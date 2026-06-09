@@ -1,0 +1,21 @@
+[Unit]
+Description=iCode background indexer daemon
+After=network.target
+
+[Service]
+Type=simple
+User=%i
+Environment=ICODE_HOME=/home/%i/.icode
+ExecStart=/usr/local/bin/icode daemon run
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=60s
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/%i/.icode /tmp
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,70 @@
+version: "3.9"
+
+# Граф-БД для iCode (v0.10+).
+# Выбери один из двух профилей: memgraph (рекомендуется для dev) или neo4j (для prod).
+#
+# Запуск:
+#   docker compose -f docker-compose.graph.yml --profile memgraph up -d
+#   docker compose -f docker-compose.graph.yml --profile neo4j    up -d
+#
+# daemon.toml (добавить):
+#   [graph]
+#   bolt_url = "bolt://localhost:7687"
+#   username = "neo4j"       # для memgraph — любая строка
+#   password = ""            # для memgraph без auth
+
+services:
+
+  # ── Memgraph ────────────────────────────────────────────────────────────────
+  # In-memory, быстрее, легче деплоить. Идеально для разработки и локального
+  # использования. Тот же Cypher, тот же Bolt-протокол — переключаемо с Neo4j.
+  memgraph:
+    image: memgraph/memgraph-platform:latest
+    profiles: [memgraph]
+    ports:
+      - "7687:7687"    # Bolt (neo4rs подключается сюда)
+      - "7444:7444"    # Memgraph Lab (веб-визуализация)
+      - "3000:3000"    # Memgraph Lab UI
+    environment:
+      - MEMGRAPH_USER=memgraph
+      - MEMGRAPH_PASSWORD=
+    volumes:
+      - memgraph_data:/var/lib/memgraph
+      - memgraph_log:/var/log/memgraph
+    command: ["--also-log-to-stderr", "--log-level=WARNING"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mg_client", "--host", "localhost", "-e", "RETURN 1;"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Neo4j ────────────────────────────────────────────────────────────────────
+  # Зрелая граф-БД, Bloom для визуализации. Рекомендуется для production.
+  neo4j:
+    image: neo4j:5-community
+    profiles: [neo4j]
+    ports:
+      - "7687:7687"    # Bolt
+      - "7474:7474"    # HTTP Browser UI
+    environment:
+      - NEO4J_AUTH=neo4j/icode-secret
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_dbms_memory_heap_initial__size=512m
+      - NEO4J_dbms_memory_heap_max__size=1G
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider",
+             "http://localhost:7474/browser/"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  memgraph_data:
+  memgraph_log:
+  neo4j_data:
+  neo4j_logs:

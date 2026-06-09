@@ -1,0 +1,167 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Публичный icode — без BSL/1С специфики и без LLM-фич.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            crate: code-index
+            features: ''
+            artifact: icode.exe
+            archive: icode-windows-x64.zip
+            cross: false
+          # musl = полностью статический бинарник, работает на любом Linux без glibc
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            crate: code-index
+            features: ''
+            artifact: icode
+            archive: icode-linux-x64.tar.gz
+            cross: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            crate: code-index
+            features: ''
+            artifact: icode
+            archive: icode-linux-arm64.tar.gz
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-13
+            crate: code-index
+            features: ''
+            artifact: icode
+            archive: icode-macos-x64.tar.gz
+            cross: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            crate: code-index
+            features: ''
+            artifact: icode
+            archive: icode-macos-arm64.tar.gz
+            cross: false
+
+          # bsl-indexer — приватная сборка с feature `enrichment` (LLM-обогащение).
+          # Если в будущем добавим feature `embeddings` (этап 5b) — здесь
+          # дополнить как `enrichment,embeddings`. См. карточку 262 (модель
+          # распространения) и docs/bsl-indexer.md.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            crate: bsl-indexer
+            features: enrichment
+            artifact: bsl-indexer.exe
+            archive: bsl-indexer-windows-x64.zip
+            cross: false
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            crate: bsl-indexer
+            features: enrichment
+            artifact: bsl-indexer
+            archive: bsl-indexer-linux-x64.tar.gz
+            cross: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            crate: bsl-indexer
+            features: enrichment
+            artifact: bsl-indexer
+            archive: bsl-indexer-macos-arm64.tar.gz
+            cross: false
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (для musl-таргетов)
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-${{ matrix.crate }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release binary
+        shell: bash
+        run: |
+          CMD="cargo"
+          if [ "${{ matrix.cross }}" = "true" ]; then CMD="cross"; fi
+          if [ -n "${{ matrix.features }}" ]; then
+            $CMD build --release --target ${{ matrix.target }} -p ${{ matrix.crate }} --features ${{ matrix.features }}
+          else
+            $CMD build --release --target ${{ matrix.target }} -p ${{ matrix.crate }}
+          fi
+
+      - name: Package (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.artifact }}" -DestinationPath "${{ matrix.archive }}"
+
+      - name: Package (Linux/macOS)
+        if: matrix.os != 'windows-latest'
+        run: |
+          tar czf ${{ matrix.archive }} -C target/${{ matrix.target }}/release ${{ matrix.artifact }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: artifacts/*
+          body: |
+            ## Установка
+
+            **Linux / macOS — один шаг:**
+            ```bash
+            curl -sSf https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh
+            ```
+
+            **Затем настроить проект (запустить в корне проекта):**
+            ```bash
+            icode setup
+            ```
+
+            Это всё. Демон запустится автоматически, `.mcp.json` создастся в проекте.
+
+            ---
+
+            **Ручная установка:** скачайте архив для вашей платформы ниже, распакуйте, положите `icode` в PATH.
