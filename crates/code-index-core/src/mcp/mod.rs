@@ -316,6 +316,19 @@ pub struct ComplexParams {
     pub language: Option<String>,
 }
 
+/// Параметры `find_existing`: поиск уже существующей функциональности.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct FindExistingParams {
+    pub repo: String,
+    /// Что собираешься написать — имя или короткое описание (`sendWelcomeEmail`,
+    /// `validate user input`, `парсинг даты`).
+    pub query: String,
+    /// `function` | `class` | `all` (по умолчанию all).
+    pub kind: Option<String>,
+    pub language: Option<String>,
+    pub limit: Option<usize>,
+}
+
 /// Параметры `find_routes`: веб-маршруты фреймворка (framework-aware routing).
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct FindRoutesParams {
@@ -995,6 +1008,17 @@ impl CodeIndexServer {
             ).await;
         }
         tools::find_complex_functions(entry, p.limit, p.path_glob, p.language).await
+    }
+
+    #[tool(description = "✋ ПЕРЕД тем как писать новую функцию/класс — проверь, нет ли уже такого. Ищет существующие символы, похожие на твой замысел, по имени (camelCase/snake_case) + словам из docstring. query = имя или короткое описание того, что собираешься написать ('sendWelcomeEmail', 'validate email', 'парсинг даты'). kind=function|class|all. Возвращает [{kind, name, qualified_name, file_path, line, signature, doc, score}] по убыванию похожести — переиспользуй вместо дублирования.")]
+    async fn find_existing(&self, Parameters(p): Parameters<FindExistingParams>) -> String {
+        let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
+        if !entry.is_local {
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients, &entry.ip, entry.port, "find_existing", &p,
+            ).await;
+        }
+        tools::find_existing(entry, p.query, p.kind, p.language, p.limit).await
     }
 
     #[tool(description = "🌐 Веб-маршруты фреймворка (framework-aware routing): связывает HTTP-метод + URL с контроллером@методом. Для веб-проекта это ТОЧКА ВХОДА — начинай навигацию отсюда: 'какой контроллер обрабатывает POST /users?'. Фильтры: method (GET/POST/…), path (подстрока URL), handler (подстрока класса/метода). Сейчас распознаётся Laravel/PHP (Route::get/post/… + [Ctrl::class,'m'] / 'Ctrl@m'). Возвращает [{method, path, handler_class, handler_method, file_path, line}].")]

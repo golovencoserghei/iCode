@@ -155,6 +155,141 @@ impl Storage {
         (count, qn)
     }
 
+    /// Найти УЖЕ СУЩЕСТВУЮЩИЕ символы, похожие на запрос — чтобы агент не писал
+    /// дубль того, что уже реализовано. Токенный матч (camelCase/snake_case + слова
+    /// из docstring), без эмбеддингов. kind: "function"|"class"|"all" (по умолч. all).
+    pub fn find_existing(
+        &self,
+        query: &str,
+        kind: Option<&str>,
+        language: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ExistingMatch>> {
+        let qtokens: std::collections::HashSet<String> = tokenize(query).into_iter().collect();
+        if qtokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some(k) = kind {
+            if !matches!(k, "function" | "class" | "all") {
+                return Err(anyhow::anyhow!(
+                    "find_existing: kind должен быть function|class|all (получено '{}')",
+                    k
+                ));
+            }
+        }
+        let qnorm: String = query.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect();
+        let want_fn = kind.map(|k| k == "function" || k == "all").unwrap_or(true);
+        let want_cls = kind.map(|k| k == "class" || k == "all").unwrap_or(true);
+
+        // Скоринг: токены имени (вес 3) / docstring (вес 1) + бонус за подстроку имени
+        // (только для имён ≥3 символов — иначе `id`/`is` шумят на любом запросе).
+        let score_one = |name: &str, qn: Option<&str>, doc: &str| -> i64 {
+            let mut name_tokens: std::collections::HashSet<String> = tokenize(name).into_iter().collect();
+            if let Some(q) = qn {
+                for t in tokenize(q) {
+                    name_tokens.insert(t);
+                }
+            }
+            let doc_tokens: std::collections::HashSet<String> = tokenize(doc).into_iter().collect();
+            let mut score = 0i64;
+            for t in &qtokens {
+                if name_tokens.contains(t) {
+                    score += 3;
+                } else if doc_tokens.contains(t) {
+                    score += 1;
+                }
+            }
+            let nnorm: String = name.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect();
+            if nnorm.len() >= 3 && (nnorm.contains(&qnorm) || qnorm.contains(&nnorm)) {
+                score += 4;
+            }
+            score
+        };
+
+        // Копим (кандидат, file_id) и резолвим путь ТОЛЬКО для топ-N после усечения
+        // (иначе на частом токене — тысячи лишних SELECT path по совпадениям).
+        let mut out: Vec<(ExistingMatch, i64)> = Vec::new();
+        let lang_clause = if language.is_some() { " JOIN files fi ON fi.id = t.file_id WHERE fi.language = ?1" } else { "" };
+
+        if want_fn {
+            let sql = format!(
+                "SELECT t.name, t.qualified_name, t.args, substr(COALESCE(t.docstring,''),1,240), t.file_id, t.line_start FROM functions t{}",
+                lang_clause
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let map_row = |r: &rusqlite::Row| -> rusqlite::Result<(String, Option<String>, Option<String>, String, i64, i64)> {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+            };
+            let rows: Vec<_> = if let Some(l) = language {
+                stmt.query_map(params![l], map_row)?.collect::<rusqlite::Result<Vec<_>>>()?
+            } else {
+                stmt.query_map([], map_row)?.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for (name, qn, args, doc, file_id, line) in rows {
+                let score = score_one(&name, qn.as_deref(), &doc);
+                if score > 0 {
+                    out.push((
+                        ExistingMatch {
+                            kind: "function".to_string(),
+                            name,
+                            qualified_name: qn,
+                            file_path: String::new(),
+                            line: line as usize,
+                            signature: args.filter(|s| !s.is_empty()),
+                            doc: (!doc.is_empty()).then_some(doc),
+                            score,
+                        },
+                        file_id,
+                    ));
+                }
+            }
+        }
+
+        if want_cls {
+            let sql = format!(
+                "SELECT t.name, substr(COALESCE(t.docstring,''),1,240), t.file_id, t.line_start FROM classes t{}",
+                lang_clause
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let map_row = |r: &rusqlite::Row| -> rusqlite::Result<(String, String, i64, i64)> {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            };
+            let rows: Vec<_> = if let Some(l) = language {
+                stmt.query_map(params![l], map_row)?.collect::<rusqlite::Result<Vec<_>>>()?
+            } else {
+                stmt.query_map([], map_row)?.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for (name, doc, file_id, line) in rows {
+                let score = score_one(&name, None, &doc);
+                if score > 0 {
+                    out.push((
+                        ExistingMatch {
+                            kind: "class".to_string(),
+                            name,
+                            qualified_name: None,
+                            file_path: String::new(),
+                            line: line as usize,
+                            signature: None,
+                            doc: (!doc.is_empty()).then_some(doc),
+                            score,
+                        },
+                        file_id,
+                    ));
+                }
+            }
+        }
+
+        out.sort_by(|a, b| b.0.score.cmp(&a.0.score).then(a.0.name.cmp(&b.0.name)));
+        out.truncate(limit);
+        Ok(out
+            .into_iter()
+            .map(|(mut m, file_id)| {
+                m.file_path = self.get_path_by_file_id(file_id).ok().flatten().unwrap_or_default();
+                m
+            })
+            .collect())
+    }
+
     /// Класс функции по (имя, file_id) из qualified_name (`Class::method`).
     fn class_of_fn(&self, fn_name: &str, file_id: i64) -> Option<String> {
         self.conn
@@ -498,4 +633,34 @@ impl Storage {
             .collect();
         Ok(filtered)
     }
+}
+
+/// Разбить идентификатор/фразу на токены: границы camelCase, snake_case, не-буквы.
+/// `sendWelcomeEmail`/`send_welcome_email`/`send welcome email` → [send, welcome, email].
+/// Токены короче 2 символов отбрасываются.
+pub(crate) fn tokenize(s: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut prev_lower_or_digit = false;
+    for ch in s.chars() {
+        if ch.is_alphanumeric() {
+            if ch.is_uppercase() && prev_lower_or_digit && !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+            for lc in ch.to_lowercase() {
+                cur.push(lc);
+            }
+            prev_lower_or_digit = ch.is_lowercase() || ch.is_numeric();
+        } else {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+            prev_lower_or_digit = false;
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out.retain(|t| t.len() >= 2);
+    out
 }

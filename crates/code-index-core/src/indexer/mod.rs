@@ -1546,6 +1546,31 @@ class App:
         assert_eq!(callers[0].resolution, "own"); // save объявлен в самом User
     }
 
+    /// find_existing: запрос по описанию/имени находит уже существующий символ.
+    #[test]
+    fn test_find_existing_surfaces_duplicates() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("app")).unwrap();
+        fs::write(tmp.path().join("app/Mailer.php"),
+            "<?php\nclass Mailer {\n /** Send a welcome email to the user */\n public function sendWelcomeEmail($user) {}\n public function ping() {}\n}\n").unwrap();
+        let mut storage = Storage::open_in_memory().unwrap();
+        Indexer::new(&mut storage).full_reindex(tmp.path(), false).unwrap();
+
+        // Запрос по описанию того, что собираемся написать → находит существующее.
+        let m = storage.find_existing("send welcome email", Some("function"), None, 10).unwrap();
+        assert!(!m.is_empty(), "должен найти существующий метод");
+        assert_eq!(m[0].name, "sendWelcomeEmail", "топ-кандидат — существующий метод");
+        assert!(!m.iter().any(|x| x.name == "ping"), "нерелевантный метод отфильтрован");
+
+        // camelCase-запрос тоже матчит.
+        let m2 = storage.find_existing("WelcomeEmail", Some("function"), None, 10).unwrap();
+        assert_eq!(m2[0].name, "sendWelcomeEmail");
+
+        // Класс находится по имени.
+        let mc = storage.find_existing("mailer", Some("class"), None, 10).unwrap();
+        assert_eq!(mc[0].name, "Mailer");
+    }
+
     /// icode doctor: сверка индекса с диском детектит пропущенные/устаревшие/удалённые.
     #[test]
     fn test_doctor_detects_drift() {

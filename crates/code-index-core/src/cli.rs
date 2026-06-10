@@ -330,6 +330,24 @@ enum Commands {
         top: usize,
     },
 
+    /// Проверить, нет ли уже такой функции/класса (перед написанием нового кода)
+    FindExisting {
+        /// Имя или описание того, что собираешься написать
+        query: String,
+        /// Путь к проекту
+        #[arg(short, long, default_value = ".")]
+        path: String,
+        /// function | class | all
+        #[arg(short, long, default_value = "all")]
+        kind: String,
+        /// Фильтр по языку
+        #[arg(short, long)]
+        language: Option<String>,
+        /// Максимум результатов
+        #[arg(long, default_value = "15")]
+        limit: usize,
+    },
+
     /// Функции по сложности (длина + fan-out + fan-in) — что рефакторить/ревьюить
     Complex {
         /// Путь к проекту
@@ -1180,6 +1198,13 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
             let db_path = get_db_path(&path);
             let storage = Storage::open_file_readonly(&db_path)?;
             let r = storage.find_complex_functions(limit, path_glob.as_deref(), language.as_deref())?;
+            println!("{}", serde_json::to_string_pretty(&r)?);
+        }
+
+        Commands::FindExisting { query, path, kind, language, limit } => {
+            let db_path = get_db_path(&path);
+            let storage = Storage::open_file_readonly(&db_path)?;
+            let r = storage.find_existing(&query, Some(&kind), language.as_deref(), limit)?;
             println!("{}", serde_json::to_string_pretty(&r)?);
         }
 

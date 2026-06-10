@@ -1317,6 +1317,27 @@ pub async fn find_routes(
     }
 }
 
+pub async fn find_existing(
+    entry: &RepoEntry,
+    query: String,
+    kind: Option<String>,
+    language: Option<String>,
+    limit: Option<usize>,
+) -> String {
+    bail_if_not_ready!(entry);
+    let storage = entry.local_storage().lock().await;
+    let want = limit.unwrap_or(15);
+    match storage.find_existing(&query, kind.as_deref(), language.as_deref(), want) {
+        Ok(matches) => {
+            let deps: Vec<String> = matches.iter().map(|m| m.file_path.clone()).collect();
+            let result = serde_json::json!({ "count": matches.len(), "matches": matches });
+            let stale = compute_stale(&storage, entry.root_path.as_deref(), &deps);
+            wrap_with_meta_fresh(&result, deps, stale)
+        }
+        Err(e) => format!("{{\"error\": \"find_existing: {}\"}}", e),
+    }
+}
+
 // ── Тесты freshness/staleness ────────────────────────────────────────────────
 
 #[cfg(test)]

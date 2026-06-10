@@ -127,6 +127,24 @@ pub struct RouteHit {
     pub line: usize,
 }
 
+/// Кандидат «это уже есть» — существующий символ, похожий на запрос (find_existing).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExistingMatch {
+    /// function | class
+    pub kind: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qualified_name: Option<String>,
+    pub file_path: String,
+    pub line: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc: Option<String>,
+    /// Оценка похожести (выше — релевантнее).
+    pub score: i64,
+}
+
 /// Ребро call-графа с ООП-резолвом (для get_callers/get_callees).
 /// `name` — другой конец ребра: вызыватель (для callers) либо вызываемый (для callees).
 #[derive(Debug, Clone, Serialize, Deserialize)]

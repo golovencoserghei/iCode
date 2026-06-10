@@ -15,6 +15,11 @@
   entry_points (оркестраторы/корни), parse_errors (слепые зоны). CLI: `icode repo-map`.
 - **`find_complex_functions`** — функции по сложности (длина + fan-out + fan-in)
   для рефакторинга/ревью. CLI: `icode complex`.
+- **`find_existing`** — «не пиши заново, если уже есть»: перед написанием новой
+  функции/класса агент ищет существующую по имени (camelCase/snake_case-токены) +
+  словам из docstring. `find_existing("assign role to user")` → топ
+  `UserRoleController::assignRoleToUser`. Возвращает кандидатов с score (без
+  эмбеддингов). CLI: `icode find-existing "<запрос>" [--kind function|class|all]`.
 - **Видимость слепых зон** — таблица `parse_errors` (миграция v6): файлы, которые
   не удалось распарсить, теперь видны (в `get_repo_map.parse_errors`), «ничего не
   упускаем». Самоочищается: файл снова распарсился → отметка снимается.

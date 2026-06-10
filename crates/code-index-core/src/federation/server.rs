@@ -20,7 +20,7 @@ use axum::{
 };
 
 use crate::mcp::{
-    tools, CodeIndexServer, ComplexParams, ExtensionToolParams, FilePathParams, FindRoutesParams,
+    tools, CodeIndexServer, ComplexParams, ExtensionToolParams, FilePathParams, FindExistingParams, FindRoutesParams,
     FunctionNameParams, GrepBodyParams, GrepCodeParams, GrepTextParams, ImportParams,
     ListFilesParams, NameParams, ReadFileParams, RepoEntry, RepoMapParams, SearchParams,
     StatFileParams, StatsParams,
@@ -55,6 +55,7 @@ pub fn federate_router(server: CodeIndexServer) -> Router {
         .route("/federate/grep_code", post(handle_grep_code))
         // v0.11: framework-aware routing
         .route("/federate/find_routes", post(handle_find_routes))
+        .route("/federate/find_existing", post(handle_find_existing))
         // v0.11: архитектурная аналитика
         .route("/federate/get_repo_map", post(handle_get_repo_map))
         .route("/federate/find_complex_functions", post(handle_find_complex_functions))
@@ -114,6 +115,17 @@ async fn handle_find_routes(
         Err(r) => return r,
     };
     ok_json(tools::find_routes(entry, p.method, p.path, p.handler, p.limit).await)
+}
+
+async fn handle_find_existing(
+    State(server): State<Server>,
+    Json(p): Json<FindExistingParams>,
+) -> axum::response::Response {
+    let entry = match resolve_local(&server, &p.repo, "find_existing") {
+        Ok(e) => e,
+        Err(r) => return r,
+    };
+    ok_json(tools::find_existing(entry, p.query, p.kind, p.language, p.limit).await)
 }
 
 async fn handle_get_repo_map(
