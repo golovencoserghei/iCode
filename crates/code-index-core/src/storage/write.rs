@@ -9,14 +9,16 @@ impl Storage {
     /// Вставить или обновить запись файла; возвращает id строки
     pub fn upsert_file(&self, record: &FileRecord) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO files (path, content_hash, ast_hash, language, lines_total, indexed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO files (path, content_hash, ast_hash, language, lines_total, indexed_at, mtime, file_size)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(path) DO UPDATE SET
                  content_hash = excluded.content_hash,
                  ast_hash     = excluded.ast_hash,
                  language     = excluded.language,
                  lines_total  = excluded.lines_total,
-                 indexed_at   = excluded.indexed_at",
+                 indexed_at   = excluded.indexed_at,
+                 mtime        = excluded.mtime,
+                 file_size    = excluded.file_size",
             params![
                 record.path,
                 record.content_hash,
@@ -24,6 +26,8 @@ impl Storage {
                 record.language,
                 record.lines_total as i64,
                 record.indexed_at,
+                record.mtime,
+                record.file_size,
             ],
         )
         .context("upsert_file: ошибка выполнения запроса")?;

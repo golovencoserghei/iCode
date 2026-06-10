@@ -346,6 +346,16 @@ enum Commands {
         path_glob: Option<String>,
     },
 
+    /// Сверить индекс с рабочим деревом: пропущено / устарело / удалено + слепые зоны
+    Doctor {
+        /// Путь к проекту
+        #[arg(short, long, default_value = ".")]
+        path: String,
+        /// Вывод в JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Управление фоновым демоном индексации
     Daemon {
         #[command(subcommand)]
@@ -1171,6 +1181,55 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
             let storage = Storage::open_file_readonly(&db_path)?;
             let r = storage.find_complex_functions(limit, path_glob.as_deref(), language.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&r)?);
+        }
+
+        Commands::Doctor { path, json } => {
+            let abs = Path::new(&path).canonicalize().unwrap_or_else(|_| PathBuf::from(&path));
+            let db_path = get_db_path(&path);
+            if !db_path.exists() {
+                return Err(anyhow::anyhow!(
+                    "Индекс не найден: {}. Запустите `icode index .` или `icode init`.",
+                    db_path.display()
+                ));
+            }
+            let config = IndexConfig::load(&abs)?;
+            let storage = Storage::open_file_readonly(&db_path)?;
+            let report = crate::indexer::diagnose(&abs, &config, &storage).map_err(|e| {
+                anyhow::anyhow!(
+                    "Не удалось прочитать индекс ({}). Возможно он пуст или повреждён — \
+                     запустите `icode index .`.",
+                    e
+                )
+            })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                let mark = if report.healthy { "✅" } else { "⚠️" };
+                println!("{} iCode doctor — {}", mark, abs.display());
+                if let Some(note) = &report.note {
+                    println!("  ⓘ {}", note);
+                }
+                println!("  Индексировано: {}   на диске: {}", report.indexed_files, report.disk_files);
+                println!("  Пропущено (нет в индексе):   {}", report.missing_count);
+                println!("  Устарело (изменилось):       {}", report.outdated_count);
+                println!("  Фантомы (удалены с диска):   {}", report.stale_count);
+                println!("  Не распарсилось (слепые):    {}", report.parse_error_count);
+                let show = |title: &str, v: &[String]| {
+                    if !v.is_empty() {
+                        println!("  {} (до 50):", title);
+                        for p in v {
+                            println!("    {}", p);
+                        }
+                    }
+                };
+                show("Пропущено", &report.missing_sample);
+                show("Устарело", &report.outdated_sample);
+                show("Фантомы", &report.stale_sample);
+                show("Не распарсилось", &report.parse_error_sample);
+                if !report.healthy {
+                    println!("\n  Починить: `icode index .` (или `--force` для полной переиндексации).");
+                }
+            }
         }
 
         Commands::Setup { path, icode_home } => {

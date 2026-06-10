@@ -230,6 +230,7 @@ icode get-function <name>             # тело функции по имени
 icode grep-body --pattern <p>         # поиск по телам функций/классов
 icode search-text <q>                 # FTS по текстовым файлам
 icode stats                           # статистика индекса
+icode doctor                          # сверка индекса с диском: пропущено/устарело/фантомы
 icode clean                           # убрать из индекса удалённые файлы
 icode index /path                     # однократная (пере)индексация (--force)
 ```

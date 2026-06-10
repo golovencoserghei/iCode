@@ -1331,8 +1331,7 @@ mod fresh_tests {
                 file_size: Some(size),
             })
             .unwrap();
-        // upsert_file не пишет mtime/size — проставляем отдельно (как делает индексатор).
-        storage.update_file_metadata(path, mtime, size).unwrap();
+        // upsert_file сам персистит mtime/file_size из FileRecord (см. write.rs).
     }
 
     #[tokio::test]

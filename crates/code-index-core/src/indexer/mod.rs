@@ -20,6 +20,156 @@ use crate::storage::Storage;
 use config::IndexConfig;
 use file_types::{categorize_file, FileCategory};
 
+/// Отчёт сверки индекса с рабочим деревом (`icode doctor`).
+/// Делает доверие к индексу проверяемым: что НЕ проиндексировано, что устарело,
+/// что осталось от удалённых файлов, и какие файлы не распарсились (слепые зоны).
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct DiagnosticReport {
+    /// Файлов в индексе (таблица files).
+    pub indexed_files: usize,
+    /// Индексируемых файлов на диске (после exclude/категоризации).
+    pub disk_files: usize,
+    /// На диске, но НЕ в индексе (пропущены).
+    pub missing_count: usize,
+    /// В индексе, но удалены с диска (фантомы).
+    pub stale_count: usize,
+    /// В обоих, но (size/mtime) разошлись — индекс устарел.
+    pub outdated_count: usize,
+    /// Файлы с ошибкой парсинга (слепые зоны индекса символов).
+    pub parse_error_count: usize,
+    /// `true` — индекс полностью соответствует диску и без слепых зон.
+    pub healthy: bool,
+    /// Предупреждение, делающее отчёт корректным в особых конфигурациях
+    /// (напр. активен `max_files` — тогда «пропущено» недостоверно).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub missing_sample: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub stale_sample: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub outdated_sample: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub parse_error_sample: Vec<String>,
+}
+
+/// Сверить индекс (`storage`) с рабочим деревом `root` (без хеширования — по
+/// (mtime,size)). Read-only: ничего не мутирует, подходит для readonly-БД.
+pub fn diagnose(root: &Path, config: &IndexConfig, storage: &Storage) -> Result<DiagnosticReport> {
+    use std::time::UNIX_EPOCH;
+
+    // Индекс: path → (mtime, size).
+    let indexed: HashMap<String, (Option<i64>, Option<i64>)> = storage
+        .get_all_files()?
+        .into_iter()
+        .map(|f| (f.path, (f.mtime, f.file_size)))
+        .collect();
+
+    // Диск: те же правила исключения/категоризации, что у индексатора.
+    let matcher = config.build_file_exclude_matcher();
+    let cfg = config.clone();
+    let walker = WalkDir::new(root).into_iter().filter_entry(move |e| {
+        if e.file_type().is_dir() {
+            if let Some(name) = e.file_name().to_str() {
+                return !cfg.is_excluded_dir(name);
+            }
+        }
+        true
+    });
+    let mut disk: HashMap<String, (i64, i64)> = HashMap::new();
+    for entry in walker.filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if let Some(fname) = path.file_name().and_then(|f| f.to_str()) {
+            if matcher.is_match(fname) {
+                continue;
+            }
+        }
+        let category = categorize_file(path);
+        if matches!(category, FileCategory::Binary) {
+            continue;
+        }
+        let meta = entry.metadata().ok();
+        if !matches!(category, FileCategory::Code(_)) {
+            if let Some(ref m) = meta {
+                if m.len() as usize > config.max_file_size {
+                    continue;
+                }
+            }
+        }
+        let mtime = meta
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let size = meta.as_ref().map(|m| m.len() as i64).unwrap_or(0);
+        let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/");
+        disk.insert(rel, (mtime, size));
+    }
+
+    let mut missing: Vec<String> = Vec::new();
+    let mut outdated: Vec<String> = Vec::new();
+    for (p, (dm, ds)) in &disk {
+        match indexed.get(p) {
+            None => missing.push(p.clone()),
+            Some((im, is_)) => {
+                let size_diff = is_.map(|v| v != *ds).unwrap_or(false);
+                let mtime_diff = im.map(|v| v != *dm).unwrap_or(false);
+                if size_diff || mtime_diff {
+                    outdated.push(p.clone());
+                }
+            }
+        }
+    }
+    let mut stale: Vec<String> = indexed.keys().filter(|p| !disk.contains_key(*p)).cloned().collect();
+    let mut parse_errs: Vec<String> = storage
+        .get_parse_errors(10_000)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(p, _)| p)
+        .collect();
+
+    missing.sort();
+    outdated.sort();
+    stale.sort();
+    parse_errs.sort();
+
+    // При активном max_files индекс намеренно содержит меньше файлов, чем на
+    // диске → «пропущено» недостоверно и не должно делать отчёт unhealthy.
+    let max_files_active = config.max_files > 0 && disk.len() > config.max_files;
+    let note = max_files_active.then(|| {
+        format!(
+            "max_files={} активен (на диске {}): часть «пропущено» — это намеренно \
+             непроиндексированный хвост, оценка здоровья его игнорирует.",
+            config.max_files, disk.len()
+        )
+    });
+    let healthy = stale.is_empty()
+        && outdated.is_empty()
+        && parse_errs.is_empty()
+        && (max_files_active || missing.is_empty());
+
+    const CAP: usize = 50;
+    let report = DiagnosticReport {
+        indexed_files: indexed.len(),
+        disk_files: disk.len(),
+        missing_count: missing.len(),
+        stale_count: stale.len(),
+        outdated_count: outdated.len(),
+        parse_error_count: parse_errs.len(),
+        healthy,
+        note,
+        missing_sample: missing.into_iter().take(CAP).collect(),
+        stale_sample: stale.into_iter().take(CAP).collect(),
+        outdated_sample: outdated.into_iter().take(CAP).collect(),
+        parse_error_sample: parse_errs.into_iter().take(CAP).collect(),
+    };
+    Ok(report)
+}
+
 /// Результат одного прохода индексации
 #[derive(Debug, Default)]
 pub struct IndexResult {
@@ -1348,6 +1498,35 @@ class App:
         assert_eq!(ctx.routes.len(), 1, "index должен иметь 1 связанный маршрут");
         assert_eq!(ctx.routes[0].method, "GET");
         assert_eq!(ctx.routes[0].path, "/users");
+    }
+
+    /// icode doctor: сверка индекса с диском детектит пропущенные/устаревшие/удалённые.
+    #[test]
+    fn test_doctor_detects_drift() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("a.py"), "def a():\n    pass\n").unwrap();
+        fs::write(tmp.path().join("b.py"), "def b():\n    pass\n").unwrap();
+        let mut storage = Storage::open_in_memory().unwrap();
+        Indexer::new(&mut storage).full_reindex(tmp.path(), false).unwrap();
+        let cfg = IndexConfig::default();
+
+        // Свежий индекс — здоров.
+        let r = super::diagnose(tmp.path(), &cfg, &storage).unwrap();
+        assert!(r.healthy, "свежий индекс должен быть здоров: {:?}", r);
+
+        // Дрейф: a.py изменён (размер ↑), b.py удалён, c.py добавлен.
+        fs::write(tmp.path().join("a.py"), "def a():\n    return 1234567\n").unwrap();
+        fs::remove_file(tmp.path().join("b.py")).unwrap();
+        fs::write(tmp.path().join("c.py"), "def c():\n    pass\n").unwrap();
+
+        let r = super::diagnose(tmp.path(), &cfg, &storage).unwrap();
+        assert!(!r.healthy);
+        assert_eq!(r.missing_count, 1, "c.py отсутствует в индексе");
+        assert!(r.missing_sample.contains(&"c.py".to_string()));
+        assert_eq!(r.stale_count, 1, "b.py удалён с диска");
+        assert!(r.stale_sample.contains(&"b.py".to_string()));
+        assert_eq!(r.outdated_count, 1, "a.py изменился (размер)");
+        assert!(r.outdated_sample.contains(&"a.py".to_string()));
     }
 
     /// vendor signatures: наследование от framework-класса (в vendor) резолвится
