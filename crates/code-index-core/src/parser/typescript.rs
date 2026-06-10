@@ -592,18 +592,42 @@ fn visit_import(node: tree_sitter::Node, ctx: &mut VisitContext) {
 }
 
 /// Обработать call_expression
+/// `this` → как есть; `Foo`/`foo` → имя; цепочка/вызов/индекс → None.
+fn normalize_ts_receiver(obj: Option<&str>) -> Option<String> {
+    let t = obj?.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if t == "this" {
+        return Some("this".to_string());
+    }
+    if t.contains(|c: char| matches!(c, '.' | '(' | ')' | '[' | ']' | ' ' | '{' | '}' | '?' | '!')) {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
 fn visit_call(node: tree_sitter::Node, ctx: &mut VisitContext, current_func: Option<&str>) {
     let source = ctx.source;
     let line = node.start_position().row + 1;
 
-    let callee = if let Some(func_node) = node.child_by_field_name("function") {
-        node_text(func_node, source).to_string()
-    } else {
+    let Some(func_node) = node.child_by_field_name("function") else {
         return;
+    };
+    let (callee, receiver) = if func_node.kind() == "member_expression" {
+        let prop = func_node.child_by_field_name("property").map(|n| node_text(n, source).to_string());
+        let obj = func_node.child_by_field_name("object").map(|n| node_text(n, source));
+        match prop {
+            Some(p) => (p, normalize_ts_receiver(obj)),
+            None => (node_text(func_node, source).to_string(), None),
+        }
+    } else {
+        (node_text(func_node, source).to_string(), None)
     };
 
     let caller = current_func.unwrap_or("<module>").to_string();
-    ctx.calls.push(ParsedCall { caller, callee, line, receiver: None });
+    ctx.calls.push(ParsedCall { caller, callee, line, receiver });
 }
 
 /// Главная функция парсинга TypeScript/TSX

@@ -348,6 +348,22 @@ enum Commands {
         limit: usize,
     },
 
+    /// Недостижимый код: обход call-графа от точек входа (маршруты/main/тесты)
+    Unreachable {
+        /// Путь к проекту
+        #[arg(short, long, default_value = ".")]
+        path: String,
+        /// Максимум результатов
+        #[arg(long, default_value = "50")]
+        limit: usize,
+        /// Фильтр по языку
+        #[arg(short, long)]
+        language: Option<String>,
+        /// Glob по пути (`app/**/*.php`)
+        #[arg(long)]
+        path_glob: Option<String>,
+    },
+
     /// Функции по сложности (длина + fan-out + fan-in) — что рефакторить/ревьюить
     Complex {
         /// Путь к проекту
@@ -1205,6 +1221,13 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
             let db_path = get_db_path(&path);
             let storage = Storage::open_file_readonly(&db_path)?;
             let r = storage.find_existing(&query, Some(&kind), language.as_deref(), limit)?;
+            println!("{}", serde_json::to_string_pretty(&r)?);
+        }
+
+        Commands::Unreachable { path, limit, language, path_glob } => {
+            let db_path = get_db_path(&path);
+            let storage = Storage::open_file_readonly(&db_path)?;
+            let r = storage.find_unreachable(limit, path_glob.as_deref(), language.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&r)?);
         }
 

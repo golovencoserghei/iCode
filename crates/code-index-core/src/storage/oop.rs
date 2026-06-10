@@ -25,6 +25,15 @@ pub struct OopModel {
     methods: HashMap<String, HashSet<String>>,
 }
 
+/// Разбить `qualified_name` на (класс, метод). PHP пишет `Class::method`,
+/// Python/JS/TS — `Class.method`. Пробуем `::`, затем последнюю `.`.
+/// Инвариант: все парсеры кладут в class-часть ОДНО голое имя класса (без
+/// module-пути), поэтому `rsplit_once('.')` даёт корректный класс. Если будущий
+/// парсер начнёт писать `module.Class.method` — здесь понадобится правка.
+pub(crate) fn split_qualified(qn: &str) -> Option<(&str, &str)> {
+    qn.rsplit_once("::").or_else(|| qn.rsplit_once('.'))
+}
+
 /// Срезать префикс вида `interface `/`trait `/`enum `/`class ` (PHP пишет их в
 /// `classes.name`), чтобы имя совпадало с тем, как тип упомянут в `bases` и
 /// `qualified_name`.
@@ -191,18 +200,17 @@ impl Storage {
             }
         }
 
-        // Методы из functions.qualified_name (Class::method).
-        let mut stmt = self
-            .conn
-            .prepare("SELECT qualified_name FROM functions WHERE qualified_name LIKE '%::%'")?;
+        // Методы из functions.qualified_name (Class::method / Class.method).
+        let mut stmt = self.conn.prepare(
+            "SELECT qualified_name FROM functions WHERE qualified_name LIKE '%::%' OR qualified_name LIKE '%.%'",
+        )?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         for qn in rows {
             let qn = qn?;
-            if let Some(pos) = qn.rfind("::") {
-                let cls = norm_class(&qn[..pos]).to_string();
-                let method = qn[pos + 2..].to_string();
+            if let Some((cls_part, method)) = split_qualified(&qn) {
+                let cls = norm_class(cls_part).to_string();
                 if !method.is_empty() {
-                    methods.entry(cls).or_default().insert(method);
+                    methods.entry(cls).or_default().insert(method.to_string());
                 }
             }
         }

@@ -988,6 +988,17 @@ impl CodeIndexServer {
         tools::find_dead_code(entry, p.language, p.path_glob, p.limit).await
     }
 
+    #[tool(description = "🕸️ НЕДОСТИЖИМЫЙ код через обход call-графа от ТОЧЕК ВХОДА (маршруты, main/handle/boot/register, тесты). Сильнее find_dead_code: ловит «мёртвые кластеры» — функции, вызываемые только из другого мёртвого кода (их имя есть среди callee, поэтому find_dead_code их пропускает). Консервативно по имени (мало ложных). НЕ видит рефлексию/динамическую диспетчеризацию/строковые колбэки — это кандидаты для ревью. path_glob/language сужают. Возвращает [{name, qualified_name, file_path, line_start, line_end}].")]
+    async fn find_unreachable(&self, Parameters(p): Parameters<DeadCodeParams>) -> String {
+        let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
+        if !entry.is_local {
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients, &entry.ip, entry.port, "find_unreachable", &p,
+            ).await;
+        }
+        tools::find_unreachable(entry, p.language, p.path_glob, p.limit).await
+    }
+
     #[tool(description = "🗺️ ПЕРВЫЙ ВЫЗОВ для незнакомого репо: глубокая архитектурная карта за ОДИН дешёвый вызов (~сотни токенов вместо десятков grep/read). Возвращает: counts, languages, modules (крупнейшие директории), complex_functions (где сосредоточена сложность: span+fan_out+callers), call_hotspots (самые вызываемые ПРОЕКТНЫЕ функции, без stdlib-шума), entry_points (оркестраторы/корни), parse_errors (сколько файлов НЕ проиндексировано — слепые зоны). top — размер каждой секции (default 12).")]
     async fn get_repo_map(&self, Parameters(p): Parameters<RepoMapParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };

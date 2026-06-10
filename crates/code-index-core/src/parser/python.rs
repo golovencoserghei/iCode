@@ -446,22 +446,49 @@ fn visit_import(node: tree_sitter::Node, ctx: &mut VisitContext, is_from: bool) 
     }
 }
 
+/// Нормализовать получателя Python-вызова для ООП-резолва.
+///   * `self`/`cls` → как есть (вызов в своём классе);
+///   * `Foo` / `foo` → имя (класс резолвится по знанию типа, переменная — нет);
+///   * цепочка/вызов/индекс (`a.b`, `f()`, `x[0]`) → None.
+fn normalize_py_receiver(obj: Option<&str>) -> Option<String> {
+    let t = obj?.trim();
+    if t.is_empty() {
+        return None;
+    }
+    match t {
+        "self" | "cls" => Some(t.to_string()),
+        _ => {
+            if t.contains(|c: char| matches!(c, '.' | '(' | ')' | '[' | ']' | ' ' | '{' | '}')) {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        }
+    }
+}
+
 /// Обработать вызов функции (call)
 fn visit_call(node: tree_sitter::Node, ctx: &mut VisitContext, current_func: Option<&str>) {
     let source = ctx.source;
     let line = node.start_position().row + 1;
 
-    // Callee: поле function узла call
-    let callee = if let Some(func_node) = node.child_by_field_name("function") {
-        node_text(func_node, source).to_string()
-    } else {
+    let Some(func_node) = node.child_by_field_name("function") else {
         return;
     };
+    // `obj.method()` → callee=method, receiver=obj; `foo()` → callee=foo, receiver=None.
+    let (callee, receiver) = if func_node.kind() == "attribute" {
+        let attr = func_node.child_by_field_name("attribute").map(|n| node_text(n, source).to_string());
+        let obj = func_node.child_by_field_name("object").map(|n| node_text(n, source));
+        match attr {
+            Some(a) => (a, normalize_py_receiver(obj)),
+            None => (node_text(func_node, source).to_string(), None),
+        }
+    } else {
+        (node_text(func_node, source).to_string(), None)
+    };
 
-    // Caller: имя ближайшей функции-контейнера или "<module>"
     let caller = current_func.unwrap_or("<module>").to_string();
-
-    ctx.calls.push(ParsedCall { caller, callee, line, receiver: None });
+    ctx.calls.push(ParsedCall { caller, callee, line, receiver });
 }
 
 /// Обработать присваивание переменной на уровне модуля

@@ -1,5 +1,5 @@
 /// Инструменты глубокого анализа: транзитивный call-граф, реализации, мёртвый код.
-use super::oop::OopModel;
+use super::oop::{split_qualified, OopModel};
 use super::{normalize_glob, Storage};
 use super::models::*;
 use anyhow::Result;
@@ -300,7 +300,7 @@ impl Storage {
             )
             .ok()
             .flatten()
-            .and_then(|qn| qn.rsplit_once("::").map(|(c, _)| c.to_string()))
+            .and_then(|qn| split_qualified(&qn).map(|(c, _)| c.to_string()))
     }
 
     /// Резолв цели вызова по получателю + классу вызывающего + ООП-иерархии.
@@ -314,7 +314,7 @@ impl Storage {
     ) -> (String, Option<String>) {
         if let Some(o) = oop {
             let (target, ancestors_only): (Option<String>, bool) = match receiver {
-                Some("$this") | Some("self") | Some("static") => (source_class.map(str::to_string), false),
+                Some("$this") | Some("self") | Some("static") | Some("this") | Some("cls") => (source_class.map(str::to_string), false),
                 Some("parent") => (source_class.map(str::to_string), true),
                 Some(r) if !r.starts_with('$') && o.knows_class(r) => (Some(r.to_string()), false),
                 _ => (None, false),
@@ -336,7 +336,7 @@ impl Storage {
             }
         }
         match self.function_defs_lite(callee) {
-            (1, qn) => ("exact".to_string(), qn.and_then(|q| q.rsplit_once("::").map(|(c, _)| c.to_string()))),
+            (1, qn) => ("exact".to_string(), qn.and_then(|q| split_qualified(&q).map(|(c, _)| c.to_string()))),
             (0, _) => (String::new(), None),
             _ => ("by_name".to_string(), None),
         }
@@ -463,7 +463,7 @@ impl Storage {
         let (file_id, kind, definition, route_lookup) = if !functions.is_empty() {
             let f = functions.into_iter().next().unwrap();
             let handler_class = f.qualified_name.as_deref()
-                .and_then(|qn| qn.rsplit_once("::").map(|(cls, _)| cls.to_string()));
+                .and_then(|qn| split_qualified(qn).map(|(cls, _)| cls.to_string()));
             let lookup = Some((handler_class, f.name.clone()));
             (f.file_id, "function".to_string(), Some(serde_json::to_value(&f).unwrap_or_default()), lookup)
         } else {
@@ -497,7 +497,7 @@ impl Storage {
             let oop_hit = oop.as_ref().and_then(|o| {
                 // (целевой класс, искать только в предках?)
                 let (target, ancestors_only): (Option<String>, bool) = match rec.receiver.as_deref() {
-                    Some("$this") | Some("self") | Some("static") => (self_class.map(str::to_string), false),
+                    Some("$this") | Some("self") | Some("static") | Some("this") | Some("cls") => (self_class.map(str::to_string), false),
                     Some("parent") => (self_class.map(str::to_string), true),
                     Some(r) if !r.starts_with('$') && o.knows_class(r) => (Some(r.to_string()), false),
                     _ => (None, false),
@@ -624,10 +624,87 @@ impl Storage {
         let filtered: Vec<DeadCodeEntry> = candidates
             .into_iter()
             .filter(|e| {
-                match e.qualified_name.as_deref().and_then(|qn| qn.rsplit_once("::")) {
+                match e.qualified_name.as_deref().and_then(split_qualified) {
                     Some((class, method)) => !oop.is_override(class, method),
                     None => true, // свободная функция — ООП-фильтр не применим
                 }
+            })
+            .take(limit)
+            .collect();
+        Ok(filtered)
+    }
+
+    /// НЕДОСТИЖИМЫЙ код: обход call-графа (WITH RECURSIVE) от ТОЧЕК ВХОДА —
+    /// маршрутов, main/handle/boot/register, тестов, магических методов. Функция,
+    /// до которой нельзя дойти ни от одной точки входа, — кандидат на удаление
+    /// (включая «мёртвые кластеры», которые find_dead_code пропускает, т.к. их имя
+    /// всё же встречается как callee). Резолв по ИМЕНИ — консервативный
+    /// (over-approx достижимости → мало ложных срабатываний). НЕ ловит динамическую
+    /// диспетчеризацию/рефлексию/строковые колбэки — это кандидаты для ревью.
+    pub fn find_unreachable(
+        &self,
+        limit: usize,
+        path_glob: Option<&str>,
+        language: Option<&str>,
+    ) -> Result<Vec<DeadCodeEntry>> {
+        let routes_seed = if self.conn.prepare("SELECT 1 FROM routes LIMIT 0").is_ok() {
+            " UNION SELECT handler_method FROM routes WHERE handler_method IS NOT NULL"
+        } else {
+            ""
+        };
+        let mut conds: Vec<String> = vec![
+            "f.name NOT IN (SELECT name FROM reachable)".to_string(),
+            "f.name NOT LIKE 'test%'".to_string(),
+            "f.name NOT LIKE '\\_\\_%' ESCAPE '\\'".to_string(),
+        ];
+        let mut params_dyn: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(g) = path_glob {
+            conds.push("fi.path GLOB ?".to_string());
+            params_dyn.push(Box::new(normalize_glob(g)));
+        }
+        if let Some(l) = language {
+            conds.push("fi.language = ?".to_string());
+            params_dyn.push(Box::new(l.to_string()));
+        }
+        let fetch = (limit.saturating_mul(4)).max(200) as i64;
+        params_dyn.push(Box::new(fetch));
+        let sql = format!(
+            "WITH RECURSIVE reachable(name) AS (
+                SELECT name FROM functions WHERE name IN \
+                  ('main','run','handle','execute','boot','register','up','down','invoke','setUp','tearDown', \
+                   'schedule','commands','rules','authorize','map','via','broadcastOn','build','middleware', \
+                   'toArray','toMail','toDatabase','asController') \
+                  OR name LIKE 'test%' \
+                  OR name LIKE '\\_\\_%' ESCAPE '\\' {routes}
+                UNION
+                SELECT c.callee FROM calls c JOIN reachable r ON c.caller = r.name
+             )
+             SELECT f.name, f.qualified_name, fi.path, f.line_start, f.line_end
+             FROM functions f JOIN files fi ON fi.id = f.file_id
+             WHERE {conds} ORDER BY fi.path, f.line_start LIMIT ?",
+            routes = routes_seed,
+            conds = conds.join(" AND ")
+        );
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_dyn.iter().map(|b| &**b as &dyn rusqlite::ToSql).collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_refs.as_slice(), |row| {
+            Ok(DeadCodeEntry {
+                name: row.get(0)?,
+                qualified_name: row.get(1)?,
+                file_path: row.get(2)?,
+                line_start: row.get::<_, i64>(3)? as usize,
+                line_end: row.get::<_, i64>(4)? as usize,
+            })
+        })?;
+        let candidates: Vec<DeadCodeEntry> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        // Полиморфно вызываемые override-методы достижимы — исключаем (как в find_dead_code).
+        let oop = self.build_oop_model()?;
+        let filtered: Vec<DeadCodeEntry> = candidates
+            .into_iter()
+            .filter(|e| match e.qualified_name.as_deref().and_then(split_qualified) {
+                Some((class, method)) => !oop.is_override(class, method),
+                None => true,
             })
             .take(limit)
             .collect();

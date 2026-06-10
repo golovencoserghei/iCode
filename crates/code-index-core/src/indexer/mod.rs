@@ -1546,6 +1546,47 @@ class App:
         assert_eq!(callers[0].resolution, "own"); // save объявлен в самом User
     }
 
+    /// Python: self.save() резолвится к классу через split_qualified('.') + receiver=self.
+    #[test]
+    fn test_python_self_resolution() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("svc.py"),
+            "class User:\n    def save(self):\n        pass\n    def run(self):\n        self.save()\n").unwrap();
+        let mut storage = Storage::open_in_memory().unwrap();
+        Indexer::new(&mut storage).full_reindex(tmp.path(), false).unwrap();
+
+        let (callers, _t, _a) = storage.get_callers_resolved("save", Some("User"), None, 50).unwrap();
+        assert_eq!(callers.len(), 1, "self.save() резолвится к User::save");
+        assert_eq!(callers[0].name, "run");
+        assert_eq!(callers[0].target_class.as_deref(), Some("User"));
+        assert_eq!(callers[0].resolution, "own");
+    }
+
+    /// find_unreachable: ловит «мёртвый кластер» (deadB вызывается только из
+    /// мёртвого deadA) — то, что find_dead_code пропускает (имя deadB есть в callee).
+    #[test]
+    fn test_unreachable_finds_dead_clusters() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("x.php"),
+            "<?php\nfunction main() { helper(); }\nfunction helper() { used(); }\nfunction used() {}\nfunction deadA() { deadB(); }\nfunction deadB() {}\n").unwrap();
+        let mut storage = Storage::open_in_memory().unwrap();
+        Indexer::new(&mut storage).full_reindex(tmp.path(), false).unwrap();
+
+        let u = storage.find_unreachable(50, None, None).unwrap();
+        let names: std::collections::HashSet<String> = u.iter().map(|e| e.name.clone()).collect();
+        // main — точка входа, helper/used достижимы от неё.
+        assert!(!names.contains("main"));
+        assert!(!names.contains("helper"));
+        assert!(!names.contains("used"));
+        // Мёртвый кластер: deadA не вызывается, deadB — только из deadA.
+        assert!(names.contains("deadA"), "deadA не вызывается ниоткуда");
+        assert!(names.contains("deadB"), "deadB достижим только из мёртвого deadA");
+
+        // Контроль: find_dead_code НЕ ловит deadB (его имя есть среди callee).
+        let dead = storage.find_dead_code(50, None, None).unwrap();
+        assert!(!dead.iter().any(|e| e.name == "deadB"), "find_dead_code пропускает deadB — в этом разница");
+    }
+
     /// find_existing: запрос по описанию/имени находит уже существующий символ.
     #[test]
     fn test_find_existing_surfaces_duplicates() {

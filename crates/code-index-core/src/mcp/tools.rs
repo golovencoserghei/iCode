@@ -1263,6 +1263,29 @@ pub async fn find_dead_code(
     }
 }
 
+pub async fn find_unreachable(
+    entry: &RepoEntry,
+    language: Option<String>,
+    path_glob: Option<String>,
+    limit: Option<usize>,
+) -> String {
+    bail_if_not_ready!(entry);
+    let storage = entry.local_storage().lock().await;
+    let want = limit.unwrap_or(50);
+    match storage.find_unreachable(want, path_glob.as_deref(), language.as_deref()) {
+        Ok(entries) => {
+            let deps: Vec<String> = entries.iter().map(|e| e.file_path.clone()).collect();
+            let result = serde_json::json!({
+                "count": entries.len(),
+                "note": "Недостижимо от точек входа (маршруты/main/handle/тесты). НЕ видит рефлексию/динамику/строковые колбэки — проверяйте кандидатов",
+                "unreachable": entries,
+            });
+            wrap_with_meta(&result, deps)
+        }
+        Err(e) => format!("{{\"error\": \"find_unreachable: {}\"}}", e),
+    }
+}
+
 /// get_repo_map (v0.11+): архитектурная карта репо за один дешёвый вызов.
 pub async fn get_repo_map(entry: &RepoEntry, top: Option<usize>) -> String {
     bail_if_not_ready!(entry);
