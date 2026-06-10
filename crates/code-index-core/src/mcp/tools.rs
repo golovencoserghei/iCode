@@ -480,35 +480,61 @@ pub async fn get_class(
 /// раздувает ответ. 50 хватает для навигации; полнее — get_callers_tree / language-фильтр.
 const CALL_EDGES_DEFAULT_LIMIT: usize = 50;
 
+/// Общая обёртка для callers/callees с ООП-резолвом: кап, provenance-нота,
+/// предупреждение о коллизии имени (когда class не задан).
+fn emit_resolved_calls(
+    resolved: anyhow::Result<(Vec<crate::storage::models::ResolvedCall>, usize, bool)>,
+    cap: usize,
+    class_given: bool,
+    name: &str,
+    tool: &str,
+) -> String {
+    match resolved {
+        Ok((mut r, total_raw, ambiguous)) => {
+            let matched = r.len();
+            // С class-фильтром r — все совпадения (могло быть > cap); без фильтра r
+            // уже усечён ранним лимитом в storage до cap.
+            if matched > cap {
+                r.truncate(cap);
+            }
+            let deps: Vec<String> = r.iter().map(|c| c.file_path.clone()).collect();
+            let mut notes: Vec<String> = Vec::new();
+            if ambiguous && !class_given {
+                notes.push(format!(
+                    "имя '{}' определено в нескольких классах — рёбра смешаны; уточните параметр class",
+                    name
+                ));
+            }
+            let shown = r.len();
+            if class_given {
+                if matched > shown {
+                    notes.push(format!("показано {} из {} (фильтр по class); увеличьте limit", shown, matched));
+                }
+            } else if total_raw > shown {
+                notes.push(format!("показано {} из {}; уточните class/language или увеличьте limit", shown, total_raw));
+            }
+            if notes.is_empty() {
+                wrap_with_meta(&r, deps)
+            } else {
+                wrap_with_meta_note(&r, deps, &notes.join("; "))
+            }
+        }
+        Err(e) => format!("{{\"error\": \"{}: {}\"}}", tool, e),
+    }
+}
+
 pub async fn get_callers(
     entry: &RepoEntry,
     function_name: String,
     language: Option<String>,
     limit: Option<usize>,
+    class: Option<String>,
 ) -> String {
     bail_if_not_ready!(entry);
     let storage = entry.local_storage().lock().await;
-    match storage.get_callers(&function_name, language.as_deref()) {
-        Ok(mut r) => {
-            let cap = limit.unwrap_or(CALL_EDGES_DEFAULT_LIMIT);
-            let total = r.len();
-            let truncated = total > cap;
-            if truncated {
-                r.truncate(cap);
-            }
-            let deps = collect_paths_via(&storage, &r, |cr| cr.file_id);
-            if truncated {
-                wrap_with_meta_note(
-                    &r,
-                    deps,
-                    &format!("truncated: показано {} из {}; сузьте language или увеличьте limit", cap, total),
-                )
-            } else {
-                wrap_with_meta(&r, deps)
-            }
-        }
-        Err(e) => format!("{{\"error\": \"get_callers: {}\"}}", e),
-    }
+    let cap = limit.unwrap_or(CALL_EDGES_DEFAULT_LIMIT);
+    let resolved = storage.get_callers_resolved(&function_name, class.as_deref(), language.as_deref(), cap);
+    emit_resolved_calls(resolved, cap, class.is_some(), &function_name, "get_callers")
 }
 
 pub async fn get_callees(
@@ -516,30 +542,13 @@ pub async fn get_callees(
     function_name: String,
     language: Option<String>,
     limit: Option<usize>,
+    class: Option<String>,
 ) -> String {
     bail_if_not_ready!(entry);
     let storage = entry.local_storage().lock().await;
-    match storage.get_callees(&function_name, language.as_deref()) {
-        Ok(mut r) => {
-            let cap = limit.unwrap_or(CALL_EDGES_DEFAULT_LIMIT);
-            let total = r.len();
-            let truncated = total > cap;
-            if truncated {
-                r.truncate(cap);
-            }
-            let deps = collect_paths_via(&storage, &r, |cr| cr.file_id);
-            if truncated {
-                wrap_with_meta_note(
-                    &r,
-                    deps,
-                    &format!("truncated: показано {} из {}; сузьте language или увеличьте limit", cap, total),
-                )
-            } else {
-                wrap_with_meta(&r, deps)
-            }
-        }
-        Err(e) => format!("{{\"error\": \"get_callees: {}\"}}", e),
-    }
+    let cap = limit.unwrap_or(CALL_EDGES_DEFAULT_LIMIT);
+    let resolved = storage.get_callees_resolved(&function_name, class.as_deref(), language.as_deref(), cap);
+    emit_resolved_calls(resolved, cap, class.is_some(), &function_name, "get_callees")
 }
 
 pub async fn find_symbol(

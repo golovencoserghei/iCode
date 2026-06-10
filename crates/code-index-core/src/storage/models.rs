@@ -127,6 +127,21 @@ pub struct RouteHit {
     pub line: usize,
 }
 
+/// Ребро call-графа с ООП-резолвом (для get_callers/get_callees).
+/// `name` — другой конец ребра: вызыватель (для callers) либо вызываемый (для callees).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolvedCall {
+    pub name: String,
+    pub file_path: String,
+    pub line: usize,
+    /// own | inherited | exact | by_name | "" (внешний/неразрешён)
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub resolution: String,
+    /// Класс, к которому резолвится вызов (если удалось однозначно).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_class: Option<String>,
+}
+
 /// Результат поиска символа (объединённый)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolSearchResult {

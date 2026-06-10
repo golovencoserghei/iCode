@@ -1,4 +1,5 @@
 /// Инструменты глубокого анализа: транзитивный call-граф, реализации, мёртвый код.
+use super::oop::OopModel;
 use super::{normalize_glob, Storage};
 use super::models::*;
 use anyhow::Result;
@@ -152,6 +153,125 @@ impl Storage {
         let count = qns.len();
         let qn = if count == 1 { qns.into_iter().next().flatten() } else { None };
         (count, qn)
+    }
+
+    /// Класс функции по (имя, file_id) из qualified_name (`Class::method`).
+    fn class_of_fn(&self, fn_name: &str, file_id: i64) -> Option<String> {
+        self.conn
+            .query_row(
+                "SELECT qualified_name FROM functions WHERE name = ?1 AND file_id = ?2 LIMIT 1",
+                params![fn_name, file_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+            .and_then(|qn| qn.rsplit_once("::").map(|(c, _)| c.to_string()))
+    }
+
+    /// Резолв цели вызова по получателю + классу вызывающего + ООП-иерархии.
+    /// Возвращает (resolution, target_class). Тот же принцип, что в get_symbol_context.
+    fn resolve_call_target(
+        &self,
+        oop: Option<&OopModel>,
+        source_class: Option<&str>,
+        receiver: Option<&str>,
+        callee: &str,
+    ) -> (String, Option<String>) {
+        if let Some(o) = oop {
+            let (target, ancestors_only): (Option<String>, bool) = match receiver {
+                Some("$this") | Some("self") | Some("static") => (source_class.map(str::to_string), false),
+                Some("parent") => (source_class.map(str::to_string), true),
+                Some(r) if !r.starts_with('$') && o.knows_class(r) => (Some(r.to_string()), false),
+                _ => (None, false),
+            };
+            if let Some(cls) = target {
+                let def = if ancestors_only {
+                    o.resolve_in_ancestors(&cls, callee)
+                } else {
+                    o.resolve_method(&cls, callee)
+                };
+                if let Some(d) = def {
+                    let kind = if d == cls { "own" } else { "inherited" };
+                    return (kind.to_string(), Some(d));
+                }
+                // Получатель — известный класс, но метод в индексе не найден: цель всё равно класс.
+                if receiver.map(|r| !r.starts_with('$')).unwrap_or(false) {
+                    return ("by_name".to_string(), Some(cls));
+                }
+            }
+        }
+        match self.function_defs_lite(callee) {
+            (1, qn) => ("exact".to_string(), qn.and_then(|q| q.rsplit_once("::").map(|(c, _)| c.to_string()))),
+            (0, _) => (String::new(), None),
+            _ => ("by_name".to_string(), None),
+        }
+    }
+
+    /// Вызыватели функции с ООП-резолвом и опц. фильтром по целевому классу
+    /// (`class` = «кто вызывает class::name»). Возвращает (рёбра, всего_до_фильтра, имя_неоднозначно).
+    pub fn get_callers_resolved(
+        &self,
+        name: &str,
+        class_filter: Option<&str>,
+        language: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<ResolvedCall>, usize, bool)> {
+        let oop = self.build_oop_model().ok();
+        let ambiguous = self.function_definition_count(name) > 1;
+        let raw = self.get_callers(name, language)?;
+        let total = raw.len();
+        let mut out = Vec::new();
+        for rec in raw {
+            // Без class-фильтра незачем резолвить рёбра сверх лимита (на «толстых»
+            // функциях это тысячи лишних точечных запросов). С фильтром — сканируем
+            // всё, совпадений мало.
+            if class_filter.is_none() && out.len() >= limit {
+                break;
+            }
+            let src_class = self.class_of_fn(&rec.caller, rec.file_id);
+            let (resolution, target) =
+                self.resolve_call_target(oop.as_ref(), src_class.as_deref(), rec.receiver.as_deref(), name);
+            if let Some(cf) = class_filter {
+                if target.as_deref() != Some(cf) {
+                    continue;
+                }
+            }
+            let path = self.get_path_by_file_id(rec.file_id).ok().flatten().unwrap_or_default();
+            out.push(ResolvedCall { name: rec.caller, file_path: path, line: rec.line, resolution, target_class: target });
+        }
+        Ok((out, total, ambiguous))
+    }
+
+    /// Вызываемые функцией с ООП-резолвом и опц. фильтром по классу-источнику
+    /// (`class` = «что вызывает class::name» — какое из определений name брать).
+    pub fn get_callees_resolved(
+        &self,
+        name: &str,
+        class_filter: Option<&str>,
+        language: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<ResolvedCall>, usize, bool)> {
+        let oop = self.build_oop_model().ok();
+        let ambiguous = self.function_definition_count(name) > 1;
+        let raw = self.get_callees(name, language)?;
+        let total = raw.len();
+        let mut out = Vec::new();
+        for rec in raw {
+            if class_filter.is_none() && out.len() >= limit {
+                break;
+            }
+            let src_class = self.class_of_fn(name, rec.file_id);
+            if let Some(cf) = class_filter {
+                if src_class.as_deref() != Some(cf) {
+                    continue;
+                }
+            }
+            let (resolution, target) =
+                self.resolve_call_target(oop.as_ref(), src_class.as_deref(), rec.receiver.as_deref(), &rec.callee);
+            let path = self.get_path_by_file_id(rec.file_id).ok().flatten().unwrap_or_default();
+            out.push(ResolvedCall { name: rec.callee, file_path: path, line: rec.line, resolution, target_class: target });
+        }
+        Ok((out, total, ambiguous))
     }
 
     /// Полный контекст символа за один вызов: definition + callers + callees +
@@ -319,6 +439,15 @@ impl Storage {
             "f.name NOT LIKE '%_test'".to_string(),
             "f.name NOT IN ('main','run','start','execute','handle','setup','teardown','new','init','__init__','__new__','create','destroy','delete')".to_string(),
         ];
+        // Роут-хендлеры достижимы через маршрут (не по имени) — НЕ мёртвый код.
+        // Кросс-ссылка на таблицу routes; пропускаем условие, если её нет (старая readonly-БД).
+        if self.conn.prepare("SELECT 1 FROM routes LIMIT 0").is_ok() {
+            conds.push(
+                "f.qualified_name NOT IN (SELECT handler_class || '::' || handler_method \
+                 FROM routes WHERE handler_class IS NOT NULL AND handler_method IS NOT NULL)"
+                    .to_string(),
+            );
+        }
         let mut params_dyn: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(g) = path_glob {
             conds.push("fi.path GLOB ?".to_string());

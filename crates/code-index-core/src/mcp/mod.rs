@@ -129,6 +129,9 @@ pub struct FunctionNameParams {
     /// Максимум рёбер в ответе (по умолчанию 50). При усечении в _meta.note —
     /// сколько всего; сузьте language или поднимите limit для полноты.
     pub limit: Option<usize>,
+    /// Уточнить класс при коллизии имён (имя метода в нескольких классах).
+    /// callers: «кто вызывает class::name»; callees: «что вызывает class::name».
+    pub class: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -725,7 +728,7 @@ impl CodeIndexServer {
         tools::get_class(entry, p.name, p.path_glob).await
     }
 
-    #[tool(description = "Найти вызывателей функции (callers). Вызывай для КРИТИЧЕСКИХ и API-методов ПЕРЕД тем как угадывать параметры — показывает реальные сигнатуры вызовов в продакшн коде, а не предполагаемые. Возвращает JSON-массив CallRecord. По умолчанию максимум 50 рёбер (усечение помечается в _meta.note) — сузь language или подними limit.")]
+    #[tool(description = "Найти вызывателей функции (callers) с ООП-резолвом. Возвращает [{name, file_path, line, resolution (own/inherited/exact/by_name), target_class}]. Если имя метода есть в нескольких классах — уточни `class` (\"кто вызывает class::name\"), иначе в _meta.note предупреждение о смешении. Максимум 50 рёбер (усечение в _meta.note).")]
     async fn get_callers(&self, Parameters(p): Parameters<FunctionNameParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -733,10 +736,10 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "get_callers", &p,
             ).await;
         }
-        tools::get_callers(entry, p.function_name, p.language, p.limit).await
+        tools::get_callers(entry, p.function_name, p.language, p.limit, p.class).await
     }
 
-    #[tool(description = "Найти что вызывает функция (callees) в указанном репо. Возвращает JSON-массив CallRecord. По умолчанию максимум 50 рёбер (на «толстых» функциях остальное усекается с пометкой в _meta.note) — сузь language или подними limit.")]
+    #[tool(description = "Найти что вызывает функция (callees) с ООП-резолвом. Возвращает [{name, file_path, line, resolution, target_class}] — target_class показывает, в каком классе резолвится вызов ($this/self/parent/класс). Уточни `class` если имя в нескольких классах (\"что вызывает class::name\"). Максимум 50 рёбер (усечение в _meta.note).")]
     async fn get_callees(&self, Parameters(p): Parameters<FunctionNameParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -744,7 +747,7 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "get_callees", &p,
             ).await;
         }
-        tools::get_callees(entry, p.function_name, p.language, p.limit).await
+        tools::get_callees(entry, p.function_name, p.language, p.limit, p.class).await
     }
 
     #[tool(description = "Универсальный поиск символа по точному имени. По умолчанию ДЁШЕВО: функции/классы в lean-виде БЕЗ тел (+ variables, imports). include_body=true вернёт тела инлайн. path_glob — фильтр по пути. Возвращает {functions, classes, variables, imports}.")]

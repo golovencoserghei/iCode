@@ -699,10 +699,15 @@ fn class_const_name(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
 fn extract_handler(node: tree_sitter::Node, source: &[u8]) -> (Option<String>, Option<String>) {
     match node.kind() {
         "string" | "encapsed_string" => match string_literal(node, source) {
-            Some(s) => match s.split_once('@') {
-                Some((cls, m)) => (Some(cls.trim().to_string()), Some(m.trim().to_string())),
-                None => (Some(s), None),
-            },
+            Some(s) => {
+                // Нормализуем класс до короткого имени (как qualified_name функций),
+                // иначе 'App\Http\Ctrl@m' не сматчится с роут-хендлером в dead-code.
+                let short = |c: &str| c.trim().rsplit('\\').next().unwrap_or(c).trim().to_string();
+                match s.split_once('@') {
+                    Some((cls, m)) => (Some(short(cls)), Some(m.trim().to_string())),
+                    None => (Some(short(&s)), None),
+                }
+            }
             None => (None, None),
         },
         "array_creation_expression" => {
@@ -726,7 +731,98 @@ fn extract_handler(node: tree_sitter::Node, source: &[u8]) -> (Option<String>, O
     }
 }
 
-/// Попытаться распознать `Route::<verb>(...)` и добавить ParsedRoute в контекст.
+/// Добавить маршрут с применением префикса активных групп.
+fn push_route(
+    ctx: &mut VisitContext,
+    method: &str,
+    raw_path: &str,
+    handler_class: Option<String>,
+    handler_method: Option<String>,
+    line: usize,
+) {
+    let path = if ctx.route_prefix.is_empty() {
+        if raw_path.starts_with('/') { raw_path.to_string() } else { format!("/{}", raw_path.trim_matches('/')) }
+    } else {
+        join_route(&ctx.route_prefix, raw_path)
+    };
+    ctx.routes.push(ParsedRoute {
+        method: method.to_string(),
+        path,
+        handler_class,
+        handler_method,
+        name: None,
+        line,
+    });
+}
+
+/// Собрать строковые значения из массива-литерала (для `Route::match([...])`).
+fn array_string_values(node: tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    if node.kind() == "array_creation_expression" {
+        let mut cursor = node.walk();
+        for el in node.named_children(&mut cursor) {
+            if el.kind() == "array_element_initializer" {
+                let n = el.named_child_count();
+                if n > 0 {
+                    if let Some(v) = el.named_child(n - 1) {
+                        if let Some(s) = string_literal(v, source) {
+                            out.push(s);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Развернуть `Route::resource`/`apiResource` в стандартные экшены Laravel.
+/// `only`/`except` (из `->only([...])`/`->except([...])`) ограничивают набор —
+/// иначе фантомные маршруты «оживляли» бы реально удалённые экшены в dead-code.
+/// Ограничение: вложенные ресурсы (`users.posts`) дают неточный path (handler-метод
+/// при этом корректен) — точки в имени не разворачиваются в `/users/{user}/posts`.
+fn push_resource_routes(
+    ctx: &mut VisitContext,
+    name: &str,
+    controller: Option<String>,
+    api: bool,
+    only: Option<&[String]>,
+    except: Option<&[String]>,
+    line: usize,
+) {
+    let base = name.trim_matches('/');
+    // Параметр ресурса ≈ singular (Laravel): "users" → "{user}". Приближение —
+    // важна не точность имени параметра, а наличие маршрута и handler-метод.
+    let last = base.rsplit('/').next().unwrap_or(base);
+    let singular = last.strip_suffix('s').filter(|s| !s.is_empty()).unwrap_or(last);
+    let param = format!("{{{}}}", singular);
+    // (method, путь-суффикс, handler-метод)
+    let mut actions: Vec<(&str, String, &str)> = vec![
+        ("GET", String::new(), "index"),
+        ("POST", String::new(), "store"),
+        ("GET", format!("/{}", param), "show"),
+        ("PUT", format!("/{}", param), "update"),
+        ("DELETE", format!("/{}", param), "destroy"),
+    ];
+    if !api {
+        actions.push(("GET", "/create".to_string(), "create"));
+        actions.push(("GET", format!("/{}/edit", param), "edit"));
+    }
+    // ->only([...]) / ->except([...]) ограничивают набор экшенов.
+    actions.retain(|(_, _, hm)| match (only, except) {
+        (Some(o), _) => o.iter().any(|x| x == hm),
+        (None, Some(e)) => !e.iter().any(|x| x == hm),
+        (None, None) => true,
+    });
+    for (method, suffix, hm) in actions {
+        let path = format!("{}{}", base, suffix);
+        push_route(ctx, method, &path, controller.clone(), Some(hm.to_string()), line);
+    }
+}
+
+/// Попытаться распознать `Route::<verb>(...)` и добавить маршрут(ы) в контекст.
+/// Поддержка: get/post/put/patch/delete/options/any, match([...]), resource/
+/// apiResource (разворачивается в экшены), view, redirect/permanentRedirect.
 fn try_extract_route(node: tree_sitter::Node, ctx: &mut VisitContext) {
     let source = ctx.source;
 
@@ -743,50 +839,72 @@ fn try_extract_route(node: tree_sitter::Node, ctx: &mut VisitContext) {
     let verb = node
         .child_by_field_name("name")
         .map(|n| node_text(n, source))
-        .unwrap_or("");
-    let method = match verb.to_ascii_lowercase().as_str() {
-        "get" => "GET",
-        "post" => "POST",
-        "put" => "PUT",
-        "patch" => "PATCH",
-        "delete" => "DELETE",
-        "options" => "OPTIONS",
-        "any" => "ANY",
-        "match" => "MATCH",
-        _ => return,
-    };
+        .unwrap_or("")
+        .to_ascii_lowercase();
 
     let Some(args) = node.child_by_field_name("arguments") else {
         return;
     };
     let arg_exprs = collect_arg_exprs(args);
-
-    // `Route::match([methods], '/path', handler)` сдвигает path/handler на 1.
-    let (path_idx, handler_idx) = if method == "MATCH" { (1, 2) } else { (0, 1) };
-
-    let Some(raw_path) = arg_exprs.get(path_idx).and_then(|n| string_literal(*n, source)) else {
-        return;
-    };
-    let (handler_class, handler_method) = arg_exprs
-        .get(handler_idx)
-        .map(|n| extract_handler(*n, source))
-        .unwrap_or((None, None));
-
-    // Префикс активных групп (Route::prefix('admin')->group(...)) → полный путь.
-    let path = if ctx.route_prefix.is_empty() {
-        raw_path
-    } else {
-        join_route(&ctx.route_prefix, &raw_path)
+    let line = node.start_position().row + 1;
+    let sl = |i: usize| arg_exprs.get(i).and_then(|n| string_literal(*n, source));
+    let handler = |i: usize| {
+        arg_exprs.get(i).map(|n| extract_handler(*n, source)).unwrap_or((None, None))
     };
 
-    ctx.routes.push(ParsedRoute {
-        method: method.to_string(),
-        path,
-        handler_class,
-        handler_method,
-        name: None,
-        line: node.start_position().row + 1,
-    });
+    match verb.as_str() {
+        "get" | "post" | "put" | "patch" | "delete" | "options" | "any" => {
+            let Some(path) = sl(0) else { return };
+            let (hc, hm) = handler(1);
+            push_route(ctx, &verb.to_uppercase(), &path, hc, hm, line);
+        }
+        "match" => {
+            // Route::match(['get','post'], '/path', handler) → по маршруту на метод.
+            let methods = arg_exprs.first().map(|n| array_string_values(*n, source)).unwrap_or_default();
+            let Some(path) = sl(1) else { return };
+            let (hc, hm) = handler(2);
+            for m in methods {
+                push_route(ctx, &m.to_uppercase(), &path, hc.clone(), hm.clone(), line);
+            }
+        }
+        "resource" | "apiresource" => {
+            let Some(name) = sl(0) else { return };
+            // Контроллер resource передаётся как `Ctrl::class` (class-константа),
+            // реже строкой/массивом — class_const_name покрывает все варианты.
+            let controller = arg_exprs.get(1).and_then(|n| class_const_name(*n, source));
+            // ->only([...]) / ->except([...]) в цепочке вызовов ограничивают экшены.
+            let (mut only, mut except): (Option<Vec<String>>, Option<Vec<String>>) = (None, None);
+            let mut p = node.parent();
+            while let Some(pn) = p {
+                if !matches!(pn.kind(), "member_call_expression" | "nullsafe_member_call_expression") {
+                    break;
+                }
+                let nm = pn.child_by_field_name("name").map(|x| node_text(x, source)).unwrap_or("");
+                if (nm == "only" || nm == "except") && only.is_none() && except.is_none() {
+                    if let Some(args) = pn.child_by_field_name("arguments") {
+                        if let Some(arr) = collect_arg_exprs(args).into_iter().next() {
+                            let vals = array_string_values(arr, source);
+                            if nm == "only" { only = Some(vals); } else { except = Some(vals); }
+                        }
+                    }
+                }
+                p = pn.parent();
+            }
+            push_resource_routes(ctx, &name, controller, verb == "apiresource", only.as_deref(), except.as_deref(), line);
+        }
+        "view" => {
+            // Route::view('/x', 'view-name') → GET, без контроллер-хендлера.
+            if let Some(path) = sl(0) {
+                push_route(ctx, "GET", &path, None, None, line);
+            }
+        }
+        "redirect" | "permanentredirect" => {
+            if let Some(path) = sl(0) {
+                push_route(ctx, "ANY", &path, None, None, line);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Объединить префиксы групп и путь маршрута в один URL с одиночными `/`.
@@ -1264,6 +1382,58 @@ Route::get('/public', [HomeController::class, 'index']);
         assert_eq!(p("GET", "users").as_deref(), Some("/admin/users"));
         assert_eq!(p("GET", "daily").as_deref(), Some("/admin/reports/daily"), "вложенные префиксы");
         assert_eq!(p("GET", "index").as_deref(), Some("/public"), "вне группы — без префикса");
+    }
+
+    #[test]
+    fn test_route_resource_match_view_redirect() {
+        let parser = PhpParser::new();
+        let source = r#"<?php
+Route::resource('users', UserController::class);
+Route::apiResource('photos', PhotoController::class);
+Route::match(['get', 'post'], '/search', [SearchController::class, 'run']);
+Route::view('/welcome', 'welcome');
+Route::redirect('/old', '/new');
+"#;
+        let r = parser.parse(source, "routes/web.php").unwrap();
+        // resource → 7 экшенов
+        let users: Vec<_> = r.routes.iter().filter(|x| x.handler_class.as_deref() == Some("UserController")).collect();
+        assert_eq!(users.len(), 7, "resource = 7 маршрутов");
+        let has = |m: &str, p: &str, h: &str| users.iter().any(|x| x.method == m && x.path == p && x.handler_method.as_deref() == Some(h));
+        assert!(has("GET", "/users", "index"));
+        assert!(has("POST", "/users", "store"));
+        assert!(has("GET", "/users/{user}", "show"));
+        assert!(has("PUT", "/users/{user}", "update"));
+        assert!(has("DELETE", "/users/{user}", "destroy"));
+        assert!(has("GET", "/users/create", "create"));
+        assert!(has("GET", "/users/{user}/edit", "edit"));
+        // apiResource → 5 (без create/edit)
+        let photos: Vec<_> = r.routes.iter().filter(|x| x.handler_class.as_deref() == Some("PhotoController")).collect();
+        assert_eq!(photos.len(), 5, "apiResource = 5 маршрутов");
+        assert!(!photos.iter().any(|x| matches!(x.handler_method.as_deref(), Some("create") | Some("edit"))));
+        // match → по маршруту на метод
+        let search: Vec<_> = r.routes.iter().filter(|x| x.handler_method.as_deref() == Some("run")).collect();
+        assert_eq!(search.len(), 2);
+        assert!(search.iter().any(|x| x.method == "GET" && x.path == "/search"));
+        assert!(search.iter().any(|x| x.method == "POST"));
+        // view / redirect — без контроллер-хендлера
+        assert!(r.routes.iter().any(|x| x.method == "GET" && x.path == "/welcome" && x.handler_class.is_none()));
+        assert!(r.routes.iter().any(|x| x.path == "/old"));
+    }
+
+    #[test]
+    fn test_route_resource_only_except() {
+        let parser = PhpParser::new();
+        let source = r#"<?php
+Route::resource('a', AController::class)->only(['index', 'store']);
+Route::resource('b', BController::class)->except(['destroy']);
+"#;
+        let r = parser.parse(source, "routes/web.php").unwrap();
+        let a: Vec<_> = r.routes.iter().filter(|x| x.handler_class.as_deref() == Some("AController")).collect();
+        assert_eq!(a.len(), 2, "only(['index','store']) → 2 маршрута");
+        assert!(a.iter().all(|x| matches!(x.handler_method.as_deref(), Some("index") | Some("store"))));
+        let b: Vec<_> = r.routes.iter().filter(|x| x.handler_class.as_deref() == Some("BController")).collect();
+        assert_eq!(b.len(), 6, "except(['destroy']) → 7−1");
+        assert!(!b.iter().any(|x| x.handler_method.as_deref() == Some("destroy")));
     }
 
     #[test]

@@ -1500,6 +1500,31 @@ class App:
         assert_eq!(ctx.routes[0].path, "/users");
     }
 
+    /// get_callers: ООП-резолв + class-фильтр разруливает коллизию одноимённых методов.
+    #[test]
+    fn test_callers_resolution_and_class_filter() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("app")).unwrap();
+        fs::write(tmp.path().join("app/A.php"),
+            "<?php\nclass A {\n public function save() {}\n public function run() { $this->save(); }\n}\n").unwrap();
+        fs::write(tmp.path().join("app/B.php"),
+            "<?php\nclass B {\n public function save() {}\n public function go() { $this->save(); }\n}\n").unwrap();
+        let mut storage = Storage::open_in_memory().unwrap();
+        Indexer::new(&mut storage).full_reindex(tmp.path(), false).unwrap();
+
+        // Без class: оба вызывателя, помечено ambiguous (save в 2 классах).
+        let (all, _total, ambiguous) = storage.get_callers_resolved("save", None, None, 50).unwrap();
+        assert!(ambiguous, "save определён в двух классах");
+        assert_eq!(all.len(), 2, "run (из A) и go (из B)");
+        assert!(all.iter().all(|c| c.resolution == "own"), "$this->save() резолвится в свой класс");
+
+        // class=A: только run, цель A::save.
+        let (a, _, _) = storage.get_callers_resolved("save", Some("A"), None, 50).unwrap();
+        assert_eq!(a.len(), 1, "только вызыватель из A");
+        assert_eq!(a[0].name, "run");
+        assert_eq!(a[0].target_class.as_deref(), Some("A"));
+    }
+
     /// icode doctor: сверка индекса с диском детектит пропущенные/устаревшие/удалённые.
     #[test]
     fn test_doctor_detects_drift() {
