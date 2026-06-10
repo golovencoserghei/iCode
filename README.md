@@ -187,6 +187,14 @@ framework-методов, а `get_symbol_context` резолвит унасле�
 Route::get('/users', [UserController::class, 'index']);   // → GET /users → UserController::index
 Route::post('/users', 'UserController@store');            // → POST /users → UserController::store
 Route::delete('/users/{id}', [UserController::class, 'destroy'])->name('users.destroy');
+
+// Группы с префиксами — вложенные маршруты получают полный путь:
+Route::prefix('admin')->group(function () {
+    Route::get('/users', [AdminController::class, 'users']);          // → /admin/users
+});
+Route::group(['prefix' => 'api/v1'], function () {
+    Route::post('/users', [UserController::class, 'store']);          // → /api/v1/users
+});
 ```
 
 - `find_routes` — поиск по маршрутам (фильтры `method` / `path` / `handler`).

@@ -28,6 +28,9 @@
   HTTP-метод + URL с контроллером@методом:
   - PHP/Laravel: `Route::get/post/put/patch/delete/options/any/match(...)` с
     хендлером `[Ctrl::class, 'm']`, `'Ctrl@m'` или closure (включая цепочку `->name(...)`)
+  - route-группы с префиксами: `Route::prefix('admin')->group(...)` и
+    `Route::group(['prefix' => 'admin'], ...)` — вложенные маршруты получают полный
+    путь (`/admin/users`), префиксы аккумулируются по вложенности; только фасад `Route`
   - Таблица `routes` в SQLite (миграция v5), узел `Route` + ребро `HANDLED_BY`
     в граф-слое (Neo4j/Memgraph)
   - Новый MCP-инструмент **`find_routes`** (фильтры: method, path, handler)

@@ -69,6 +69,9 @@ struct VisitContext<'a> {
     calls: Vec<ParsedCall>,
     variables: Vec<ParsedVariable>,
     routes: Vec<ParsedRoute>,
+    /// Стек префиксов активных route-групп (Route::prefix('x')->group / Route::group).
+    /// Вложенные группы аккумулируются; маршруты внутри получают объединённый путь.
+    route_prefix: Vec<String>,
 }
 
 impl<'a> VisitContext<'a> {
@@ -81,6 +84,7 @@ impl<'a> VisitContext<'a> {
             calls: Vec::new(),
             variables: Vec::new(),
             routes: Vec::new(),
+            route_prefix: Vec::new(),
         }
     }
 }
@@ -140,12 +144,34 @@ fn visit_node(
             if node.kind() == "scoped_call_expression" {
                 try_extract_route(node, ctx);
             }
+            // Route-группы: на время обхода closure группы кладём её префикс в стек,
+            // чтобы вложенные маршруты получили объединённый путь. source — Copy-ссылка,
+            // не держит заём ctx, поэтому можно мутировать ctx.route_prefix.
+            let src = ctx.source;
+            let call_name = node
+                .child_by_field_name("name")
+                .map(|n| node_text(n, src))
+                .unwrap_or("");
+            let pushed_prefix = if call_name == "group" {
+                match extract_group_prefix(node, src) {
+                    Some(p) if !p.trim().is_empty() => {
+                        ctx.route_prefix.push(p);
+                        true
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            };
             // Рекурсия в object-часть для цепочек: $this->a()->b()->c()
             // AST: member_call[object=member_call[object=...], name=c]
             if let Some(obj) = node.child_by_field_name("object") {
                 visit_node(obj, ctx, class_name, current_func);
             }
             recurse_into_arguments(node, ctx, class_name, current_func);
+            if pushed_prefix {
+                ctx.route_prefix.pop();
+            }
         }
         "expression_statement" => {
             // Переменные на уровне файла/программы
@@ -738,13 +764,20 @@ fn try_extract_route(node: tree_sitter::Node, ctx: &mut VisitContext) {
     // `Route::match([methods], '/path', handler)` сдвигает path/handler на 1.
     let (path_idx, handler_idx) = if method == "MATCH" { (1, 2) } else { (0, 1) };
 
-    let Some(path) = arg_exprs.get(path_idx).and_then(|n| string_literal(*n, source)) else {
+    let Some(raw_path) = arg_exprs.get(path_idx).and_then(|n| string_literal(*n, source)) else {
         return;
     };
     let (handler_class, handler_method) = arg_exprs
         .get(handler_idx)
         .map(|n| extract_handler(*n, source))
         .unwrap_or((None, None));
+
+    // Префикс активных групп (Route::prefix('admin')->group(...)) → полный путь.
+    let path = if ctx.route_prefix.is_empty() {
+        raw_path
+    } else {
+        join_route(&ctx.route_prefix, &raw_path)
+    };
 
     ctx.routes.push(ParsedRoute {
         method: method.to_string(),
@@ -754,6 +787,98 @@ fn try_extract_route(node: tree_sitter::Node, ctx: &mut VisitContext) {
         name: None,
         line: node.start_position().row + 1,
     });
+}
+
+/// Объединить префиксы групп и путь маршрута в один URL с одиночными `/`.
+/// `(["admin"], "/users")` → `/admin/users`; `(["a","b"], "/")` → `/a/b`.
+fn join_route(prefixes: &[String], path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for p in prefixes {
+        let t = p.trim_matches('/');
+        if !t.is_empty() {
+            parts.push(t);
+        }
+    }
+    let pt = path.trim_matches('/');
+    if !pt.is_empty() {
+        parts.push(pt);
+    }
+    format!("/{}", parts.join("/"))
+}
+
+/// Является ли scope scoped-call'а фасадом `Route` (последний сегмент пути).
+fn scope_is_route(call: tree_sitter::Node, source: &[u8]) -> bool {
+    call.child_by_field_name("scope")
+        .map(|n| node_text(n, source).rsplit('\\').next().unwrap_or("").trim() == "Route")
+        .unwrap_or(false)
+}
+
+/// Первый строковый аргумент вызова (для `prefix('x')`).
+fn first_string_arg(call: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let args = call.child_by_field_name("arguments")?;
+    collect_arg_exprs(args).into_iter().next().and_then(|a| string_literal(a, source))
+}
+
+/// Извлечь префикс route-группы. ТОЛЬКО для фасада `Route` (как try_extract_route),
+/// иначе не-Route `$x->group(...)` ложно префиксовал бы вложенные Route::-вызовы.
+///   * `Route::group(['prefix' => 'admin'], cl)` — из массива-конфига;
+///   * `Route::prefix('admin')->group(cl)` (в т.ч. с middleware в цепочке) — из
+///     вызова `prefix(...)`; корень цепочки обязан быть `Route`.
+fn extract_group_prefix(group_call: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    // Pattern A: Route::group([config], closure)
+    if group_call.kind() == "scoped_call_expression" {
+        if !scope_is_route(group_call, source) {
+            return None;
+        }
+        let args = group_call.child_by_field_name("arguments")?;
+        let first = collect_arg_exprs(args).into_iter().next()?;
+        if first.kind() == "array_creation_expression" {
+            return array_prefix_value(first, source);
+        }
+        return None;
+    }
+    // Pattern B: X->group(closure) — идём по object-цепочке, запоминаем prefix('x'),
+    // и возвращаем его ТОЛЬКО если корень цепочки — Route.
+    let mut found: Option<String> = None;
+    let mut cur = group_call.child_by_field_name("object");
+    while let Some(n) = cur {
+        match n.kind() {
+            "member_call_expression" | "nullsafe_member_call_expression" => {
+                let nm = n.child_by_field_name("name").map(|x| node_text(x, source)).unwrap_or("");
+                if nm == "prefix" && found.is_none() {
+                    found = first_string_arg(n, source);
+                }
+                cur = n.child_by_field_name("object");
+            }
+            "scoped_call_expression" => {
+                // Корень цепочки (Route::prefix / Route::middleware / ...).
+                let nm = n.child_by_field_name("name").map(|x| node_text(x, source)).unwrap_or("");
+                if nm == "prefix" && found.is_none() {
+                    found = first_string_arg(n, source);
+                }
+                return if scope_is_route(n, source) { found } else { None };
+            }
+            _ => break, // корень — переменная/имя (не Route) → не группа Route
+        }
+    }
+    None
+}
+
+/// Найти значение ключа `'prefix'` в массиве-конфиге группы.
+fn array_prefix_value(arr: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let mut cursor = arr.walk();
+    for el in arr.named_children(&mut cursor) {
+        if el.kind() == "array_element_initializer" {
+            let mut ec = el.walk();
+            let kids: Vec<tree_sitter::Node> = el.named_children(&mut ec).collect();
+            if kids.len() >= 2 {
+                if string_literal(kids[0], source).as_deref() == Some("prefix") {
+                    return string_literal(kids[1], source);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn parse_php(source: &str) -> Result<ParseResult> {
@@ -1118,6 +1243,60 @@ Route::delete('/users/{id}', [UserController::class, 'destroy'])->name('users.de
         let del = result.routes.iter().find(|r| r.method == "DELETE").unwrap();
         assert_eq!(del.path, "/users/{id}");
         assert_eq!(del.handler_method.as_deref(), Some("destroy"));
+    }
+
+    #[test]
+    fn test_route_group_prefix_fluent() {
+        let parser = PhpParser::new();
+        let source = r#"<?php
+Route::prefix('admin')->group(function () {
+    Route::get('/users', [AdminController::class, 'users']);
+    Route::middleware('auth')->prefix('reports')->group(function () {
+        Route::get('/daily', [ReportController::class, 'daily']);
+    });
+});
+Route::get('/public', [HomeController::class, 'index']);
+"#;
+        let result = parser.parse(source, "routes/web.php").unwrap();
+        let p = |m: &str, h: &str| result.routes.iter()
+            .find(|r| r.handler_method.as_deref() == Some(h) && r.method == m)
+            .map(|r| r.path.clone());
+        assert_eq!(p("GET", "users").as_deref(), Some("/admin/users"));
+        assert_eq!(p("GET", "daily").as_deref(), Some("/admin/reports/daily"), "вложенные префиксы");
+        assert_eq!(p("GET", "index").as_deref(), Some("/public"), "вне группы — без префикса");
+    }
+
+    #[test]
+    fn test_non_route_group_does_not_prefix() {
+        let parser = PhpParser::new();
+        // Не-Route group/prefix не должен префиксовать вложенные Route::-маршруты.
+        let source = r#"<?php
+$items->prefix('oops')->group(function () {
+    Route::get('/real', [C::class, 'real']);
+});
+Builder::group(['prefix' => 'nope'], function () {
+    Route::post('/x', [C::class, 'x']);
+});
+"#;
+        let result = parser.parse(source, "routes/web.php").unwrap();
+        let real = result.routes.iter().find(|r| r.handler_method.as_deref() == Some("real")).unwrap();
+        assert_eq!(real.path, "/real", "не-Route ->group не должен добавлять префикс");
+        let x = result.routes.iter().find(|r| r.handler_method.as_deref() == Some("x")).unwrap();
+        assert_eq!(x.path, "/x", "не-Route ::group не должен добавлять префикс");
+    }
+
+    #[test]
+    fn test_route_group_prefix_array() {
+        let parser = PhpParser::new();
+        let source = r#"<?php
+Route::group(['prefix' => 'api/v1', 'middleware' => 'auth'], function () {
+    Route::post('/users', [UserController::class, 'store']);
+});
+"#;
+        let result = parser.parse(source, "routes/api.php").unwrap();
+        let r = result.routes.iter().find(|r| r.method == "POST").unwrap();
+        assert_eq!(r.path, "/api/v1/users");
+        assert_eq!(r.handler_method.as_deref(), Some("store"));
     }
 
     #[test]
