@@ -101,6 +101,10 @@ pub struct SearchParams {
     /// Glob по path для сужения поиска (Phase 1, post-filter в MCP-слое).
     /// Например `src/**/*.py` или `Documents/**`.
     pub path_glob: Option<String>,
+    /// Вернуть полные тела функций/классов инлайн. По умолчанию false — выдаётся
+    /// lean-проекция (имя, сигнатура, путь, строки) для экономии токенов; тело
+    /// тянут точечно через get_function/read_file.
+    pub include_body: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -111,6 +115,9 @@ pub struct NameParams {
     pub language: Option<String>,
     /// Glob по path (Phase 1, post-filter).
     pub path_glob: Option<String>,
+    /// Только для find_symbol: вернуть тела инлайн (по умолчанию lean без тел).
+    /// get_function/get_class игнорируют — они всегда возвращают тело.
+    pub include_body: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -119,6 +126,9 @@ pub struct FunctionNameParams {
     pub repo: String,
     pub function_name: String,
     pub language: Option<String>,
+    /// Максимум рёбер в ответе (по умолчанию 50). При усечении в _meta.note —
+    /// сколько всего; сузьте language или поднимите limit для полноты.
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -283,6 +293,36 @@ pub struct DeadCodeParams {
     pub repo: String,
     pub language: Option<String>,
     pub path_glob: Option<String>,
+    pub limit: Option<usize>,
+}
+
+/// Параметры `get_repo_map`: архитектурная карта репозитория за один вызов.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct RepoMapParams {
+    pub repo: String,
+    /// Сколько элементов в каждой секции (модули/сложность/hotspots). По умолчанию 12.
+    pub top: Option<usize>,
+}
+
+/// Параметры `find_complex_functions`: ранжирование функций по сложности.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ComplexParams {
+    pub repo: String,
+    pub limit: Option<usize>,
+    pub path_glob: Option<String>,
+    pub language: Option<String>,
+}
+
+/// Параметры `find_routes`: веб-маршруты фреймворка (framework-aware routing).
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct FindRoutesParams {
+    pub repo: String,
+    /// Фильтр по HTTP-методу (GET/POST/…). Регистронезависимо. Опционально.
+    pub method: Option<String>,
+    /// Подстрока URL-пути (`/users`). Опционально.
+    pub path: Option<String>,
+    /// Подстрока по контроллеру или методу-хендлеру (`UserController`, `store`). Опционально.
+    pub handler: Option<String>,
     pub limit: Option<usize>,
 }
 
@@ -641,7 +681,7 @@ fn collect_extension_tools(
 
 #[tool_router]
 impl CodeIndexServer {
-    #[tool(description = "FTS поиск функций по имени, docstring или телу. Возвращает FunctionRecord с line_start/line_end — используй их для targeted read_file. Для навигации по файлу используй get_file_outline (дёшево), для полных тел — get_file_summary. path_glob — фильтр (`src/**/*.py`).")]
+    #[tool(description = "FTS поиск функций по имени, docstring или телу. По умолчанию ДЁШЕВО: lean-проекция {name, qualified_name, file_path, line_start, line_end, args, return_type, docstring} БЕЗ тел — локализуй символ, затем тяни тело точечно через get_function/read_file по строкам. include_body=true вернёт полные тела инлайн. path_glob — фильтр (`src/**/*.py`).")]
     async fn search_function(&self, Parameters(p): Parameters<SearchParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -649,10 +689,10 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "search_function", &p,
             ).await;
         }
-        tools::search_function(entry, p.query, p.limit, p.language, p.path_glob).await
+        tools::search_function(entry, p.query, p.limit, p.language, p.path_glob, p.include_body).await
     }
 
-    #[tool(description = "FTS поиск классов по имени, docstring или телу. Возвращает ClassRecord с line_start/line_end. Для навигации по файлу — get_file_outline, для полных тел — get_file_summary. path_glob — фильтр по пути.")]
+    #[tool(description = "FTS поиск классов по имени, docstring или телу. По умолчанию ДЁШЕВО: lean-проекция {name, file_path, line_start, line_end, bases, docstring} БЕЗ тел. include_body=true — полные тела. Для тел конкретного класса — get_class. path_glob — фильтр по пути.")]
     async fn search_class(&self, Parameters(p): Parameters<SearchParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -660,7 +700,7 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "search_class", &p,
             ).await;
         }
-        tools::search_class(entry, p.query, p.limit, p.language, p.path_glob).await
+        tools::search_class(entry, p.query, p.limit, p.language, p.path_glob, p.include_body).await
     }
 
     #[tool(description = "Найти функцию по точному имени. Возвращает FunctionRecord с body и line_start/line_end. Если нужен только список функций файла без тел — используй get_file_outline. path_glob — фильтр по пути.")]
@@ -685,7 +725,7 @@ impl CodeIndexServer {
         tools::get_class(entry, p.name, p.path_glob).await
     }
 
-    #[tool(description = "Найти вызывателей функции (callers). Вызывай для КРИТИЧЕСКИХ и API-методов ПЕРЕД тем как угадывать параметры — показывает реальные сигнатуры вызовов в продакшн коде, а не предполагаемые. Возвращает JSON-массив CallRecord.")]
+    #[tool(description = "Найти вызывателей функции (callers). Вызывай для КРИТИЧЕСКИХ и API-методов ПЕРЕД тем как угадывать параметры — показывает реальные сигнатуры вызовов в продакшн коде, а не предполагаемые. Возвращает JSON-массив CallRecord. По умолчанию максимум 50 рёбер (усечение помечается в _meta.note) — сузь language или подними limit.")]
     async fn get_callers(&self, Parameters(p): Parameters<FunctionNameParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -693,10 +733,10 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "get_callers", &p,
             ).await;
         }
-        tools::get_callers(entry, p.function_name, p.language).await
+        tools::get_callers(entry, p.function_name, p.language, p.limit).await
     }
 
-    #[tool(description = "Найти что вызывает функция (callees) в указанном репо. Возвращает JSON-массив CallRecord.")]
+    #[tool(description = "Найти что вызывает функция (callees) в указанном репо. Возвращает JSON-массив CallRecord. По умолчанию максимум 50 рёбер (на «толстых» функциях остальное усекается с пометкой в _meta.note) — сузь language или подними limit.")]
     async fn get_callees(&self, Parameters(p): Parameters<FunctionNameParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -704,10 +744,10 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "get_callees", &p,
             ).await;
         }
-        tools::get_callees(entry, p.function_name, p.language).await
+        tools::get_callees(entry, p.function_name, p.language, p.limit).await
     }
 
-    #[tool(description = "Универсальный поиск символа по точному имени в указанном репо. path_glob — опциональный фильтр по пути. Возвращает JSON-объект {functions, classes, variables, imports}.")]
+    #[tool(description = "Универсальный поиск символа по точному имени. По умолчанию ДЁШЕВО: функции/классы в lean-виде БЕЗ тел (+ variables, imports). include_body=true вернёт тела инлайн. path_glob — фильтр по пути. Возвращает {functions, classes, variables, imports}.")]
     async fn find_symbol(&self, Parameters(p): Parameters<NameParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -715,7 +755,7 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "find_symbol", &p,
             ).await;
         }
-        tools::find_symbol(entry, p.name, p.language, p.path_glob).await
+        tools::find_symbol(entry, p.name, p.language, p.path_glob, p.include_body).await
     }
 
     #[tool(description = "Импорты файла (file_id) или модуля (module). Вызывай ПЕРЕД написанием нового кода — увидеть какие зависимости уже используются в похожих файлах, не изобретать свои. Возвращает JSON-массив ImportRecord.")]
@@ -877,7 +917,7 @@ impl CodeIndexServer {
 
     // ── Deep analysis tools ──────────────────────────────────────────────────
 
-    #[tool(description = "🔍 СУПЕР-ИНСТРУМЕНТ: полный контекст символа за ОДИН вызов вместо 7. Возвращает: definition (тело), callers (кто вызывает), callees (что вызывает), file_outline (скелет файла), file_imports (импорты). Если имя неоднозначно — возвращает kind='ambiguous' + список кандидатов, уточни file_hint. Заменяет: get_function + get_callers + get_callees + get_file_outline + get_imports.")]
+    #[tool(description = "🔍 СУПЕР-ИНСТРУМЕНТ: полный контекст символа за ОДИН вызов вместо 7. Возвращает: definition (тело), callers, callees, file_outline, file_imports, routes (веб-маршруты, если это контроллер-метод), inheritance (ООП: какие методы предков переопределяет/реализует и кто переопределяет его). Если имя неоднозначно — kind='ambiguous' + кандидаты, уточни file_hint. Заменяет: get_function + get_callers + get_callees + get_file_outline + get_imports.")]
     async fn get_symbol_context(&self, Parameters(p): Parameters<SymbolContextParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -930,6 +970,39 @@ impl CodeIndexServer {
             ).await;
         }
         tools::find_dead_code(entry, p.language, p.path_glob, p.limit).await
+    }
+
+    #[tool(description = "🗺️ ПЕРВЫЙ ВЫЗОВ для незнакомого репо: глубокая архитектурная карта за ОДИН дешёвый вызов (~сотни токенов вместо десятков grep/read). Возвращает: counts, languages, modules (крупнейшие директории), complex_functions (где сосредоточена сложность: span+fan_out+callers), call_hotspots (самые вызываемые ПРОЕКТНЫЕ функции, без stdlib-шума), entry_points (оркестраторы/корни), parse_errors (сколько файлов НЕ проиндексировано — слепые зоны). top — размер каждой секции (default 12).")]
+    async fn get_repo_map(&self, Parameters(p): Parameters<RepoMapParams>) -> String {
+        let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
+        if !entry.is_local {
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients, &entry.ip, entry.port, "get_repo_map", &p,
+            ).await;
+        }
+        tools::get_repo_map(entry, p.top).await
+    }
+
+    #[tool(description = "Функции, отранжированные по сложности (длина + fan-out + fan-in) — где сосредоточена сложность и что рефакторить/ревьюить в первую очередь. Фильтры path_glob/language, limit (default 15). Возвращает [{name, qualified_name, file_path, line_start, line_end, span, fan_out, callers}].")]
+    async fn find_complex_functions(&self, Parameters(p): Parameters<ComplexParams>) -> String {
+        let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
+        if !entry.is_local {
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients, &entry.ip, entry.port, "find_complex_functions", &p,
+            ).await;
+        }
+        tools::find_complex_functions(entry, p.limit, p.path_glob, p.language).await
+    }
+
+    #[tool(description = "🌐 Веб-маршруты фреймворка (framework-aware routing): связывает HTTP-метод + URL с контроллером@методом. Для веб-проекта это ТОЧКА ВХОДА — начинай навигацию отсюда: 'какой контроллер обрабатывает POST /users?'. Фильтры: method (GET/POST/…), path (подстрока URL), handler (подстрока класса/метода). Сейчас распознаётся Laravel/PHP (Route::get/post/… + [Ctrl::class,'m'] / 'Ctrl@m'). Возвращает [{method, path, handler_class, handler_method, file_path, line}].")]
+    async fn find_routes(&self, Parameters(p): Parameters<FindRoutesParams>) -> String {
+        let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
+        if !entry.is_local {
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients, &entry.ip, entry.port, "find_routes", &p,
+            ).await;
+        }
+        tools::find_routes(entry, p.method, p.path, p.handler, p.limit).await
     }
 }
 

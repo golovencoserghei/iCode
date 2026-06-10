@@ -15,6 +15,9 @@ CREATE INDEX IF NOT EXISTS idx_calls_callee       ON calls(callee);
 CREATE INDEX IF NOT EXISTS idx_calls_file         ON calls(file_id);
 CREATE INDEX IF NOT EXISTS idx_variables_name     ON variables(name);
 CREATE INDEX IF NOT EXISTS idx_variables_file     ON variables(file_id);
+CREATE INDEX IF NOT EXISTS idx_routes_handler     ON routes(handler_class, handler_method);
+CREATE INDEX IF NOT EXISTS idx_routes_method      ON routes(method);
+CREATE INDEX IF NOT EXISTS idx_routes_file        ON routes(file_id);
 ";
 
 /// SQL для создания FTS-триггеров (отдельная константа, чтобы переиспользовать при rebuild)
@@ -206,6 +209,10 @@ pub fn initialize_tables_only(conn: &rusqlite::Connection) -> rusqlite::Result<(
     migrate_v2(conn)?;
     migrate_v3(conn)?;
     migrate_v4(conn)?;
+    migrate_v5(conn)?;
+    migrate_v6(conn)?;
+    migrate_v7(conn)?;
+    migrate_v8(conn)?;
     Ok(())
 }
 
@@ -232,6 +239,10 @@ pub fn initialize(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     migrate_v2(conn)?;
     migrate_v3(conn)?;
     migrate_v4(conn)?;
+    migrate_v5(conn)?;
+    migrate_v6(conn)?;
+    migrate_v7(conn)?;
+    migrate_v8(conn)?;
     // Создаём триггеры
     conn.execute_batch(TRIGGERS_SQL)?;
     // Создаём индексы
@@ -300,6 +311,78 @@ pub fn migrate_v4(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Миграция v5 (framework-aware routing): таблица `routes` — веб-маршруты
+/// фреймворков (Laravel `Route::get(...)` и др.), связывающие HTTP-метод + URL
+/// с хендлером (контроллер@метод). Хендлер хранится разобранным на класс/метод,
+/// чтобы `find_routes` и `get_symbol_context` могли мгновенно матчить
+/// контроллер-методы с их маршрутами.
+///
+///   * `method`         — HTTP-метод в верхнем регистре (GET/POST/…/ANY/MATCH).
+///   * `path`           — URL-шаблон как в коде (`/users/{id}`).
+///   * `handler_class`  — класс контроллера (NULL для closure).
+///   * `handler_method` — метод контроллера (NULL для closure / invokable).
+pub fn migrate_v5(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS routes (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id        INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            method         TEXT    NOT NULL,
+            path           TEXT    NOT NULL,
+            handler_class  TEXT,
+            handler_method TEXT,
+            name           TEXT,
+            line           INTEGER NOT NULL DEFAULT 0
+         );",
+    )?;
+    Ok(())
+}
+
+/// Миграция v6: таблица `parse_errors` — файлы, которые не удалось распарсить.
+/// Делает слепые зоны индекса видимыми («что НЕ проиндексировано»): репортится
+/// в get_stats и repo_map. Не FK на files — у непарсящихся файлов нет записи в files.
+pub fn migrate_v6(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS parse_errors (
+            path       TEXT PRIMARY KEY,
+            error      TEXT NOT NULL,
+            indexed_at TEXT NOT NULL DEFAULT (datetime('now'))
+         );",
+    )?;
+    Ok(())
+}
+
+/// Миграция v7: колонка `calls.receiver` — получатель вызова ($this/self/parent/
+/// static/имя класса/переменная) для точного ООП-резолва call-рёбер.
+/// Безопасно повторять — проверяет наличие колонки перед ALTER.
+pub fn migrate_v7(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let has_col = conn.prepare("SELECT receiver FROM calls LIMIT 0").is_ok();
+    if !has_col {
+        conn.execute_batch("ALTER TABLE calls ADD COLUMN receiver TEXT;")?;
+    }
+    Ok(())
+}
+
+/// Миграция v8 (vendor signatures): таблицы `ext_classes`/`ext_methods` — СИГНАТУРЫ
+/// типов и методов из директорий-зависимостей (vendor/node_modules), без тел.
+/// Изолированы от основных таблиц: их читает ТОЛЬКО OopModel (для резолва
+/// наследования от фреймворка), поэтому search/dead-code/repo_map не засоряются.
+pub fn migrate_v8(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS ext_classes (
+            name  TEXT NOT NULL,
+            bases TEXT
+         );
+         CREATE TABLE IF NOT EXISTS ext_methods (
+            class  TEXT NOT NULL,
+            method TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_ext_classes_name  ON ext_classes(name);
+         CREATE INDEX IF NOT EXISTS idx_ext_methods_class ON ext_methods(class);
+         CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);",
+    )?;
+    Ok(())
+}
+
 /// Удалить все обычные индексы и FTS-триггеры (перед bulk-load).
 ///
 /// Вызывается перед массовой загрузкой данных, чтобы ускорить INSERT:
@@ -332,6 +415,11 @@ pub fn drop_indexes_and_triggers(conn: &rusqlite::Connection) -> rusqlite::Resul
         -- Удаляем индексы на таблице variables
         DROP INDEX IF EXISTS idx_variables_name;
         DROP INDEX IF EXISTS idx_variables_file;
+
+        -- Удаляем индексы на таблице routes
+        DROP INDEX IF EXISTS idx_routes_handler;
+        DROP INDEX IF EXISTS idx_routes_method;
+        DROP INDEX IF EXISTS idx_routes_file;
 
         -- Удаляем FTS-триггеры functions
         DROP TRIGGER IF EXISTS fts_functions_insert;
@@ -372,4 +460,32 @@ pub fn rebuild_indexes_and_triggers(conn: &rusqlite::Connection) -> rusqlite::Re
     ")?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    /// Регресс на CRITICAL #1: «старая» БД до v0.11 (только базовые таблицы + v2/v3),
+    /// загруженная in-memory, должна получить routes/parse_errors/file_contents
+    /// через initialize_tables_only — иначе индексатор падает с `no such table: routes`.
+    #[test]
+    fn initialize_tables_only_upgrades_pre_v011_db() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(SQL_SCHEMA).unwrap();
+        migrate_v2(&conn).unwrap();
+        migrate_v3(&conn).unwrap();
+        // До апгрейда таблиц v5/v6 нет.
+        assert!(conn.prepare("SELECT 1 FROM routes LIMIT 0").is_err());
+        assert!(conn.prepare("SELECT 1 FROM parse_errors LIMIT 0").is_err());
+
+        // Как в open_auto (in-memory): прогон полного набора миграций.
+        initialize_tables_only(&conn).unwrap();
+
+        assert!(conn.prepare("SELECT method, path FROM routes LIMIT 0").is_ok());
+        assert!(conn.prepare("SELECT path, error FROM parse_errors LIMIT 0").is_ok());
+        assert!(conn.prepare("SELECT oversize FROM file_contents LIMIT 0").is_ok());
+        // Идемпотентность — повторный вызов безопасен.
+        initialize_tables_only(&conn).unwrap();
+    }
 }

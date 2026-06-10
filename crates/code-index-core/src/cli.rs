@@ -105,13 +105,33 @@ enum Commands {
         /// Вывод в JSON вместо текста
         #[arg(long)]
         json: bool,
+
+        /// В JSON вернуть полные тела (по умолчанию lean: без тел функций/классов)
+        #[arg(long)]
+        include_body: bool,
     },
 
-    /// Создать конфигурацию .code-index/config.json с настройками по умолчанию
+    /// Инициализировать проект для iCode: конфиг + индекс (+ .mcp.json).
+    ///
+    /// Достаточно запустить один раз в корне проекта:
+    ///
+    ///   cd ~/my-project && icode init
+    ///
+    /// После этого сразу работают `icode query`, `icode get-callers` и др.
+    /// Для фонового авто-обновления индекса — `icode daemon run` / `icode setup`.
     Init {
         /// Путь к проекту
         #[arg(short, long, default_value = ".")]
         path: String,
+        /// Не строить индекс (только создать конфиг и .mcp.json)
+        #[arg(long)]
+        no_index: bool,
+        /// Не создавать .mcp.json (интеграция с Claude Code / MCP-клиентом)
+        #[arg(long)]
+        no_mcp: bool,
+        /// Принудительно переиндексировать всё, даже неизменённые файлы
+        #[arg(long)]
+        force: bool,
     },
 
     /// Удалить из индекса файлы, которых нет на диске
@@ -137,6 +157,10 @@ enum Commands {
         /// Максимум результатов
         #[arg(long, default_value = "20")]
         limit: usize,
+
+        /// Вернуть полные тела (по умолчанию lean: сигнатура+строки+путь без тел)
+        #[arg(long)]
+        include_body: bool,
     },
 
     /// Полнотекстовый поиск классов по имени/телу (FTS)
@@ -155,6 +179,10 @@ enum Commands {
         /// Максимум результатов
         #[arg(long, default_value = "20")]
         limit: usize,
+
+        /// Вернуть полные тела (по умолчанию lean: имя+строки+путь+bases без тел)
+        #[arg(long)]
+        include_body: bool,
     },
 
     /// Получить функцию по точному имени
@@ -197,6 +225,10 @@ enum Commands {
         /// Фильтр по языку
         #[arg(short, long)]
         language: Option<String>,
+
+        /// Максимум рёбер (по умолчанию 50)
+        #[arg(long, default_value = "50")]
+        limit: usize,
     },
 
     /// Что вызывает данная функция (callees)
@@ -211,6 +243,10 @@ enum Commands {
         /// Фильтр по языку
         #[arg(short, long)]
         language: Option<String>,
+
+        /// Максимум рёбер (по умолчанию 50)
+        #[arg(long, default_value = "50")]
+        limit: usize,
     },
 
     /// Получить импорты файла или модуля
@@ -281,6 +317,33 @@ enum Commands {
         /// Максимум результатов
         #[arg(long, default_value = "100")]
         limit: usize,
+    },
+
+    /// Архитектурная карта репозитория за один вызов (counts, modules,
+    /// complex_functions, call_hotspots, entry_points, parse_errors)
+    RepoMap {
+        /// Путь к проекту
+        #[arg(short, long, default_value = ".")]
+        path: String,
+        /// Размер каждой секции
+        #[arg(long, default_value = "12")]
+        top: usize,
+    },
+
+    /// Функции по сложности (длина + fan-out + fan-in) — что рефакторить/ревьюить
+    Complex {
+        /// Путь к проекту
+        #[arg(short, long, default_value = ".")]
+        path: String,
+        /// Максимум результатов
+        #[arg(long, default_value = "15")]
+        limit: usize,
+        /// Фильтр по языку
+        #[arg(short, long)]
+        language: Option<String>,
+        /// Glob по пути (`app/**/*.php`)
+        #[arg(long)]
+        path_glob: Option<String>,
     },
 
     /// Управление фоновым демоном индексации
@@ -590,6 +653,87 @@ async fn handle_index(
     Ok(())
 }
 
+/// Разрешить ICODE_HOME: явный аргумент → переменная окружения → дефолт по ОС.
+fn resolve_icode_home(arg: Option<&str>) -> PathBuf {
+    if let Some(h) = arg {
+        return PathBuf::from(h);
+    }
+    if let Ok(env_val) = std::env::var("ICODE_HOME") {
+        return PathBuf::from(env_val);
+    }
+    #[cfg(windows)]
+    let base = std::env::var("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("C:\\icode"));
+    #[cfg(not(windows))]
+    let base = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".local");
+    base.join("icode")
+}
+
+/// `icode init` — одношаговая инициализация проекта: конфиг + .mcp.json + индекс.
+///
+/// Идемпотентна: существующие конфиг/`.mcp.json` не перезаписываются, индексация
+/// пропускает неизменённые файлы. После запуска сразу работают query-команды.
+async fn handle_init(
+    path: String,
+    no_index: bool,
+    no_mcp: bool,
+    force: bool,
+    registry: &Option<crate::extension::ProcessorRegistry>,
+) -> anyhow::Result<()> {
+    let abs_path = Path::new(&path)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(&path));
+    println!("\n🚀 iCode init — {}\n", abs_path.display());
+
+    // 1. Конфиг проекта (.icode/config.json)
+    let config_path = abs_path.join(".icode").join("config.json");
+    if config_path.exists() {
+        println!("✓ конфиг уже существует: {}", config_path.display());
+    } else {
+        IndexConfig::default().save(&abs_path)?;
+        println!("✓ создан конфиг: {}", config_path.display());
+    }
+
+    // 2. .mcp.json для интеграции с Claude Code / MCP-клиентом (skip если есть).
+    if no_mcp {
+        println!("⏭  .mcp.json пропущен (--no-mcp)");
+    } else {
+        let icode_home = resolve_icode_home(None);
+        let _ = std::fs::create_dir_all(&icode_home);
+        let binary = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("icode"));
+        setup_mcp_json(&abs_path, &binary, &icode_home)?;
+    }
+
+    // 3. Индекс (по умолчанию строим сразу, чтобы query-команды работали).
+    if no_index {
+        println!("⏭  индекс пропущен (--no-index). Постройте позже: icode index .");
+    } else {
+        println!("\n▶ строим индекс...");
+        handle_index(path, force, registry).await?;
+    }
+
+    // 4. Подсказки по дальнейшим командам.
+    println!("\n✅ Проект инициализирован.\n");
+    println!("Команды поверх индекса (читают .icode/index.db напрямую, демон не нужен):");
+    println!("  icode query <symbol>           — где определён символ (функции/классы/...)");
+    println!("  icode get-callers <fn>         — кто вызывает функцию");
+    println!("  icode get-callees <fn>         — что вызывает функция");
+    println!("  icode search-function <q>      — FTS-поиск функций");
+    println!("  icode grep-body --pattern <p>  — поиск по телам функций/классов");
+    println!("  icode stats                    — статистика индекса");
+    println!("  icode clean                    — убрать из индекса удалённые файлы");
+    println!();
+    println!("Фоновый режим (авто-обновление индекса + MCP-сервер):");
+    println!("  icode daemon run               — фоновый индексатор (один писатель)");
+    println!("  icode setup                    — daemon.toml + autostart (systemd/launchd)");
+    println!("  icode serve --path .           — MCP-сервер (stdio) для AI-клиента");
+    println!();
+    Ok(())
+}
+
 /// Подключиться к граф-БД если в конфиге есть секция `[graph]`.
 /// Возвращает `Arc<GraphClient>` или `None` при ошибке (не фатально).
 async fn connect_graph_client(
@@ -738,7 +882,7 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
             }
         }
 
-        Commands::Query { symbol, path, language, json } => {
+        Commands::Query { symbol, path, language, json, include_body } => {
             tracing::info!("Поиск символа '{}': path={}", symbol, path);
 
             // 1. Открыть БД (только чтение — не конкурирует с MCP-демоном)
@@ -749,8 +893,24 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
             let result = storage.find_symbol(&symbol, language.as_deref())?;
 
             if json {
-                // JSON-формат для программного использования
-                println!("{}", serde_json::to_string_pretty(&result)?);
+                if include_body {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                } else {
+                    // lean по умолчанию: без тел — экономит токены
+                    let lean = crate::storage::models::SymbolSearchLean {
+                        functions: result.functions.iter()
+                            .map(|f| crate::storage::models::FunctionHit::from_record(
+                                f, storage.get_path_by_file_id(f.file_id).ok().flatten().unwrap_or_default()))
+                            .collect(),
+                        classes: result.classes.iter()
+                            .map(|c| crate::storage::models::ClassHit::from_record(
+                                c, storage.get_path_by_file_id(c.file_id).ok().flatten().unwrap_or_default()))
+                            .collect(),
+                        variables: result.variables.clone(),
+                        imports: result.imports.clone(),
+                    };
+                    println!("{}", serde_json::to_string_pretty(&lean)?);
+                }
                 return Ok(());
             }
 
@@ -869,46 +1029,45 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
             );
         }
 
-        Commands::Init { path } => {
-            // 1. Разрешить путь до абсолютного
-            let abs_path = Path::new(&path)
-                .canonicalize()
-                .unwrap_or_else(|_| PathBuf::from(&path));
-
-            let config_path = abs_path.join(".icode").join("config.json");
-
-            if config_path.exists() {
-                println!("Конфигурация уже существует: {}", config_path.display());
-                println!("Для перезаписи удалите файл вручную.");
-                return Ok(());
-            }
-
-            // 2. Создать конфиг по умолчанию
-            let config = IndexConfig::default();
-            config.save(&abs_path)?;
-
-            println!("Создан файл конфигурации: {}", config_path.display());
-            println!("Отредактируйте его при необходимости:");
-            println!("  exclude_dirs          — дополнительные директории для исключения");
-            println!("  extra_text_extensions — дополнительные расширения для FTS-индексации");
-            println!("  max_file_size         — макс. размер текстового файла в байтах (по умолчанию 1 МБ, не влияет на код)");
-            println!("  max_files             — лимит файлов (0 = без лимита)");
+        Commands::Init { path, no_index, no_mcp, force } => {
+            handle_init(path, no_index, no_mcp, force, &registry).await?;
         }
 
         // ── Новые команды: JSON-вывод ─────────────────────────────────────────
 
-        Commands::SearchFunction { query, path, language, limit } => {
+        Commands::SearchFunction { query, path, language, limit, include_body } => {
             let db_path = get_db_path(&path);
             let storage = Storage::open_file_readonly(&db_path)?;
             let results = storage.search_functions(&query, limit, language.as_deref())?;
-            println!("{}", serde_json::to_string_pretty(&results)?);
+            if include_body {
+                println!("{}", serde_json::to_string_pretty(&results)?);
+            } else {
+                // lean: без тел — экономит токены; тело тянут точечно get-function
+                let hits: Vec<crate::storage::models::FunctionHit> = results
+                    .iter()
+                    .map(|f| crate::storage::models::FunctionHit::from_record(
+                        f, storage.get_path_by_file_id(f.file_id).ok().flatten().unwrap_or_default(),
+                    ))
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&hits)?);
+            }
         }
 
-        Commands::SearchClass { query, path, language, limit } => {
+        Commands::SearchClass { query, path, language, limit, include_body } => {
             let db_path = get_db_path(&path);
             let storage = Storage::open_file_readonly(&db_path)?;
             let results = storage.search_classes(&query, limit, language.as_deref())?;
-            println!("{}", serde_json::to_string_pretty(&results)?);
+            if include_body {
+                println!("{}", serde_json::to_string_pretty(&results)?);
+            } else {
+                let hits: Vec<crate::storage::models::ClassHit> = results
+                    .iter()
+                    .map(|c| crate::storage::models::ClassHit::from_record(
+                        c, storage.get_path_by_file_id(c.file_id).ok().flatten().unwrap_or_default(),
+                    ))
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&hits)?);
+            }
         }
 
         Commands::GetFunction { name, path, language: _ } => {
@@ -925,17 +1084,19 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&results)?);
         }
 
-        Commands::GetCallers { function_name, path, language } => {
+        Commands::GetCallers { function_name, path, language, limit } => {
             let db_path = get_db_path(&path);
             let storage = Storage::open_file_readonly(&db_path)?;
-            let results = storage.get_callers(&function_name, language.as_deref())?;
+            let mut results = storage.get_callers(&function_name, language.as_deref())?;
+            results.truncate(limit);
             println!("{}", serde_json::to_string_pretty(&results)?);
         }
 
-        Commands::GetCallees { function_name, path, language } => {
+        Commands::GetCallees { function_name, path, language, limit } => {
             let db_path = get_db_path(&path);
             let storage = Storage::open_file_readonly(&db_path)?;
-            let results = storage.get_callees(&function_name, language.as_deref())?;
+            let mut results = storage.get_callees(&function_name, language.as_deref())?;
+            results.truncate(limit);
             println!("{}", serde_json::to_string_pretty(&results)?);
         }
 
@@ -997,6 +1158,19 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
                 limit,
             )?;
             println!("{}", serde_json::to_string_pretty(&results)?);
+        }
+
+        Commands::RepoMap { path, top } => {
+            let db_path = get_db_path(&path);
+            let storage = Storage::open_file_readonly(&db_path)?;
+            println!("{}", serde_json::to_string_pretty(&storage.repo_map(top)?)?);
+        }
+
+        Commands::Complex { path, limit, language, path_glob } => {
+            let db_path = get_db_path(&path);
+            let storage = Storage::open_file_readonly(&db_path)?;
+            let r = storage.find_complex_functions(limit, path_glob.as_deref(), language.as_deref())?;
+            println!("{}", serde_json::to_string_pretty(&r)?);
         }
 
         Commands::Setup { path, icode_home } => {
@@ -1125,22 +1299,8 @@ fn handle_setup(path: String, icode_home_arg: Option<String>) -> anyhow::Result<
         .canonicalize()
         .unwrap_or_else(|_| std::path::PathBuf::from(&path));
 
-    // 1. Определить ICODE_HOME
-    let icode_home: std::path::PathBuf = if let Some(ref h) = icode_home_arg {
-        std::path::PathBuf::from(h)
-    } else if let Ok(env_val) = std::env::var("ICODE_HOME") {
-        std::path::PathBuf::from(env_val)
-    } else {
-        // Дефолт: ~/.local/icode (Linux/macOS) или %APPDATA%\icode (Windows)
-        #[cfg(windows)]
-        let base = std::env::var("APPDATA").map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::path::PathBuf::from("C:\\icode"));
-        #[cfg(not(windows))]
-        let base = dirs::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-            .join(".local");
-        base.join("icode")
-    };
+    // 1. Определить ICODE_HOME (явный аргумент → ENV → дефолт по ОС)
+    let icode_home: std::path::PathBuf = resolve_icode_home(icode_home_arg.as_deref());
 
     println!("\n🔧 iCode setup");
     println!("   Проект:    {}", project_path.display());

@@ -20,9 +20,10 @@ use axum::{
 };
 
 use crate::mcp::{
-    tools, CodeIndexServer, ExtensionToolParams, FilePathParams, FunctionNameParams,
-    GrepBodyParams, GrepCodeParams, GrepTextParams, ImportParams, ListFilesParams, NameParams,
-    ReadFileParams, RepoEntry, SearchParams, StatFileParams, StatsParams,
+    tools, CodeIndexServer, ComplexParams, ExtensionToolParams, FilePathParams, FindRoutesParams,
+    FunctionNameParams, GrepBodyParams, GrepCodeParams, GrepTextParams, ImportParams,
+    ListFilesParams, NameParams, ReadFileParams, RepoEntry, RepoMapParams, SearchParams,
+    StatFileParams, StatsParams,
 };
 
 use super::dispatcher::federation_error;
@@ -52,6 +53,11 @@ pub fn federate_router(server: CodeIndexServer) -> Router {
         .route("/federate/grep_text", post(handle_grep_text))
         // Phase 2 (v0.8.0)
         .route("/federate/grep_code", post(handle_grep_code))
+        // v0.11: framework-aware routing
+        .route("/federate/find_routes", post(handle_find_routes))
+        // v0.11: архитектурная аналитика
+        .route("/federate/get_repo_map", post(handle_get_repo_map))
+        .route("/federate/find_complex_functions", post(handle_find_complex_functions))
         // v0.8.1: универсальный route для extension-tools (BSL и любых
         // будущих расширений). Один route на все extension-tools, чтобы
         // не плодить per-tool маршруты при добавлении нового language-процессора.
@@ -99,6 +105,39 @@ fn resolve_local<'a>(
 
 // ── Handlers ────────────────────────────────────────────────────────────────
 
+async fn handle_find_routes(
+    State(server): State<Server>,
+    Json(p): Json<FindRoutesParams>,
+) -> axum::response::Response {
+    let entry = match resolve_local(&server, &p.repo, "find_routes") {
+        Ok(e) => e,
+        Err(r) => return r,
+    };
+    ok_json(tools::find_routes(entry, p.method, p.path, p.handler, p.limit).await)
+}
+
+async fn handle_get_repo_map(
+    State(server): State<Server>,
+    Json(p): Json<RepoMapParams>,
+) -> axum::response::Response {
+    let entry = match resolve_local(&server, &p.repo, "get_repo_map") {
+        Ok(e) => e,
+        Err(r) => return r,
+    };
+    ok_json(tools::get_repo_map(entry, p.top).await)
+}
+
+async fn handle_find_complex_functions(
+    State(server): State<Server>,
+    Json(p): Json<ComplexParams>,
+) -> axum::response::Response {
+    let entry = match resolve_local(&server, &p.repo, "find_complex_functions") {
+        Ok(e) => e,
+        Err(r) => return r,
+    };
+    ok_json(tools::find_complex_functions(entry, p.limit, p.path_glob, p.language).await)
+}
+
 async fn handle_search_function(
     State(server): State<Server>,
     Json(p): Json<SearchParams>,
@@ -107,7 +146,7 @@ async fn handle_search_function(
         Ok(e) => e,
         Err(r) => return r,
     };
-    ok_json(tools::search_function(entry, p.query, p.limit, p.language, p.path_glob).await)
+    ok_json(tools::search_function(entry, p.query, p.limit, p.language, p.path_glob, p.include_body).await)
 }
 
 async fn handle_search_class(
@@ -118,7 +157,7 @@ async fn handle_search_class(
         Ok(e) => e,
         Err(r) => return r,
     };
-    ok_json(tools::search_class(entry, p.query, p.limit, p.language, p.path_glob).await)
+    ok_json(tools::search_class(entry, p.query, p.limit, p.language, p.path_glob, p.include_body).await)
 }
 
 async fn handle_get_function(
@@ -151,7 +190,7 @@ async fn handle_get_callers(
         Ok(e) => e,
         Err(r) => return r,
     };
-    ok_json(tools::get_callers(entry, p.function_name, p.language).await)
+    ok_json(tools::get_callers(entry, p.function_name, p.language, p.limit).await)
 }
 
 async fn handle_get_callees(
@@ -162,7 +201,7 @@ async fn handle_get_callees(
         Ok(e) => e,
         Err(r) => return r,
     };
-    ok_json(tools::get_callees(entry, p.function_name, p.language).await)
+    ok_json(tools::get_callees(entry, p.function_name, p.language, p.limit).await)
 }
 
 async fn handle_find_symbol(
@@ -173,7 +212,7 @@ async fn handle_find_symbol(
         Ok(e) => e,
         Err(r) => return r,
     };
-    ok_json(tools::find_symbol(entry, p.name, p.language, p.path_glob).await)
+    ok_json(tools::find_symbol(entry, p.name, p.language, p.path_glob, p.include_body).await)
 }
 
 async fn handle_get_imports(

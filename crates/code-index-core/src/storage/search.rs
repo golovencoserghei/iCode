@@ -172,7 +172,7 @@ impl Storage {
         match language {
             Some(lang) => {
                 let mut stmt = self.conn.prepare(
-                    "SELECT c.id, c.file_id, c.caller, c.callee, c.line
+                    "SELECT c.id, c.file_id, c.caller, c.callee, c.line, c.receiver
                      FROM calls c JOIN files fi ON fi.id = c.file_id
                      WHERE c.caller = ?1 AND fi.language = ?2",
                 )?;
@@ -181,7 +181,7 @@ impl Storage {
             }
             None => {
                 let mut stmt = self.conn.prepare(
-                    "SELECT id, file_id, caller, callee, line FROM calls WHERE caller = ?1",
+                    "SELECT id, file_id, caller, callee, line, receiver FROM calls WHERE caller = ?1",
                 )?;
                 let rows = stmt.query_map(params![function_name], row_to_call)?;
                 rows.map(|r| r.map_err(Into::into)).collect()
@@ -194,7 +194,7 @@ impl Storage {
         match language {
             Some(lang) => {
                 let mut stmt = self.conn.prepare(
-                    "SELECT c.id, c.file_id, c.caller, c.callee, c.line
+                    "SELECT c.id, c.file_id, c.caller, c.callee, c.line, c.receiver
                      FROM calls c JOIN files fi ON fi.id = c.file_id
                      WHERE c.callee = ?1 AND fi.language = ?2",
                 )?;
@@ -203,7 +203,7 @@ impl Storage {
             }
             None => {
                 let mut stmt = self.conn.prepare(
-                    "SELECT id, file_id, caller, callee, line FROM calls WHERE callee = ?1",
+                    "SELECT id, file_id, caller, callee, line, receiver FROM calls WHERE callee = ?1",
                 )?;
                 let rows = stmt.query_map(params![function_name], row_to_call)?;
                 rows.map(|r| r.map_err(Into::into)).collect()
@@ -439,6 +439,8 @@ impl Storage {
             total_calls:      count("calls")?,
             total_variables:  count("variables")?,
             total_text_files: count("text_files")?,
+            // Слепые зоны индекса: файлы, которые не удалось распарсить.
+            parse_errors:     count("parse_errors").unwrap_or(0),
             indexing_status: None,
         })
     }

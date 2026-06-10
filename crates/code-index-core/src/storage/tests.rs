@@ -130,7 +130,7 @@ fn test_stats() {
     assert_eq!(storage.get_stats().expect("get_stats").total_files, 0);
     let file_id = storage.upsert_file(&make_file("/src/stats.py")).unwrap();
     storage.insert_functions(&[make_function(file_id, "f1"), make_function(file_id, "f2")]).unwrap();
-    storage.insert_calls(&[CallRecord { id: None, file_id, caller: "f1".into(), callee: "f2".into(), line: 5 }]).unwrap();
+    storage.insert_calls(&[CallRecord { id: None, file_id, caller: "f1".into(), callee: "f2".into(), line: 5, receiver: None }]).unwrap();
     let stats = storage.get_stats().expect("get_stats после вставки");
     assert_eq!(stats.total_files, 1);
     assert_eq!(stats.total_functions, 2);

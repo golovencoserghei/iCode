@@ -158,6 +158,13 @@ impl<'a> Indexer<'a> {
 
         self.phase_backfill(root)?;
 
+        // Сигнатуры зависимостей (vendor/node_modules) для ООП-резолва — opt-in.
+        if !self.config.dependency_dirs.is_empty() {
+            if let Err(e) = self.phase_signatures(root, force) {
+                warn!("[signatures] пропущено из-за ошибки: {}", e);
+            }
+        }
+
         result.elapsed_ms = start.elapsed().as_millis() as u64;
         info!("[timing] total: {}ms (indexed={} skipped={} deleted={} errors={})",
             result.elapsed_ms, result.files_indexed, result.files_skipped,
@@ -226,18 +233,28 @@ impl<'a> Indexer<'a> {
                     match self.write_code_to_db(rel_path, content_hash, language, *lines_total,
                         ast_hash, parse_result, is_fresh_db, Some(*mtime), Some(*file_size),
                         text_for_fts.as_deref(), Some(raw_content.as_str())) {
-                        Ok(_) => { result.files_indexed += 1; batch_count += 1; }
+                        Ok(_) => {
+                            result.files_indexed += 1; batch_count += 1;
+                            let _ = self.storage.clear_parse_error(rel_path); // снова парсится — снять отметку
+                        }
                         Err(e) => result.errors.push((rel_path.clone(), e.to_string())),
                     }
                 }
                 ParsedFile::Text { rel_path, content_hash, lines_total, content, language, mtime, file_size } => {
                     match self.write_text_to_db(rel_path, content_hash, *lines_total, content,
                         language, is_fresh_db, Some(*mtime), Some(*file_size)) {
-                        Ok(_) => { result.files_indexed += 1; batch_count += 1; }
+                        Ok(_) => {
+                            result.files_indexed += 1; batch_count += 1;
+                            let _ = self.storage.clear_parse_error(rel_path);
+                        }
                         Err(e) => result.errors.push((rel_path.clone(), e.to_string())),
                     }
                 }
-                ParsedFile::Error { rel_path, error } => result.errors.push((rel_path.clone(), error.clone())),
+                ParsedFile::Error { rel_path, error } => {
+                    result.errors.push((rel_path.clone(), error.clone()));
+                    // Сделать слепую зону видимой: запомнить непарсящийся файл.
+                    let _ = self.storage.upsert_parse_error(rel_path, error);
+                }
             }
             if batch_count >= batch_size {
                 self.storage.commit_batch()?;
@@ -271,7 +288,100 @@ impl<'a> Indexer<'a> {
                 result.files_deleted += 1;
             }
         }
+        // Прунинг parse_errors удалённых с диска файлов: у непарсящихся файлов нет
+        // строки в `files`, поэтому чистим по `seen` (всё, что реально просмотрено
+        // в этом проходе). Иначе строки-ошибки «утекают» навсегда.
+        for path in self.storage.parse_error_paths().unwrap_or_default() {
+            if !seen.contains(&path) {
+                let _ = self.storage.clear_parse_error(&path);
+            }
+        }
         self.storage.commit_batch()
+    }
+
+    /// Индексация СИГНАТУР зависимостей (vendor/node_modules): классы+bases и
+    /// методы (без тел) в таблицы `ext_*` для ООП-резолва наследования от
+    /// фреймворка. Пересканирует только при `force` или если ext пуст (deps
+    /// редко меняются). Парсит параллельно, держит в памяти только сигнатуры.
+    fn phase_signatures(&mut self, root: &Path, force: bool) -> Result<()> {
+        // Гейтим по факту «просканировано» (а не по числу строк): иначе при
+        // нулевом результате (пустой vendor / непарсимые файлы) скан повторялся бы
+        // на каждом reindex. Обновление deps → `icode index --force`.
+        if !force && self.storage.meta_get("ext_scanned").is_some() {
+            return Ok(());
+        }
+        let t = std::time::Instant::now();
+        self.storage.clear_ext_signatures()?;
+        let registry = ParserRegistry::from_languages(&self.config.languages);
+
+        let mut ext_classes: Vec<(String, Option<String>)> = Vec::new();
+        let mut ext_methods: Vec<(String, String)> = Vec::new();
+
+        for dep in &self.config.dependency_dirs {
+            let dir = root.join(dep);
+            if !dir.is_dir() {
+                continue;
+            }
+            let files: Vec<std::path::PathBuf> = WalkDir::new(&dir)
+                .into_iter()
+                .filter_entry(|e| {
+                    !(e.file_type().is_dir()
+                        && e.file_name().to_str().map(|n| n == ".git").unwrap_or(false))
+                })
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().is_file())
+                .map(|e| e.path().to_path_buf())
+                .collect();
+
+            // Параллельный парсинг: на каждый файл извлекаем только сигнатуры,
+            // ParseResult (с телами) сразу отбрасывается — память не растёт.
+            let sigs: Vec<(Vec<(String, Option<String>)>, Vec<(String, String)>)> = files
+                .par_iter()
+                .filter_map(|p| {
+                    let ext = p.extension().and_then(|e| e.to_str())?.to_lowercase();
+                    let parser = registry.get_parser(&ext)?;
+                    let content = std::fs::read_to_string(p).ok()?;
+                    let pr = parser.parse(&content, &p.to_string_lossy()).ok()?;
+                    let classes = pr
+                        .classes
+                        .iter()
+                        .map(|c| (c.name.clone(), c.bases.clone()))
+                        .collect();
+                    let methods = pr
+                        .functions
+                        .iter()
+                        .filter_map(|f| {
+                            f.qualified_name.as_ref().and_then(|qn| {
+                                qn.rsplit_once("::").map(|(cls, m)| (cls.to_string(), m.to_string()))
+                            })
+                        })
+                        .collect();
+                    Some((classes, methods))
+                })
+                .collect();
+
+            for (c, m) in sigs {
+                ext_classes.extend(c);
+                ext_methods.extend(m);
+            }
+        }
+
+        self.storage.begin_batch()?;
+        let r1 = self.storage.insert_ext_classes(&ext_classes);
+        let r2 = self.storage.insert_ext_methods(&ext_methods);
+        // Маркер «просканировано» — чтобы не пересканировать при пустом результате.
+        let r3 = self.storage.meta_set("ext_scanned", "1");
+        self.storage.commit_batch()?;
+        r1?;
+        r2?;
+        r3?;
+        info!(
+            "[signatures] зависимости: {} типов, {} методов за {} мс",
+            ext_classes.len(),
+            ext_methods.len(),
+            t.elapsed().as_millis()
+        );
+        Ok(())
     }
 
     fn phase_backfill(&mut self, root: &Path) -> Result<()> {
@@ -359,6 +469,7 @@ impl<'a> Indexer<'a> {
             self.storage.delete_imports_by_file(file_id)?;
             self.storage.delete_calls_by_file(file_id)?;
             self.storage.delete_variables_by_file(file_id)?;
+            self.storage.delete_routes_by_file(file_id)?;
             // Для языков с двойной индексацией убираем старую запись text_files,
             // чтобы не дублировать при upsert.
             if text_for_fts.is_some() {
@@ -434,6 +545,7 @@ impl<'a> Indexer<'a> {
                 caller: c.caller.clone(),
                 callee: c.callee.clone(),
                 line: c.line,
+                receiver: c.receiver.clone(),
             })
             .collect();
         self.storage.insert_calls(&calls)?;
@@ -451,6 +563,23 @@ impl<'a> Indexer<'a> {
             })
             .collect();
         self.storage.insert_variables(&variables)?;
+
+        // Конвертируем и сохраняем веб-маршруты (framework-aware routing)
+        let routes: Vec<RouteRecord> = parse_result
+            .routes
+            .iter()
+            .map(|r| RouteRecord {
+                id: None,
+                file_id,
+                method: r.method.clone(),
+                path: r.path.clone(),
+                handler_class: r.handler_class.clone(),
+                handler_method: r.handler_method.clone(),
+                name: r.name.clone(),
+                line: r.line,
+            })
+            .collect();
+        self.storage.insert_routes(&routes)?;
 
         // Двойная индексация: для html (и других языков из is_dual_indexed_language)
         // дополнительно сохраняем сырой контент в text_files, чтобы продолжали
@@ -518,6 +647,21 @@ impl<'a> Indexer<'a> {
                         file_path: rel_path.to_string(),
                         module: module.clone(),
                         kind: imp.kind.clone(),
+                    });
+                }
+            }
+
+            // Framework-aware routing: Route-узел + ребро HANDLED_BY к контроллер-методу.
+            for route in &parse_result.routes {
+                if let Some(handler_method) = &route.handler_method {
+                    self.graph.send(GraphCommand::AddRoute {
+                        repo: self.repo.clone(),
+                        file_path: rel_path.to_string(),
+                        method: route.method.clone(),
+                        path: route.path.clone(),
+                        handler_class: route.handler_class.clone(),
+                        handler_method: handler_method.clone(),
+                        line: route.line,
                     });
                 }
             }
@@ -1156,5 +1300,114 @@ class App:
         // FTS по-прежнему работает после повторного прохода
         let found_after = storage.search_functions("fresh_func_10", 10, None).unwrap();
         assert!(!found_after.is_empty(), "FTS должен работать и после повторной индексации");
+    }
+
+    /// E2E framework-aware routing: индексация PHP-проекта (routes + controller),
+    /// затем find_routes и обогащение get_symbol_context связанными маршрутами.
+    #[test]
+    fn test_framework_routing_end_to_end() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("routes")).unwrap();
+        fs::create_dir_all(tmp.path().join("app")).unwrap();
+        fs::write(
+            tmp.path().join("routes/web.php"),
+            "<?php\nuse Illuminate\\Support\\Facades\\Route;\n\
+             Route::get('/users', [UserController::class, 'index']);\n\
+             Route::post('/users', [UserController::class, 'store']);\n",
+        ).unwrap();
+        fs::write(
+            tmp.path().join("app/UserController.php"),
+            "<?php\nclass UserController {\n\
+                 public function index() { return []; }\n\
+                 public function store() { return null; }\n}\n",
+        ).unwrap();
+
+        let mut storage = Storage::open_in_memory().unwrap();
+        {
+            let mut indexer = Indexer::new(&mut storage);
+            let r = indexer.full_reindex(tmp.path(), false).unwrap();
+            assert!(r.errors.is_empty(), "ошибки индексации: {:?}", r.errors);
+        }
+
+        // find_routes возвращает оба маршрута
+        let routes = storage.find_routes(None, None, None, 100).unwrap();
+        assert_eq!(routes.len(), 2, "должно быть 2 маршрута");
+        let get = routes.iter().find(|r| r.method == "GET").unwrap();
+        assert_eq!(get.path, "/users");
+        assert_eq!(get.handler_class.as_deref(), Some("UserController"));
+        assert_eq!(get.handler_method.as_deref(), Some("index"));
+
+        // фильтр по handler
+        let by_handler = storage.find_routes(None, None, Some("store"), 100).unwrap();
+        assert_eq!(by_handler.len(), 1);
+        assert_eq!(by_handler[0].method, "POST");
+
+        // get_symbol_context для контроллер-метода содержит связанный маршрут
+        let ctx = storage.get_symbol_context("index", None, None).unwrap();
+        assert_eq!(ctx.kind, "function");
+        assert_eq!(ctx.routes.len(), 1, "index должен иметь 1 связанный маршрут");
+        assert_eq!(ctx.routes[0].method, "GET");
+        assert_eq!(ctx.routes[0].path, "/users");
+    }
+
+    /// vendor signatures: наследование от framework-класса (в vendor) резолвится
+    /// для ООП-анализа, при этом vendor НЕ попадает в основной индекс (search/dead-code).
+    #[test]
+    fn test_vendor_signatures_resolve_framework_inheritance() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("app")).unwrap();
+        fs::create_dir_all(tmp.path().join("vendor/framework")).unwrap();
+        fs::write(
+            tmp.path().join("vendor/framework/Controller.php"),
+            "<?php\nclass Controller {\n public function boot() {}\n public function middleware() {}\n}\n",
+        ).unwrap();
+        fs::write(
+            tmp.path().join("app/UserController.php"),
+            "<?php\nclass UserController extends Controller {\n \
+                 public function boot() { return 1; }\n \
+                 public function customAction() { return 2; }\n}\n",
+        ).unwrap();
+
+        let mut storage = Storage::open_in_memory().unwrap();
+        let config = IndexConfig { dependency_dirs: vec!["vendor".into()], ..Default::default() };
+        Indexer::with_config(&mut storage, config).full_reindex(tmp.path(), false).unwrap();
+
+        // vendor-сигнатуры наполнены, но базовый класс НЕ в основном индексе.
+        assert!(storage.count_ext_classes() > 0, "ext_classes должны наполниться из vendor");
+        assert!(storage.get_class_by_name("Controller").unwrap().is_empty(),
+            "vendor-класс не должен попасть в основной индекс (search его не видит)");
+
+        // OopModel резолвит framework-наследование через ext-сигнатуры.
+        let oop = storage.build_oop_model().unwrap();
+        assert!(oop.is_override("UserController", "boot"),
+            "boot — override framework-метода Controller::boot (через vendor-сигнатуры)");
+        assert!(!oop.is_override("UserController", "customAction"),
+            "customAction не объявлен в предке → не override");
+
+        // dead-code не помечает boot (полиморфный framework-hook).
+        let dead = storage.find_dead_code(200, None, None).unwrap();
+        assert!(!dead.iter().any(|d| d.qualified_name.as_deref() == Some("UserController::boot")),
+            "boot не должен попадать в dead-code (override framework-метода)");
+    }
+
+    /// Переиндексация удаляет устаревшие маршруты файла (нет «фантомных» routes).
+    #[test]
+    fn test_routing_reindex_removes_stale_routes() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("routes")).unwrap();
+        let web = tmp.path().join("routes/web.php");
+        fs::write(&web, "<?php\nRoute::get('/a', [C::class, 'a']);\nRoute::get('/b', [C::class, 'b']);\n").unwrap();
+
+        let mut storage = Storage::open_in_memory().unwrap();
+        { let mut ix = Indexer::new(&mut storage); ix.full_reindex(tmp.path(), false).unwrap(); }
+        assert_eq!(storage.find_routes(None, None, None, 100).unwrap().len(), 2);
+
+        // Переписываем файл — остаётся один маршрут
+        fs::write(&web, "<?php\nRoute::get('/a', [C::class, 'a']);\n").unwrap();
+        { let mut ix = Indexer::new(&mut storage); ix.full_reindex(tmp.path(), true).unwrap(); }
+
+        let routes = storage.find_routes(None, None, None, 100).unwrap();
+        assert_eq!(routes.len(), 1, "после переиндексации остаётся 1 маршрут (старые удалены)");
+        assert_eq!(routes[0].path, "/a");
     }
 }

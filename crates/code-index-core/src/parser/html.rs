@@ -70,6 +70,7 @@ fn parse_html(source: &str) -> Result<ParseResult> {
         imports: ctx.imports,
         calls: Vec::new(), // у HTML нет «вызовов»
         variables: ctx.variables,
+        routes: Vec::new(),
         lines_total,
         ast_hash,
     })

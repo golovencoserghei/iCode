@@ -88,13 +88,22 @@ icode index /path/to/project
 
 ```json
 {
-  "exclude_dirs": ["vendor", "node_modules", ".git", "var", "cache"],
+  "exclude_dirs": ["var", "cache"],
   "languages": ["php"],
   "storage_mode": "disk",
   "debounce_ms": 1500,
-  "batch_ms": 2000
+  "batch_ms": 2000,
+  "dependency_dirs": ["vendor"]
 }
 ```
+
+`dependency_dirs` (опционально) — папки зависимостей, из которых индексируются
+**только сигнатуры** (классы + `extends`/`implements`, методы — без тел) в отдельные
+таблицы `ext_*`. Это даёт ООП-резолв наследования от фреймворка (Laravel
+`Controller`/`Model`): `find_dead_code` не считает мёртвыми переопределения
+framework-методов, а `get_symbol_context` резолвит унаследованные методы. Эти папки
+автоматически исключаются из основного индекса (не засоряют поиск/FTS).
+Пересканируются при `icode index --force` (после `composer`/`npm update`).
 
 ## MCP-инструменты
 
@@ -120,6 +129,10 @@ icode index /path/to/project
 | `get_callees` | Что вызывает данная функция |
 | `get_imports` | Импорты файла или модуля |
 | `get_file_summary` | Полная карта файла: функции, классы, импорты, переменные |
+| `get_symbol_context` | Полный контекст символа за 1 вызов: definition + callers + callees + outline + imports + **routes** + **inheritance** |
+| `get_repo_map` | 🗺️ Архитектурная карта репо за 1 дешёвый вызов: модули, сложность, hotspots, точки входа, слепые зоны |
+| `find_complex_functions` | Функции по сложности (длина + fan-out + fan-in) — что рефакторить/ревьюить |
+| `find_routes` | 🌐 Веб-маршруты фреймворка: HTTP-метод + URL → контроллер@метод (Laravel/PHP) |
 
 ### Обзор репозитория
 
@@ -146,18 +159,90 @@ icode index /path/to/project
 
 `_meta.dependent_files` — список файлов, от которых зависит ответ. Используется для точечной инвалидации кэша.
 
-## CLI-команды
+Навигационные инструменты дополнительно сверяют файлы с рабочим деревом и при
+рассинхроне добавляют:
+
+```json
+{
+  "result": {...},
+  "_meta": {
+    "dependent_files": ["src/foo.php"],
+    "stale": ["src/foo.php"],
+    "stale_warning": "⚠️ Эти файлы изменились на диске после индексации — данные могут быть устаревшими. Прочитайте их напрямую с диска для актуального содержимого."
+  }
+}
+```
+
+`_meta.stale` — файлы, чьи `(size, mtime)` на диске разошлись с индексом (файл
+изменён/удалён после индексации). Сигнал агенту прочитать их напрямую.
+
+## Framework-aware routing
+
+Для веб-проектов «точка входа» — это маршрут, а не вызов функции. iCode распознаёт
+определения маршрутов и связывает HTTP-метод + URL с контроллером@методом.
+
+Сейчас поддерживается **Laravel/PHP**:
+
+```php
+Route::get('/users', [UserController::class, 'index']);   // → GET /users → UserController::index
+Route::post('/users', 'UserController@store');            // → POST /users → UserController::store
+Route::delete('/users/{id}', [UserController::class, 'destroy'])->name('users.destroy');
+```
+
+- `find_routes` — поиск по маршрутам (фильтры `method` / `path` / `handler`).
+- `get_symbol_context("index")` — для контроллер-метода вернёт связанные маршруты
+  в поле `routes`, то есть путь `URL → Controller::method` проходится за один вызов.
+- При включённом граф-слое `[graph]` создаются узлы `Route` и рёбра `HANDLED_BY`.
+
+## Бенчмарк
+
+`scripts/benchmark.py` измеряет выигрыш индекса против наивного «grep + чтение файлов»
+(оценка токенов, число операций, время) — методология как у codegraph:
 
 ```bash
-icode serve --path .                  # запустить MCP-сервер
-icode serve --path alias=/path        # с алиасом
-icode index /path                     # однократная индексация
-icode index --force /path             # принудительная переиндексация
+cargo build --release -p icode
+python3 scripts/benchmark.py --repo /path/to/project
+python3 scripts/benchmark.py --repo . --symbols UserService,handle,index --json out.json
+```
+
+## CLI-команды
+
+### Старт за одну команду
+
+```bash
+cd /path/to/project
+icode init                            # конфиг + индекс + .mcp.json — всё за раз
+```
+
+`icode init` идемпотентен: создаёт `.icode/config.json` (если нет), строит индекс
+и пишет `.mcp.json` для Claude Code (если ещё нет). Флаги: `--no-index`, `--no-mcp`,
+`--force`. После него сразу работают query-команды ниже.
+
+### Запросы к индексу (демон не нужен — читают `.icode/index.db` напрямую)
+
+```bash
+icode query <symbol>                  # где определён символ (функции/классы/...)
+icode get-callers <name>              # кто вызывает функцию
+icode get-callees <name>              # что вызывает функция
+icode search-function <name>          # FTS-поиск функций
+icode search-class <name>             # FTS-поиск классов
+icode get-function <name>             # тело функции по имени
+icode grep-body --pattern <p>         # поиск по телам функций/классов
+icode search-text <q>                 # FTS по текстовым файлам
 icode stats                           # статистика индекса
-icode search-function <name>          # поиск функции
-icode get-callers <name>              # граф вызовов
-icode daemon run                      # запустить демон
+icode clean                           # убрать из индекса удалённые файлы
+icode index /path                     # однократная (пере)индексация (--force)
+```
+
+### Фоновый режим и MCP
+
+```bash
+icode setup                           # daemon.toml + .mcp.json + autostart
+icode serve --path .                  # MCP-сервер (stdio) для AI-клиента
+icode serve --path alias=/path        # с алиасом
+icode daemon run                      # фоновый индексатор (единственный писатель)
 icode daemon status                   # статус демона
+icode daemon reload                   # перечитать daemon.toml
 icode daemon stop                     # остановить демон
 ```
 

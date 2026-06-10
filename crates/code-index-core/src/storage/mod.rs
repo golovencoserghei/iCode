@@ -15,7 +15,9 @@ pub mod schema;
 mod analysis;
 mod content;
 mod grep;
+mod oop;
 mod read;
+mod repomap;
 mod search;
 mod write;
 
@@ -120,8 +122,14 @@ impl Storage {
                             .run_to_completion(100, std::time::Duration::from_millis(0), None)
                             .context("Ошибка при копировании БД disk→memory")?;
                     }
-                    schema::migrate_v2(&memory_conn).context("Ошибка миграции v2 (in-memory)")?;
-                    schema::migrate_v3(&memory_conn).context("Ошибка миграции v3 (in-memory)")?;
+                    // Прогоняем ВЕСЬ набор миграций (v2..v6) на скопированной в RAM
+                    // БД. Старый on-disk индекс мог быть создан до v0.11 и не иметь
+                    // таблиц file_contents/routes/parse_errors, в которые индексатор
+                    // теперь пишет на горячем пути — иначе `no such table: routes`.
+                    // initialize_tables_only идемпотентен (CREATE TABLE IF NOT EXISTS
+                    // + миграции), индексы/триггеры уже скопированы с диска.
+                    schema::initialize_tables_only(&memory_conn)
+                        .context("Ошибка миграции схемы (in-memory)")?;
                     register_regexp(&memory_conn)?;
                     Ok(Self { conn: memory_conn })
                 } else {
@@ -295,6 +303,13 @@ fn row_to_call(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallRecord> {
         caller:  row.get(2)?,
         callee:  row.get(3)?,
         line:    row.get::<_, i64>(4)? as usize,
+        // receiver — колонка 5, если SELECT её включает. Толерантны ТОЛЬКО к
+        // отсутствию колонки (SELECT без receiver); реальные ошибки типа пробрасываем.
+        receiver: match row.get::<_, Option<String>>(5) {
+            Ok(v) => v,
+            Err(rusqlite::Error::InvalidColumnIndex(_)) => None,
+            Err(e) => return Err(e),
+        },
     })
 }
 

@@ -428,7 +428,7 @@ fn visit_call(node: tree_sitter::Node, ctx: &mut VisitContext, current_func: Opt
     };
 
     let caller = current_func.unwrap_or("<module>").to_string();
-    ctx.calls.push(ParsedCall { caller, callee, line });
+    ctx.calls.push(ParsedCall { caller, callee, line, receiver: None });
 }
 
 /// Обработать field_declaration (static/final поля → переменные)
@@ -501,6 +501,7 @@ fn parse_java(source: &str) -> Result<ParseResult> {
         imports: ctx.imports,
         calls: ctx.calls,
         variables: ctx.variables,
+        routes: Vec::new(),
         lines_total,
         ast_hash,
     })

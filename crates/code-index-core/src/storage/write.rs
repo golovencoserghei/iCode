@@ -169,10 +169,10 @@ impl Storage {
 
     pub fn insert_calls(&self, records: &[CallRecord]) -> Result<()> {
         let mut stmt = self.conn.prepare(
-            "INSERT INTO calls (file_id, caller, callee, line) VALUES (?1,?2,?3,?4)",
+            "INSERT INTO calls (file_id, caller, callee, line, receiver) VALUES (?1,?2,?3,?4,?5)",
         )?;
         for r in records {
-            stmt.execute(params![r.file_id, r.caller, r.callee, r.line as i64])
+            stmt.execute(params![r.file_id, r.caller, r.callee, r.line as i64, r.receiver])
                 .context("insert_calls: ошибка вставки строки")?;
         }
         Ok(())
@@ -202,6 +202,114 @@ impl Storage {
         self.conn
             .execute("DELETE FROM variables WHERE file_id = ?1", params![file_id])
             .context("delete_variables_by_file")?;
+        Ok(())
+    }
+
+    // ── Routes (framework-aware routing) ───────────────────────────────────────
+
+    pub fn insert_routes(&self, records: &[RouteRecord]) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            "INSERT INTO routes
+                 (file_id, method, path, handler_class, handler_method, name, line)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        )?;
+        for r in records {
+            stmt.execute(params![
+                r.file_id, r.method, r.path,
+                r.handler_class, r.handler_method, r.name, r.line as i64,
+            ])
+            .context("insert_routes: ошибка вставки строки")?;
+        }
+        Ok(())
+    }
+
+    pub fn delete_routes_by_file(&self, file_id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM routes WHERE file_id = ?1", params![file_id])
+            .context("delete_routes_by_file")?;
+        Ok(())
+    }
+
+    // ── Parse errors (видимость слепых зон индекса) ──────────────────────────
+
+    /// Записать/обновить ошибку парсинга файла (файл не попал в индекс символов).
+    pub fn upsert_parse_error(&self, path: &str, error: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO parse_errors (path, error, indexed_at) VALUES (?1, ?2, datetime('now'))
+                 ON CONFLICT(path) DO UPDATE SET error = excluded.error, indexed_at = excluded.indexed_at",
+                params![path, error],
+            )
+            .context("upsert_parse_error")?;
+        Ok(())
+    }
+
+    /// Снять отметку об ошибке: файл снова успешно распарсился.
+    pub fn clear_parse_error(&self, path: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM parse_errors WHERE path = ?1", params![path])
+            .context("clear_parse_error")?;
+        Ok(())
+    }
+
+    // ── Ext signatures (сигнатуры зависимостей для ООП-резолва) ──────────────
+
+    /// Сколько сигнатур типов зависимостей сейчас в индексе (для решения,
+    /// нужно ли пересканировать vendor).
+    pub fn count_ext_classes(&self) -> usize {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM ext_classes", [], |r| r.get::<_, i64>(0))
+            .map(|n| n as usize)
+            .unwrap_or(0)
+    }
+
+    /// Прочитать значение из таблицы `meta` по ключу.
+    pub fn meta_get(&self, key: &str) -> Option<String> {
+        self.conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
+                r.get::<_, String>(0)
+            })
+            .ok()
+    }
+
+    /// Записать значение в таблицу `meta` (upsert).
+    pub fn meta_set(&self, key: &str, value: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )
+            .context("meta_set")?;
+        Ok(())
+    }
+
+    /// Полностью очистить сигнатуры зависимостей (перед пересканированием).
+    pub fn clear_ext_signatures(&self) -> Result<()> {
+        self.conn.execute_batch("DELETE FROM ext_classes; DELETE FROM ext_methods;")
+            .context("clear_ext_signatures")?;
+        Ok(())
+    }
+
+    /// Вставить сигнатуры типов зависимостей: (имя, bases).
+    pub fn insert_ext_classes(&self, records: &[(String, Option<String>)]) -> Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare("INSERT INTO ext_classes (name, bases) VALUES (?1, ?2)")?;
+        for (name, bases) in records {
+            stmt.execute(params![name, bases]).context("insert_ext_classes")?;
+        }
+        Ok(())
+    }
+
+    /// Вставить сигнатуры методов зависимостей: (класс, метод).
+    pub fn insert_ext_methods(&self, records: &[(String, String)]) -> Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare("INSERT INTO ext_methods (class, method) VALUES (?1, ?2)")?;
+        for (class, method) in records {
+            stmt.execute(params![class, method]).context("insert_ext_methods")?;
+        }
         Ok(())
     }
 

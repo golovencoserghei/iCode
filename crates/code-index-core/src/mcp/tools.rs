@@ -12,6 +12,7 @@
 use super::{CodeIndexServer, RepoEntry};
 use crate::daemon_core::client;
 use crate::daemon_core::ipc::{PathStatus, ToolUnavailable};
+use crate::storage::models::{ClassHit, ClassRecord, FunctionHit, FunctionRecord};
 
 /// Soft-cap: число строк в одном `read_file` (по умолчанию).
 pub(crate) const READ_FILE_SOFT_CAP_LINES: usize = 5_000;
@@ -160,6 +161,94 @@ pub(crate) fn wrap_with_meta_note<T: serde::Serialize>(
         .unwrap_or_else(|e| format!("{{\"error\": \"Сериализация wrap: {}\"}}", e))
 }
 
+// ── Freshness / staleness (connect-time reconciliation, v0.11+) ──────────────
+
+/// Сверить файлы из `deps` с рабочим деревом на диске и вернуть те, что
+/// устарели в индексе (изменился размер/mtime либо файл удалён с диска).
+///
+/// Идея заимствована из codegraph: даже когда демон в статусе `Ready`,
+/// конкретный файл мог измениться в окне debounce до того, как watcher
+/// переиндексировал его. Сверка `(size, mtime)` ловит это без IPC к демону —
+/// MCP-сервер сам знает индексные метаданные и сам читает диск.
+///
+/// `root=None` (remote-репо) или отсутствие метаданных → файл не помечается
+/// (нет данных для сравнения — не шумим).
+pub(crate) fn compute_stale(
+    storage: &tokio::sync::MutexGuard<'_, crate::storage::Storage>,
+    root: Option<&std::path::Path>,
+    deps: &[String],
+) -> Vec<String> {
+    use std::time::UNIX_EPOCH;
+    let Some(root) = root else { return Vec::new() };
+    let mut stale = Vec::new();
+    for rel in deps {
+        if rel.is_empty() {
+            continue;
+        }
+        let Ok(Some(rec)) = storage.get_file_by_path(rel) else { continue };
+        match std::fs::metadata(root.join(rel)) {
+            Ok(m) => {
+                let disk_size = m.len() as i64;
+                let disk_mtime = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64);
+                let size_mismatch = rec.file_size.map(|s| s != disk_size).unwrap_or(false);
+                let mtime_mismatch = match (rec.mtime, disk_mtime) {
+                    (Some(a), Some(b)) => a != b,
+                    _ => false,
+                };
+                if size_mismatch || mtime_mismatch {
+                    stale.push(rel.clone());
+                }
+            }
+            // Файл есть в индексе, но удалён с диска — данные устарели.
+            Err(_) => stale.push(rel.clone()),
+        }
+    }
+    stale
+}
+
+/// Как `wrap_with_meta`, но добавляет `_meta.stale` + предупреждающий баннер,
+/// когда часть `dependent_files` устарела относительно диска. Используется
+/// инструментами, по результатам которых агент действует (read_file,
+/// get_function/get_class, get_file_summary/outline, get_symbol_context,
+/// find_routes). При пустом `stale` поведение идентично `wrap_with_meta`.
+pub(crate) fn wrap_with_meta_fresh<T: serde::Serialize>(
+    result: &T,
+    dependent_files: Vec<String>,
+    stale: Vec<String>,
+) -> String {
+    use std::collections::HashSet;
+    let deps: Vec<String> = dependent_files
+        .into_iter()
+        .filter(|p| !p.is_empty())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let result_value = match serde_json::to_value(result) {
+        Ok(v) => v,
+        Err(e) => return format!("{{\"error\": \"Сериализация result: {}\"}}", e),
+    };
+    let mut meta = serde_json::json!({ "dependent_files": deps });
+    if !stale.is_empty() {
+        let stale_dedup: Vec<String> = stale
+            .into_iter()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        meta["stale"] = serde_json::json!(stale_dedup);
+        meta["stale_warning"] = serde_json::json!(
+            "⚠️ Эти файлы изменились на диске после индексации — данные могут быть устаревшими. \
+             Прочитайте их напрямую с диска для актуального содержимого."
+        );
+    }
+    let wrapped = serde_json::json!({ "result": result_value, "_meta": meta });
+    serde_json::to_string_pretty(&wrapped)
+        .unwrap_or_else(|e| format!("{{\"error\": \"Сериализация wrap: {}\"}}", e))
+}
+
 /// Собрать `dependent_files` из vec'а записей через extractor file_id.
 /// Применяется к Vec<FunctionRecord>, Vec<ClassRecord>, Vec<CallRecord> и т.п.
 /// Дубликаты не нужно дедуплицировать здесь — `wrap_with_meta` сам сделает.
@@ -208,6 +297,56 @@ pub(crate) fn matches_with(matcher: &globset::GlobMatcher, path: &str) -> bool {
     matcher.is_match(path)
 }
 
+// ── Lean-проекции (token-efficiency, v0.11+) ────────────────────────────────
+//
+// По умолчанию поиск (search_function/search_class/find_symbol) отдаёт сигнатуру +
+// строки + путь БЕЗ тел функций — этого хватает чтобы локализовать символ, а тело
+// тянется точечно через get_function/read_file. `include_body=true` возвращает
+// полные записи (старое поведение). На «толстых» функциях это экономит 5–10×.
+
+/// Завернуть функции: lean (FunctionHit) по умолчанию, full (FunctionRecord) при include_body.
+fn emit_functions(
+    storage: &tokio::sync::MutexGuard<'_, crate::storage::Storage>,
+    records: Vec<FunctionRecord>,
+    deps: Vec<String>,
+    include_body: bool,
+    note: Option<&str>,
+) -> String {
+    if include_body {
+        match note {
+            Some(n) => wrap_with_meta_note(&records, deps, n),
+            None => wrap_with_meta(&records, deps),
+        }
+    } else {
+        let hits: Vec<FunctionHit> = records
+            .iter()
+            .map(|f| FunctionHit::from_record(f, lookup_path(storage, f.file_id)))
+            .collect();
+        match note {
+            Some(n) => wrap_with_meta_note(&hits, deps, n),
+            None => wrap_with_meta(&hits, deps),
+        }
+    }
+}
+
+/// Завернуть классы: lean (ClassHit) по умолчанию, full (ClassRecord) при include_body.
+fn emit_classes(
+    storage: &tokio::sync::MutexGuard<'_, crate::storage::Storage>,
+    records: Vec<ClassRecord>,
+    deps: Vec<String>,
+    include_body: bool,
+) -> String {
+    if include_body {
+        wrap_with_meta(&records, deps)
+    } else {
+        let hits: Vec<ClassHit> = records
+            .iter()
+            .map(|c| ClassHit::from_record(c, lookup_path(storage, c.file_id)))
+            .collect();
+        wrap_with_meta(&hits, deps)
+    }
+}
+
 // ── Реализации инструментов ─────────────────────────────────────────────────
 
 pub async fn search_function(
@@ -216,10 +355,12 @@ pub async fn search_function(
     limit: Option<usize>,
     language: Option<String>,
     path_glob: Option<String>,
+    include_body: Option<bool>,
 ) -> String {
     bail_if_not_ready!(entry);
     let storage = entry.local_storage().lock().await;
     let want = limit.unwrap_or(20);
+    let full = include_body.unwrap_or(false);
     // Если path_glob задан — берём с запасом (5×, до 500), потом фильтруем по пути,
     // потом обрезаем до want. Это компромисс между точностью и нагрузкой.
     let sql_limit = if path_glob.is_some() {
@@ -242,12 +383,12 @@ pub async fn search_function(
                 if let Ok(fuzzy) = storage.search_functions_fuzzy(&query, want) {
                     if !fuzzy.is_empty() {
                         let deps = collect_paths_via(&storage, &fuzzy, |fr| fr.file_id);
-                        return wrap_with_meta_note(&fuzzy, deps, "fuzzy_fallback");
+                        return emit_functions(&storage, fuzzy, deps, full, Some("fuzzy_fallback"));
                     }
                 }
             }
             let deps = collect_paths_via(&storage, &r, |fr| fr.file_id);
-            wrap_with_meta(&r, deps)
+            emit_functions(&storage, r, deps, full, None)
         }
         Err(e) => format!("{{\"error\": \"search_function: {}\"}}", e),
     }
@@ -259,10 +400,12 @@ pub async fn search_class(
     limit: Option<usize>,
     language: Option<String>,
     path_glob: Option<String>,
+    include_body: Option<bool>,
 ) -> String {
     bail_if_not_ready!(entry);
     let storage = entry.local_storage().lock().await;
     let want = limit.unwrap_or(20);
+    let full = include_body.unwrap_or(false);
     let sql_limit = if path_glob.is_some() {
         (want.saturating_mul(5)).min(500)
     } else {
@@ -279,7 +422,7 @@ pub async fn search_class(
                 r.truncate(want);
             }
             let deps = collect_paths_via(&storage, &r, |cr| cr.file_id);
-            wrap_with_meta(&r, deps)
+            emit_classes(&storage, r, deps, full)
         }
         Err(e) => format!("{{\"error\": \"search_class: {}\"}}", e),
     }
@@ -302,7 +445,8 @@ pub async fn get_function(
                 r.retain(|fr| matches_with(&matcher, &lookup_path(&storage, fr.file_id)));
             }
             let deps = collect_paths_via(&storage, &r, |fr| fr.file_id);
-            wrap_with_meta(&r, deps)
+            let stale = compute_stale(&storage, entry.root_path.as_deref(), &deps);
+            wrap_with_meta_fresh(&r, deps, stale)
         }
         Err(e) => format!("{{\"error\": \"get_function: {}\"}}", e),
     }
@@ -325,23 +469,43 @@ pub async fn get_class(
                 r.retain(|cr| matches_with(&matcher, &lookup_path(&storage, cr.file_id)));
             }
             let deps = collect_paths_via(&storage, &r, |cr| cr.file_id);
-            wrap_with_meta(&r, deps)
+            let stale = compute_stale(&storage, entry.root_path.as_deref(), &deps);
+            wrap_with_meta_fresh(&r, deps, stale)
         }
         Err(e) => format!("{{\"error\": \"get_class: {}\"}}", e),
     }
 }
 
+/// Дефолтный кап рёбер call-графа — без него «толстая» функция (десятки call-site)
+/// раздувает ответ. 50 хватает для навигации; полнее — get_callers_tree / language-фильтр.
+const CALL_EDGES_DEFAULT_LIMIT: usize = 50;
+
 pub async fn get_callers(
     entry: &RepoEntry,
     function_name: String,
     language: Option<String>,
+    limit: Option<usize>,
 ) -> String {
     bail_if_not_ready!(entry);
     let storage = entry.local_storage().lock().await;
     match storage.get_callers(&function_name, language.as_deref()) {
-        Ok(r) => {
+        Ok(mut r) => {
+            let cap = limit.unwrap_or(CALL_EDGES_DEFAULT_LIMIT);
+            let total = r.len();
+            let truncated = total > cap;
+            if truncated {
+                r.truncate(cap);
+            }
             let deps = collect_paths_via(&storage, &r, |cr| cr.file_id);
-            wrap_with_meta(&r, deps)
+            if truncated {
+                wrap_with_meta_note(
+                    &r,
+                    deps,
+                    &format!("truncated: показано {} из {}; сузьте language или увеличьте limit", cap, total),
+                )
+            } else {
+                wrap_with_meta(&r, deps)
+            }
         }
         Err(e) => format!("{{\"error\": \"get_callers: {}\"}}", e),
     }
@@ -351,13 +515,28 @@ pub async fn get_callees(
     entry: &RepoEntry,
     function_name: String,
     language: Option<String>,
+    limit: Option<usize>,
 ) -> String {
     bail_if_not_ready!(entry);
     let storage = entry.local_storage().lock().await;
     match storage.get_callees(&function_name, language.as_deref()) {
-        Ok(r) => {
+        Ok(mut r) => {
+            let cap = limit.unwrap_or(CALL_EDGES_DEFAULT_LIMIT);
+            let total = r.len();
+            let truncated = total > cap;
+            if truncated {
+                r.truncate(cap);
+            }
             let deps = collect_paths_via(&storage, &r, |cr| cr.file_id);
-            wrap_with_meta(&r, deps)
+            if truncated {
+                wrap_with_meta_note(
+                    &r,
+                    deps,
+                    &format!("truncated: показано {} из {}; сузьте language или увеличьте limit", cap, total),
+                )
+            } else {
+                wrap_with_meta(&r, deps)
+            }
         }
         Err(e) => format!("{{\"error\": \"get_callees: {}\"}}", e),
     }
@@ -368,6 +547,7 @@ pub async fn find_symbol(
     name: String,
     language: Option<String>,
     path_glob: Option<String>,
+    include_body: Option<bool>,
 ) -> String {
     bail_if_not_ready!(entry);
     let storage = entry.local_storage().lock().await;
@@ -391,7 +571,26 @@ pub async fn find_symbol(
             deps.extend(collect_paths_via(&storage, &r.classes, |cr| cr.file_id));
             deps.extend(collect_paths_via(&storage, &r.variables, |vr| vr.file_id));
             deps.extend(collect_paths_via(&storage, &r.imports, |ir| ir.file_id));
-            wrap_with_meta(&r, deps)
+            if include_body.unwrap_or(false) {
+                wrap_with_meta(&r, deps)
+            } else {
+                // Lean: функции/классы без тел (locate). Тело — точечно get_function.
+                let lean = crate::storage::models::SymbolSearchLean {
+                    functions: r
+                        .functions
+                        .iter()
+                        .map(|f| FunctionHit::from_record(f, lookup_path(&storage, f.file_id)))
+                        .collect(),
+                    classes: r
+                        .classes
+                        .iter()
+                        .map(|c| ClassHit::from_record(c, lookup_path(&storage, c.file_id)))
+                        .collect(),
+                    variables: r.variables,
+                    imports: r.imports,
+                };
+                wrap_with_meta(&lean, deps)
+            }
         }
         Err(e) => format!("{{\"error\": \"find_symbol: {}\"}}", e),
     }
@@ -430,7 +629,11 @@ pub async fn get_file_summary(entry: &RepoEntry, path: String) -> String {
     bail_if_not_ready!(entry);
     let storage = entry.local_storage().lock().await;
     match storage.get_file_summary(&path, GET_FILE_SUMMARY_BODY_CAP) {
-        Ok(Some(s)) => wrap_with_meta(&s, vec![path.clone()]),
+        Ok(Some(s)) => {
+            let deps = vec![path.clone()];
+            let stale = compute_stale(&storage, entry.root_path.as_deref(), &deps);
+            wrap_with_meta_fresh(&s, deps, stale)
+        }
         Ok(None) => format!("{{\"error\": \"Файл '{}' не найден\"}}", path),
         Err(e) => format!("{{\"error\": \"get_file_summary: {}\"}}", e),
     }
@@ -442,7 +645,11 @@ pub async fn get_file_outline(entry: &RepoEntry, path: String) -> String {
     bail_if_not_ready!(entry);
     let storage = entry.local_storage().lock().await;
     match storage.get_file_outline(&path) {
-        Ok(Some(outline)) => wrap_with_meta(&outline, vec![path.clone()]),
+        Ok(Some(outline)) => {
+            let deps = vec![path.clone()];
+            let stale = compute_stale(&storage, entry.root_path.as_deref(), &deps);
+            wrap_with_meta_fresh(&outline, deps, stale)
+        }
         Ok(None) => format!("{{\"error\": \"Файл '{}' не найден\"}}", path),
         Err(e) => format!("{{\"error\": \"get_file_outline: {}\"}}", e),
     }
@@ -712,7 +919,11 @@ pub async fn read_file(
         // file_size в ответе всё равно показывается, оператор может сравнить.
         None,
     ) {
-        Ok(Some(r)) => wrap_with_meta(&r, vec![path.clone()]),
+        Ok(Some(r)) => {
+            let deps = vec![path.clone()];
+            let stale = compute_stale(&storage, entry.root_path.as_deref(), &deps);
+            wrap_with_meta_fresh(&r, deps, stale)
+        }
         Ok(None) => format!("{{\"error\": \"Файл '{}' не найден в индексе\"}}", path),
         Err(e) => format!("{{\"error\": \"read_file: {}\"}}", e),
     }
@@ -941,7 +1152,11 @@ pub async fn get_symbol_context(
             if let Some(ref outline) = ctx.file_outline {
                 deps.push(outline.path.clone());
             }
-            wrap_with_meta(&ctx, deps)
+            for r in &ctx.routes {
+                deps.push(r.file_path.clone());
+            }
+            let stale = compute_stale(&storage, entry.root_path.as_deref(), &deps);
+            wrap_with_meta_fresh(&ctx, deps, stale)
         }
         Err(e) => format!("{{\"error\": \"get_symbol_context: {}\"}}", e),
     }
@@ -1036,5 +1251,130 @@ pub async fn find_dead_code(
             wrap_with_meta(&result, deps)
         }
         Err(e) => format!("{{\"error\": \"find_dead_code: {}\"}}", e),
+    }
+}
+
+/// get_repo_map (v0.11+): архитектурная карта репо за один дешёвый вызов.
+pub async fn get_repo_map(entry: &RepoEntry, top: Option<usize>) -> String {
+    bail_if_not_ready!(entry);
+    let storage = entry.local_storage().lock().await;
+    match storage.repo_map(top.unwrap_or(12)) {
+        // Агрегатная карта — без dependent_files (зависит от всего репо).
+        Ok(m) => wrap_with_meta(&m, vec![]),
+        Err(e) => format!("{{\"error\": \"get_repo_map: {}\"}}", e),
+    }
+}
+
+/// find_complex_functions (v0.11+): ранжирование функций по сложности.
+pub async fn find_complex_functions(
+    entry: &RepoEntry,
+    limit: Option<usize>,
+    path_glob: Option<String>,
+    language: Option<String>,
+) -> String {
+    bail_if_not_ready!(entry);
+    let storage = entry.local_storage().lock().await;
+    match storage.find_complex_functions(limit.unwrap_or(15), path_glob.as_deref(), language.as_deref()) {
+        Ok(r) => {
+            let deps: Vec<String> = r.iter().map(|f| f.file_path.clone()).collect();
+            wrap_with_meta(&r, deps)
+        }
+        Err(e) => format!("{{\"error\": \"find_complex_functions: {}\"}}", e),
+    }
+}
+
+/// find_routes (v0.11+): веб-маршруты фреймворка (framework-aware routing).
+pub async fn find_routes(
+    entry: &RepoEntry,
+    method: Option<String>,
+    path: Option<String>,
+    handler: Option<String>,
+    limit: Option<usize>,
+) -> String {
+    bail_if_not_ready!(entry);
+    let storage = entry.local_storage().lock().await;
+    let want = limit.unwrap_or(100);
+    match storage.find_routes(method.as_deref(), path.as_deref(), handler.as_deref(), want) {
+        Ok(routes) => {
+            let deps: Vec<String> = routes.iter().map(|r| r.file_path.clone()).collect();
+            let result = serde_json::json!({
+                "count": routes.len(),
+                "routes": routes,
+            });
+            let stale = compute_stale(&storage, entry.root_path.as_deref(), &deps);
+            wrap_with_meta_fresh(&result, deps, stale)
+        }
+        Err(e) => format!("{{\"error\": \"find_routes: {}\"}}", e),
+    }
+}
+
+// ── Тесты freshness/staleness ────────────────────────────────────────────────
+
+#[cfg(test)]
+mod fresh_tests {
+    use super::*;
+    use crate::storage::models::FileRecord;
+    use crate::storage::Storage;
+    use tokio::sync::Mutex;
+
+    fn put_file(storage: &Storage, path: &str, mtime: i64, size: i64) {
+        storage
+            .upsert_file(&FileRecord {
+                id: None,
+                path: path.to_string(),
+                content_hash: "h".to_string(),
+                ast_hash: None,
+                language: "text".to_string(),
+                lines_total: 1,
+                indexed_at: String::new(),
+                mtime: Some(mtime),
+                file_size: Some(size),
+            })
+            .unwrap();
+        // upsert_file не пишет mtime/size — проставляем отдельно (как делает индексатор).
+        storage.update_file_metadata(path, mtime, size).unwrap();
+    }
+
+    #[tokio::test]
+    async fn compute_stale_flags_changed_and_missing_but_not_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let fpath = root.join("a.txt");
+        std::fs::write(&fpath, "hello").unwrap();
+        let meta = std::fs::metadata(&fpath).unwrap();
+        let mtime = meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let size = meta.len() as i64;
+
+        let storage = Storage::open_in_memory().unwrap();
+        put_file(&storage, "a.txt", mtime, size); // совпадает с диском → свежий
+        put_file(&storage, "gone.txt", 123, 5); // нет на диске → устарел
+
+        let m = Mutex::new(storage);
+        let guard = m.lock().await;
+
+        let stale = compute_stale(&guard, Some(root), &["a.txt".into(), "gone.txt".into()]);
+        assert!(stale.contains(&"gone.txt".to_string()), "удалённый с диска файл → stale");
+        assert!(!stale.contains(&"a.txt".to_string()), "совпадающий файл не должен быть stale");
+
+        // Изменяем содержимое на диске → размер отличается → stale.
+        std::fs::write(&fpath, "hello, a much longer content").unwrap();
+        let stale2 = compute_stale(&guard, Some(root), &["a.txt".into()]);
+        assert!(stale2.contains(&"a.txt".to_string()), "изменённый на диске файл → stale");
+    }
+
+    #[tokio::test]
+    async fn compute_stale_empty_without_root() {
+        let storage = Storage::open_in_memory().unwrap();
+        let m = Mutex::new(storage);
+        let guard = m.lock().await;
+        // root=None (remote-репо) → ничего не помечаем.
+        let stale = compute_stale(&guard, None, &["whatever.txt".into()]);
+        assert!(stale.is_empty());
     }
 }

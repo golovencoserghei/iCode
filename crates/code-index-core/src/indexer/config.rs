@@ -90,6 +90,15 @@ pub struct IndexConfig {
     /// По умолчанию 30 секунд.
     #[serde(default = "default_flush_interval")]
     pub flush_interval_sec: u64,
+
+    /// Директории зависимостей для индексации СИГНАТУР (классы+bases, методы —
+    /// без тел), напр. `["vendor"]` / `["node_modules"]`. По умолчанию пусто —
+    /// фича выключена. Когда задано: сигнатуры из этих папок попадают в отдельные
+    /// таблицы `ext_*` и используются ТОЛЬКО для ООП-резолва (наследование от
+    /// фреймворка) — не засоряют search/dead-code/repo_map. Пересканируется при
+    /// `--force` или если ext-таблицы пусты (composer/npm update → `icode index --force`).
+    #[serde(default)]
+    pub dependency_dirs: Vec<String>,
 }
 
 fn default_storage_mode() -> String {
@@ -158,6 +167,7 @@ impl Default for IndexConfig {
             debounce_ms: default_debounce_ms(),
             batch_ms: default_batch_ms(),
             flush_interval_sec: default_flush_interval(),
+            dependency_dirs: vec![],
         }
     }
 }
@@ -186,11 +196,14 @@ impl IndexConfig {
         Ok(())
     }
 
-    /// Проверить, нужно ли исключить директорию
+    /// Проверить, нужно ли исключить директорию из ОСНОВНОГО индекса.
+    /// dependency_dirs тоже исключаются: их обрабатывает отдельная фаза сигнатур
+    /// (ext_*), и в основной индекс (search/dead-code) они попадать не должны.
     pub fn is_excluded_dir(&self, dir_name: &str) -> bool {
         use crate::indexer::file_types::EXCLUDE_DIRS;
         EXCLUDE_DIRS.contains(&dir_name)
             || self.exclude_dirs.iter().any(|d| d == dir_name)
+            || self.dependency_dirs.iter().any(|d| d == dir_name)
     }
 
     /// Скомпилировать GlobSet из exclude_file_patterns для последующего быстрого матчинга.

@@ -61,6 +61,16 @@ pub enum GraphCommand {
         module: String,
         kind: String,
     },
+    /// Framework-aware routing: Route-узел + ребро HANDLED_BY к функции-хендлеру.
+    AddRoute {
+        repo: String,
+        file_path: String,
+        method: String,
+        path: String,
+        handler_class: Option<String>,
+        handler_method: String,
+        line: usize,
+    },
     DeleteFileData {
         repo: String,
         path: String,

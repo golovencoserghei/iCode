@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 
 use super::types::{
     hash_ast, sha256_hex, ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport,
-    ParsedVariable,
+    ParsedRoute, ParsedVariable,
 };
 use super::LanguageParser;
 
@@ -45,6 +45,22 @@ fn find_child_by_kind<'a>(
     None
 }
 
+/// Собрать имена типов из base_clause / class_interface_clause:
+/// дочерние `name` / `qualified_name` — это перечисленные базовые типы/интерфейсы.
+fn collect_type_names(clause: tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cursor = clause.walk();
+    for child in clause.children(&mut cursor) {
+        if matches!(child.kind(), "name" | "qualified_name") {
+            let t = node_text(child, source).trim();
+            if !t.is_empty() {
+                out.push(t.to_string());
+            }
+        }
+    }
+    out
+}
+
 struct VisitContext<'a> {
     source: &'a [u8],
     functions: Vec<ParsedFunction>,
@@ -52,6 +68,7 @@ struct VisitContext<'a> {
     imports: Vec<ParsedImport>,
     calls: Vec<ParsedCall>,
     variables: Vec<ParsedVariable>,
+    routes: Vec<ParsedRoute>,
 }
 
 impl<'a> VisitContext<'a> {
@@ -63,6 +80,7 @@ impl<'a> VisitContext<'a> {
             imports: Vec::new(),
             calls: Vec::new(),
             variables: Vec::new(),
+            routes: Vec::new(),
         }
     }
 }
@@ -118,6 +136,10 @@ fn visit_node(
         | "nullsafe_member_call_expression"
         | "scoped_call_expression" => {
             visit_method_call(node, ctx, current_func);
+            // Framework-aware routing: `Route::get('/x', [Ctrl::class, 'm'])` и т.п.
+            if node.kind() == "scoped_call_expression" {
+                try_extract_route(node, ctx);
+            }
             // Рекурсия в object-часть для цепочек: $this->a()->b()->c()
             // AST: member_call[object=member_call[object=...], name=c]
             if let Some(obj) = node.child_by_field_name("object") {
@@ -301,11 +323,23 @@ fn visit_class(node: tree_sitter::Node, ctx: &mut VisitContext) {
     let line_start = node.start_position().row + 1;
     let line_end = node.end_position().row + 1;
 
-    // extends (base_clause) или implements
-    let bases = node
-        .child_by_field_name("base_clause")
-        .or_else(|| node.child_by_field_name("extends"))
-        .map(|n| node_text(n, source).to_string());
+    // extends / implements. В tree-sitter-php это дочерние УЗЛЫ
+    // `base_clause` (extends) и `class_interface_clause` (implements), а НЕ поля —
+    // поэтому child_by_field_name их не находит (был баг: bases всегда None).
+    // Собираем имена базовых типов из обоих в чистый список через запятую,
+    // как ожидают get_implementations и граф INHERITS.
+    let mut base_types: Vec<String> = Vec::new();
+    if let Some(c) = find_child_by_kind(node, "base_clause") {
+        base_types.extend(collect_type_names(c, source));
+    }
+    if let Some(c) = find_child_by_kind(node, "class_interface_clause") {
+        base_types.extend(collect_type_names(c, source));
+    }
+    let bases = if base_types.is_empty() {
+        None
+    } else {
+        Some(base_types.join(", "))
+    };
 
     let docstring = extract_phpdoc(node, source);
     let body = node_text(node, source).to_string();
@@ -444,7 +478,36 @@ fn visit_function_call(
             caller: current_func.unwrap_or("<module>").to_string(),
             callee,
             line,
+            receiver: None, // свободный вызов f()
         });
+    }
+}
+
+/// Нормализовать получателя вызова в значение для ООП-резолва.
+///   * `$this` → "$this"; `self`/`parent`/`static` → как есть (вызов в своём классе);
+///   * `App\Foo` / `Foo` → "Foo" (последний сегмент пути);
+///   * `$other` → "$other" (имя переменной — типобезопасный резолв пока недоступен);
+///   * сложное выражение / пусто → None.
+fn normalize_receiver(text: &str) -> Option<String> {
+    let t = text.trim();
+    if t.is_empty() {
+        return None;
+    }
+    match t {
+        "$this" | "self" | "parent" | "static" => Some(t.to_string()),
+        _ => {
+            // Цепочки/индексация/вызовы ($a->b, $a[0], foo()->bar) — резолв по типу
+            // пока не делаем.
+            if t.contains("->") || t.contains("::") || t.contains('(') || t.contains('[') {
+                None
+            } else if let Some(stripped) = t.strip_prefix('$') {
+                // Переменная: оставляем имя (без типа резолвить нельзя, но информативно).
+                (!stripped.is_empty()).then(|| t.to_string())
+            } else {
+                // Имя класса (static call) — берём последний сегмент пути.
+                Some(t.rsplit('\\').next().unwrap_or(t).to_string())
+            }
+        }
     }
 }
 
@@ -462,11 +525,18 @@ fn visit_method_call(
         .map(|n| node_text(n, source).to_string())
         .unwrap_or_default();
 
+    // Получатель: object (для member) либо scope (для scoped) — для ООП-резолва.
+    let receiver = node
+        .child_by_field_name("object")
+        .or_else(|| node.child_by_field_name("scope"))
+        .and_then(|n| normalize_receiver(node_text(n, source)));
+
     if !callee.is_empty() {
         ctx.calls.push(ParsedCall {
             caller: current_func.unwrap_or("<module>").to_string(),
             callee,
             line,
+            receiver,
         });
     }
 }
@@ -524,6 +594,168 @@ fn visit_const(node: tree_sitter::Node, ctx: &mut VisitContext) {
     }
 }
 
+// ── Framework-aware routing (Laravel/PHP) ───────────────────────────────────
+//
+// Распознаёт определения маршрутов вида `Route::<verb>('/path', handler)` и
+// связывает HTTP-метод + URL с контроллером@методом. Покрывает leaf-маршруты
+// (`Route::get`, `Route::post`, …, `Route::match`). Ограничение v1: не
+// раскрывает group-prefix (`Route::prefix('admin')->group(...)`) и не ловит
+// `Route::middleware(...)->get(...)` — путь записывается как в коде.
+
+/// Снять обрамляющие кавычки со строкового литерала PHP.
+fn strip_quotes(s: &str) -> String {
+    let s = s.trim();
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 {
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if (first == b'\'' || first == b'"') && first == last {
+            return s[1..s.len() - 1].to_string();
+        }
+    }
+    s.to_string()
+}
+
+/// Текст строкового литерала (`string` / `encapsed_string`) без кавычек.
+fn string_literal(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "string" | "encapsed_string" => Some(strip_quotes(node_text(node, source))),
+        _ => None,
+    }
+}
+
+/// Последний named-child узла `argument` — это сама expression-нагрузка
+/// (пропускает ведущее имя у named-аргументов `path: '/x'`).
+fn arg_value(arg: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    if arg.kind() == "argument" {
+        let n = arg.named_child_count();
+        if n == 0 {
+            return None;
+        }
+        arg.named_child(n - 1)
+    } else {
+        Some(arg)
+    }
+}
+
+/// Собрать expression-узлы позиционных аргументов вызова.
+fn collect_arg_exprs<'a>(args: tree_sitter::Node<'a>) -> Vec<tree_sitter::Node<'a>> {
+    let mut out = Vec::new();
+    let mut cursor = args.walk();
+    for ch in args.named_children(&mut cursor) {
+        if ch.kind() == "comment" {
+            continue;
+        }
+        if let Some(v) = arg_value(ch) {
+            out.push(v);
+        }
+    }
+    out
+}
+
+/// Имя класса из `UserController::class` / `name` / строкового литерала
+/// (берётся последний сегмент после `\`).
+fn class_const_name(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let raw = match node.kind() {
+        "class_constant_access_expression" => node_text(node.named_child(0)?, source),
+        "name" | "qualified_name" => node_text(node, source),
+        "string" | "encapsed_string" => return string_literal(node, source),
+        _ => return None,
+    };
+    Some(raw.rsplit('\\').next().unwrap_or(raw).trim().to_string())
+}
+
+/// Разобрать handler-аргумент маршрута в (class, method).
+///   * `[UserController::class, 'index']` → (UserController, index)
+///   * `'UserController@index'`           → (UserController, index)
+///   * `'InvokableController'`            → (InvokableController, None)
+///   * closure / прочее                   → (None, None)
+fn extract_handler(node: tree_sitter::Node, source: &[u8]) -> (Option<String>, Option<String>) {
+    match node.kind() {
+        "string" | "encapsed_string" => match string_literal(node, source) {
+            Some(s) => match s.split_once('@') {
+                Some((cls, m)) => (Some(cls.trim().to_string()), Some(m.trim().to_string())),
+                None => (Some(s), None),
+            },
+            None => (None, None),
+        },
+        "array_creation_expression" => {
+            let mut elems = Vec::new();
+            let mut cursor = node.walk();
+            for ch in node.named_children(&mut cursor) {
+                if ch.kind() == "array_element_initializer" {
+                    let n = ch.named_child_count();
+                    if n > 0 {
+                        if let Some(v) = ch.named_child(n - 1) {
+                            elems.push(v);
+                        }
+                    }
+                }
+            }
+            let class = elems.first().and_then(|n| class_const_name(*n, source));
+            let method = elems.get(1).and_then(|n| string_literal(*n, source));
+            (class, method)
+        }
+        _ => (None, None),
+    }
+}
+
+/// Попытаться распознать `Route::<verb>(...)` и добавить ParsedRoute в контекст.
+fn try_extract_route(node: tree_sitter::Node, ctx: &mut VisitContext) {
+    let source = ctx.source;
+
+    // scope: класс перед `::`. Принимаем только фасад `Route` (последний сегмент).
+    let scope = node
+        .child_by_field_name("scope")
+        .map(|n| node_text(n, source))
+        .unwrap_or("");
+    let scope_last = scope.rsplit('\\').next().unwrap_or(scope).trim();
+    if scope_last != "Route" {
+        return;
+    }
+
+    let verb = node
+        .child_by_field_name("name")
+        .map(|n| node_text(n, source))
+        .unwrap_or("");
+    let method = match verb.to_ascii_lowercase().as_str() {
+        "get" => "GET",
+        "post" => "POST",
+        "put" => "PUT",
+        "patch" => "PATCH",
+        "delete" => "DELETE",
+        "options" => "OPTIONS",
+        "any" => "ANY",
+        "match" => "MATCH",
+        _ => return,
+    };
+
+    let Some(args) = node.child_by_field_name("arguments") else {
+        return;
+    };
+    let arg_exprs = collect_arg_exprs(args);
+
+    // `Route::match([methods], '/path', handler)` сдвигает path/handler на 1.
+    let (path_idx, handler_idx) = if method == "MATCH" { (1, 2) } else { (0, 1) };
+
+    let Some(path) = arg_exprs.get(path_idx).and_then(|n| string_literal(*n, source)) else {
+        return;
+    };
+    let (handler_class, handler_method) = arg_exprs
+        .get(handler_idx)
+        .map(|n| extract_handler(*n, source))
+        .unwrap_or((None, None));
+
+    ctx.routes.push(ParsedRoute {
+        method: method.to_string(),
+        path,
+        handler_class,
+        handler_method,
+        name: None,
+        line: node.start_position().row + 1,
+    });
+}
+
 fn parse_php(source: &str) -> Result<ParseResult> {
     let mut ts_parser = tree_sitter::Parser::new();
     ts_parser
@@ -553,6 +785,7 @@ fn parse_php(source: &str) -> Result<ParseResult> {
         imports: ctx.imports,
         calls: ctx.calls,
         variables: ctx.variables,
+        routes: ctx.routes,
         lines_total,
         ast_hash,
     })
@@ -847,5 +1080,97 @@ class EmailService {
         let send = result.functions.iter().find(|f| f.name == "send").unwrap();
         assert_eq!(send.qualified_name.as_deref(), Some("EmailService::send"),
                    "qualified_name должен быть ClassName::method");
+    }
+
+    // ── Framework-aware routing ───────────────────────────────────────────
+
+    #[test]
+    fn test_route_array_handler() {
+        let parser = PhpParser::new();
+        let source = r#"<?php
+use Illuminate\Support\Facades\Route;
+
+Route::get('/users', [UserController::class, 'index']);
+Route::post('/users', [UserController::class, 'store']);
+"#;
+        let result = parser.parse(source, "routes/web.php").unwrap();
+        assert_eq!(result.routes.len(), 2, "должно быть 2 маршрута");
+        let get = result.routes.iter().find(|r| r.method == "GET").unwrap();
+        assert_eq!(get.path, "/users");
+        assert_eq!(get.handler_class.as_deref(), Some("UserController"));
+        assert_eq!(get.handler_method.as_deref(), Some("index"));
+        let post = result.routes.iter().find(|r| r.method == "POST").unwrap();
+        assert_eq!(post.handler_method.as_deref(), Some("store"));
+    }
+
+    #[test]
+    fn test_route_string_handler_and_chain() {
+        let parser = PhpParser::new();
+        let source = r#"<?php
+Route::get('/legacy', 'LegacyController@show');
+Route::delete('/users/{id}', [UserController::class, 'destroy'])->name('users.destroy');
+"#;
+        let result = parser.parse(source, "routes/web.php").unwrap();
+        let legacy = result.routes.iter().find(|r| r.path == "/legacy").unwrap();
+        assert_eq!(legacy.handler_class.as_deref(), Some("LegacyController"));
+        assert_eq!(legacy.handler_method.as_deref(), Some("show"));
+        // chained ->name() не должен мешать распознаванию маршрута
+        let del = result.routes.iter().find(|r| r.method == "DELETE").unwrap();
+        assert_eq!(del.path, "/users/{id}");
+        assert_eq!(del.handler_method.as_deref(), Some("destroy"));
+    }
+
+    #[test]
+    fn test_route_closure_no_handler() {
+        let parser = PhpParser::new();
+        let source = r#"<?php
+Route::get('/ping', function () {
+    return 'pong';
+});
+"#;
+        let result = parser.parse(source, "routes/web.php").unwrap();
+        assert_eq!(result.routes.len(), 1);
+        assert_eq!(result.routes[0].path, "/ping");
+        assert!(result.routes[0].handler_class.is_none(), "closure → нет handler_class");
+    }
+
+    #[test]
+    fn test_call_receiver_capture() {
+        let parser = PhpParser::new();
+        let source = r#"<?php
+class Svc extends Base {
+    public function run(): void {
+        $this->save();
+        self::helper();
+        parent::boot();
+        $other->process();
+        Logger::info('x');
+        freeFunc();
+    }
+}
+"#;
+        let r = parser.parse(source, "Svc.php").unwrap();
+        let recv = |callee: &str| r.calls.iter().find(|c| c.callee == callee).unwrap().receiver.clone();
+        assert_eq!(recv("save").as_deref(), Some("$this"));
+        assert_eq!(recv("helper").as_deref(), Some("self"));
+        assert_eq!(recv("boot").as_deref(), Some("parent"));
+        assert_eq!(recv("process").as_deref(), Some("$other"));
+        assert_eq!(recv("info").as_deref(), Some("Logger"), "static-вызов → имя класса");
+        assert_eq!(recv("freeFunc"), None, "свободная функция → нет получателя");
+    }
+
+    #[test]
+    fn test_non_route_scoped_call_ignored() {
+        let parser = PhpParser::new();
+        let source = r#"<?php
+class Foo {
+    public function bar(): void {
+        Logger::info('hello');
+        Cache::get('key');
+    }
+}
+"#;
+        let result = parser.parse(source, "Foo.php").unwrap();
+        assert!(result.routes.is_empty(), "обычные static-вызовы не должны давать маршруты");
     }
 }

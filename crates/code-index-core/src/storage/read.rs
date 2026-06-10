@@ -168,4 +168,77 @@ impl Storage {
             })),
         }
     }
+
+    // ── Routes (framework-aware routing) ───────────────────────────────────────
+
+    /// Маршруты, чей хендлер — `class::method` (или просто `method`, если class=None).
+    /// Используется для обогащения `get_symbol_context` контроллер-методов.
+    pub fn routes_for_handler(&self, class: Option<&str>, method: &str) -> Result<Vec<RouteHit>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.method, r.path, r.handler_class, r.handler_method, fi.path, r.line
+             FROM routes r JOIN files fi ON fi.id = r.file_id
+             WHERE r.handler_method = ?1 AND (?2 IS NULL OR r.handler_class = ?2)
+             ORDER BY fi.path, r.line",
+        )?;
+        let rows = stmt.query_map(params![method, class], row_to_route_hit)?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Поиск маршрутов с опциональными фильтрами:
+    ///   * `method`  — точный HTTP-метод (регистронезависимо приводится к upper вызывающим).
+    ///   * `path_like` — подстрока URL-пути (LIKE %...%).
+    ///   * `handler` — подстрока по `handler_class` ИЛИ `handler_method`.
+    pub fn find_routes(
+        &self,
+        method: Option<&str>,
+        path_like: Option<&str>,
+        handler: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<RouteHit>> {
+        let mut conds: Vec<String> = Vec::new();
+        let mut params_dyn: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(m) = method {
+            conds.push("r.method = ?".to_string());
+            params_dyn.push(Box::new(m.to_ascii_uppercase()));
+        }
+        if let Some(p) = path_like {
+            // ESCAPE '\' обязателен: иначе вставленные backslash-экранирования
+            // матчатся буквально, а % / _ в запросе ломают поиск.
+            conds.push("r.path LIKE ? ESCAPE '\\'".to_string());
+            let escaped = p.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+            params_dyn.push(Box::new(format!("%{}%", escaped)));
+        }
+        if let Some(h) = handler {
+            conds.push("(r.handler_class LIKE ? ESCAPE '\\' OR r.handler_method LIKE ? ESCAPE '\\')".to_string());
+            let escaped = h.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+            params_dyn.push(Box::new(format!("%{}%", escaped)));
+            params_dyn.push(Box::new(format!("%{}%", escaped.clone())));
+        }
+        let where_clause = if conds.is_empty() { String::new() }
+            else { format!("WHERE {}", conds.join(" AND ")) };
+        let sql = format!(
+            "SELECT r.method, r.path, r.handler_class, r.handler_method, fi.path, r.line
+             FROM routes r JOIN files fi ON fi.id = r.file_id
+             {} ORDER BY fi.path, r.line LIMIT ?",
+            where_clause
+        );
+        params_dyn.push(Box::new(limit as i64));
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_dyn.iter().map(|b| &**b as &dyn rusqlite::ToSql).collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_refs.as_slice(), row_to_route_hit)?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+}
+
+/// SELECT r.method, r.path, r.handler_class, r.handler_method, fi.path, r.line
+fn row_to_route_hit(row: &rusqlite::Row<'_>) -> rusqlite::Result<RouteHit> {
+    Ok(RouteHit {
+        method:         row.get(0)?,
+        path:           row.get(1)?,
+        handler_class:  row.get(2)?,
+        handler_method: row.get(3)?,
+        file_path:      row.get(4)?,
+        line:           row.get::<_, i64>(5)? as usize,
+    })
 }

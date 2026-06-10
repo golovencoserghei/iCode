@@ -27,11 +27,13 @@ impl GraphClient {
             "CREATE INDEX func_name_idx IF NOT EXISTS FOR (fn:Function) ON (fn.repo, fn.name)",
             "CREATE INDEX class_name_idx IF NOT EXISTS FOR (c:Class) ON (c.repo, c.name)",
             "CREATE INDEX module_name_idx IF NOT EXISTS FOR (m:Module) ON (m.repo, m.name)",
+            "CREATE INDEX route_path_idx IF NOT EXISTS FOR (rt:Route) ON (rt.repo, rt.path)",
             // Memgraph синтаксис (старый Neo4j 3.x стиль)
             "CREATE INDEX ON :File(path)",
             "CREATE INDEX ON :Function(name)",
             "CREATE INDEX ON :Class(name)",
             "CREATE INDEX ON :Module(name)",
+            "CREATE INDEX ON :Route(path)",
         ];
         for stmt in stmts {
             let _ = self.graph.run(query(stmt)).await;
@@ -175,7 +177,49 @@ impl GraphClient {
                     .await?;
             }
 
+            GraphCommand::AddRoute {
+                repo,
+                file_path,
+                method,
+                path,
+                handler_class,
+                handler_method,
+                line,
+            } => {
+                self.graph
+                    .run(
+                        query(
+                            "MERGE (rt:Route {repo: $repo, method: $method, path: $path}) \
+                             SET rt.file_path = $fp, rt.line = $line, rt.handler_class = $hclass \
+                             WITH rt \
+                             MERGE (fn:Function {repo: $repo, name: $hmethod}) \
+                             MERGE (rt)-[:HANDLED_BY]->(fn)",
+                        )
+                        .param("repo", repo)
+                        .param("method", method)
+                        .param("path", path)
+                        .param("fp", file_path)
+                        .param("line", line as i64)
+                        .param("hclass", handler_class.unwrap_or_default())
+                        .param("hmethod", handler_method),
+                    )
+                    .await?;
+            }
+
             GraphCommand::DeleteFileData { repo, path } => {
+                // Сначала чистим Route-узлы, определённые в этом файле (HANDLED_BY
+                // снимется через DETACH). Отдельным запросом — основной delete ниже
+                // оперирует Function/Class/Module.
+                let _ = self
+                    .graph
+                    .run(
+                        query(
+                            "MATCH (rt:Route {repo: $repo, file_path: $path}) DETACH DELETE rt",
+                        )
+                        .param("repo", repo.clone())
+                        .param("path", path.clone()),
+                    )
+                    .await;
                 // Delete function nodes defined in this file:
                 //   - Remove DEFINED_IN edge (outgoing from fn → file)
                 //   - Remove outgoing CALLS edges  (fn → other)

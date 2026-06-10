@@ -72,11 +72,17 @@ pub struct ParsedImport {
 }
 
 /// Извлечённый вызов функции
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ParsedCall {
     pub caller: String,
     pub callee: String,
     pub line: usize,
+    /// Получатель вызова (для точного ООП-резолва). Нормализованные значения:
+    ///   * `"$this"` / `"self"` / `"parent"` / `"static"` — вызов в пределах своего класса
+    ///     (резолвится по иерархии класса вызывателя);
+    ///   * `"Имя"` — статический вызов `Имя::m()` или `$имя->m()` (имя переменной/класса);
+    ///   * `None` — свободный вызов `f()` либо язык, где receiver не извлекается.
+    pub receiver: Option<String>,
 }
 
 /// Извлечённая переменная
@@ -84,6 +90,29 @@ pub struct ParsedCall {
 pub struct ParsedVariable {
     pub name: String,
     pub value: Option<String>,
+    pub line: usize,
+}
+
+/// Извлечённый веб-маршрут фреймворка (framework-aware routing).
+/// Связывает HTTP-метод + URL-путь с хендлером (контроллер@метод).
+///
+/// Пример (Laravel): `Route::get('/users', [UserController::class, 'index'])`
+/// → method="GET", path="/users", handler_class="UserController", handler_method="index".
+///
+/// Для closure-хендлеров `handler_class`/`handler_method` = None (анонимный обработчик).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ParsedRoute {
+    /// HTTP-метод в верхнем регистре: GET, POST, PUT, PATCH, DELETE, ANY, MATCH…
+    pub method: String,
+    /// URL-шаблон как записан в коде (`/users/{id}`). Без раскрытия group-prefix (v1).
+    pub path: String,
+    /// Класс-контроллер (`UserController`) либо None для closure.
+    pub handler_class: Option<String>,
+    /// Метод контроллера (`index`) либо None для closure / invokable.
+    pub handler_method: Option<String>,
+    /// Имя маршрута (`->name('users.index')`), если задано. Пока не извлекается (зарезервировано).
+    pub name: Option<String>,
+    /// Строка определения маршрута.
     pub line: usize,
 }
 
@@ -95,6 +124,9 @@ pub struct ParseResult {
     pub imports: Vec<ParsedImport>,
     pub calls: Vec<ParsedCall>,
     pub variables: Vec<ParsedVariable>,
+    /// Веб-маршруты фреймворка (framework-aware routing). Пусто для языков/файлов
+    /// без распознанного роутинга.
+    pub routes: Vec<ParsedRoute>,
     pub lines_total: usize,
     pub ast_hash: String,
 }

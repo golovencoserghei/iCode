@@ -98,6 +98,9 @@ struct VisitContext<'a> {
     imports: Vec<ParsedImport>,
     calls: Vec<ParsedCall>,
     variables: Vec<ParsedVariable>,
+    /// (тип, трейт) из `impl Trait for Type` — связь реализации трейта.
+    /// Сливается в `bases` соответствующего типа в конце парсинга (без дублей записей).
+    impls: Vec<(String, String)>,
 }
 
 impl<'a> VisitContext<'a> {
@@ -109,6 +112,7 @@ impl<'a> VisitContext<'a> {
             imports: Vec::new(),
             calls: Vec::new(),
             variables: Vec::new(),
+            impls: Vec::new(),
         }
     }
 }
@@ -274,6 +278,12 @@ fn visit_function(
     }
 }
 
+/// Имя типа без дженериков и пути модуля: `a::b::Foo<T>` → `Foo`.
+fn base_type_ident(s: &str) -> String {
+    let s = s.split('<').next().unwrap_or(s).trim();
+    s.rsplit("::").next().unwrap_or(s).trim().to_string()
+}
+
 /// Обработать impl_item — определяет контекст типа для методов
 fn visit_impl(
     node: tree_sitter::Node,
@@ -300,6 +310,37 @@ fn visit_impl(
     } else {
         Some(type_name.as_str())
     };
+
+    // `impl Trait for Type` — трейт идёт ПЕРЕД ключевым словом `for` (поле `trait`
+    // в этой версии tree-sitter не извлекается, поэтому детектим позиционно).
+    // Фиксируем связь Type→Trait, чтобы дальше слить её в bases типа (для ООП-анализа:
+    // методы-реализации трейта не считались «мёртвыми», get_implementations их видел).
+    if !type_name.is_empty() {
+        let mut cur = node.walk();
+        let mut trait_node: Option<tree_sitter::Node> = None;
+        let mut found_for = false;
+        for ch in node.children(&mut cur) {
+            match ch.kind() {
+                "for" => {
+                    found_for = true;
+                    break;
+                }
+                "type_identifier" | "scoped_type_identifier" | "generic_type" => {
+                    trait_node = Some(ch);
+                }
+                _ => {}
+            }
+        }
+        if found_for {
+            if let Some(tn) = trait_node {
+                let trait_name = base_type_ident(node_text(tn, source));
+                let type_key = base_type_ident(&type_name);
+                if !trait_name.is_empty() && !type_key.is_empty() {
+                    ctx.impls.push((type_key, trait_name));
+                }
+            }
+        }
+    }
 
     // Обходим тело impl
     if let Some(body) = node.child_by_field_name("body") {
@@ -576,7 +617,7 @@ fn visit_call_expr(
     }
 
     let caller = current_func.unwrap_or("<module>").to_string();
-    ctx.calls.push(ParsedCall { caller, callee, line });
+    ctx.calls.push(ParsedCall { caller, callee, line, receiver: None });
 }
 
 /// Обработать method_call_expression: receiver.method(args)
@@ -603,7 +644,7 @@ fn visit_method_call(
     };
 
     let caller = current_func.unwrap_or("<module>").to_string();
-    ctx.calls.push(ParsedCall { caller, callee, line });
+    ctx.calls.push(ParsedCall { caller, callee, line, receiver: None });
 }
 
 /// Обработать static_item и const_item → variables
@@ -689,12 +730,32 @@ fn parse_rust(source: &str) -> Result<ParseResult> {
         visit_node(child, &mut ctx, None, None, "source_file", 0);
     }
 
+    // Слить связи `impl Trait for Type` в bases соответствующих типов — без
+    // дублирования записей classes (struct/enum/trait объявлены отдельно).
+    let impls = std::mem::take(&mut ctx.impls);
+    for (type_name, trait_name) in impls {
+        if let Some(cls) = ctx.classes.iter_mut().find(|c| c.name == type_name) {
+            match &mut cls.bases {
+                Some(b) => {
+                    if !b.split(',').map(|s| s.trim()).any(|t| t == trait_name) {
+                        if !b.is_empty() {
+                            b.push_str(", ");
+                        }
+                        b.push_str(&trait_name);
+                    }
+                }
+                None => cls.bases = Some(trait_name),
+            }
+        }
+    }
+
     Ok(ParseResult {
         functions: ctx.functions,
         classes: ctx.classes,
         imports: ctx.imports,
         calls: ctx.calls,
         variables: ctx.variables,
+        routes: Vec::new(),
         lines_total,
         ast_hash,
     })
@@ -792,6 +853,26 @@ pub trait LanguageParser: Send + Sync {
         let result = parser.parse(source, "test.rs").unwrap();
         assert!(result.classes.iter().any(|c| c.name == "FileCategory"));
         assert!(result.classes.iter().any(|c| c.name == "LanguageParser"));
+    }
+
+    #[test]
+    fn test_trait_impl_recorded_in_bases() {
+        let parser = RustParser::new();
+        let source = r#"
+pub trait LanguageParser { fn parse(&self) -> i32; }
+pub struct PhpParser;
+impl LanguageParser for PhpParser { fn parse(&self) -> i32 { 1 } }
+struct Foo;
+impl Foo { fn helper(&self) {} }
+"#;
+        let result = parser.parse(source, "test.rs").unwrap();
+        // `impl LanguageParser for PhpParser` → bases типа содержит трейт.
+        let php = result.classes.iter().find(|c| c.name == "PhpParser").unwrap();
+        assert_eq!(php.bases.as_deref(), Some("LanguageParser"),
+                   "trait-impl должен попасть в bases типа");
+        // Инхерентный impl (без `for`) не создаёт фиктивного наследования.
+        let foo = result.classes.iter().find(|c| c.name == "Foo").unwrap();
+        assert!(foo.bases.is_none(), "инхерентный impl не должен давать bases");
     }
 
     #[test]
