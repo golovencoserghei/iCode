@@ -61,6 +61,58 @@ fn collect_type_names(clause: tree_sitter::Node, source: &[u8]) -> Vec<String> {
     out
 }
 
+/// Короткое имя класса из узла-типа: `?App\User` / `User|null` → `User`.
+fn simple_type_name(type_node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let raw = node_text(type_node, source).trim().trim_start_matches('?');
+    let first = raw.split('|').next().unwrap_or(raw).trim();
+    let short = first.rsplit('\\').next().unwrap_or(first).trim();
+    (!short.is_empty()).then(|| short.to_string())
+}
+
+/// Извлечь `$переменная → ТипКласс` из типизированных параметров функции/метода
+/// (включая promoted-параметры конструктора).
+fn params_to_types(params: tree_sitter::Node, source: &[u8]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut cursor = params.walk();
+    for p in params.named_children(&mut cursor) {
+        if matches!(p.kind(), "simple_parameter" | "property_promotion_parameter" | "variadic_parameter") {
+            let ty = p.child_by_field_name("type").and_then(|t| simple_type_name(t, source));
+            let nm = p.child_by_field_name("name").map(|n| node_text(n, source).to_string());
+            if let (Some(t), Some(n)) = (ty, nm) {
+                if !n.is_empty() {
+                    out.push((n, t));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Зафиксировать тип переменной из `$x = new X(...)` в текущей области.
+fn capture_var_type(node: tree_sitter::Node, ctx: &mut VisitContext) {
+    let source = ctx.source;
+    let (Some(l), Some(r)) = (node.child_by_field_name("left"), node.child_by_field_name("right")) else {
+        return;
+    };
+    if l.kind() != "variable_name" || r.kind() != "object_creation_expression" {
+        return;
+    }
+    let var = node_text(l, source).to_string();
+    if var.is_empty() {
+        return;
+    }
+    let mut c = r.walk();
+    for ch in r.children(&mut c) {
+        if matches!(ch.kind(), "name" | "qualified_name") {
+            let ty = node_text(ch, source).rsplit('\\').next().unwrap_or("").trim().to_string();
+            if !ty.is_empty() {
+                ctx.var_types.insert(var, ty);
+            }
+            return;
+        }
+    }
+}
+
 struct VisitContext<'a> {
     source: &'a [u8],
     functions: Vec<ParsedFunction>,
@@ -72,6 +124,9 @@ struct VisitContext<'a> {
     /// Стек префиксов активных route-групп (Route::prefix('x')->group / Route::group).
     /// Вложенные группы аккумулируются; маршруты внутри получают объединённый путь.
     route_prefix: Vec<String>,
+    /// Карта `$переменная → ТипКласс` в области текущей функции/метода (типизированные
+    /// параметры + `$x = new X()`). Позволяет резолвить `$x->m()` к классу X.
+    var_types: std::collections::HashMap<String, String>,
 }
 
 impl<'a> VisitContext<'a> {
@@ -85,6 +140,7 @@ impl<'a> VisitContext<'a> {
             variables: Vec::new(),
             routes: Vec::new(),
             route_prefix: Vec::new(),
+            var_types: std::collections::HashMap::new(),
         }
     }
 }
@@ -131,6 +187,30 @@ fn visit_node(
         }
         "namespace_use_declaration" => {
             visit_use(node, ctx);
+        }
+        "assignment_expression" => {
+            // `$x = new X()` → зафиксировать тип переменной для резолва вызовов.
+            capture_var_type(node, ctx);
+            let mut c = node.walk();
+            for child in node.children(&mut c) {
+                visit_node(child, ctx, class_name, current_func);
+            }
+        }
+        "anonymous_function" | "arrow_function" => {
+            // У замыкания свой скоуп типов (PHP не авто-захватывает переменные):
+            // стартуем с его параметров, не наследуя/не мутируя родительский var_types.
+            let pm: std::collections::HashMap<String, String> = node
+                .child_by_field_name("parameters")
+                .map(|p| params_to_types(p, ctx.source))
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            let prev = std::mem::replace(&mut ctx.var_types, pm);
+            let mut c = node.walk();
+            for child in node.children(&mut c) {
+                visit_node(child, ctx, class_name, current_func);
+            }
+            ctx.var_types = prev;
         }
         "function_call_expression" => {
             visit_function_call(node, ctx, current_func);
@@ -263,15 +343,23 @@ fn visit_function(
         ..Default::default()
     });
 
-    // Рекурсия в тело функции
+    // Рекурсия в тело функции — со скоупом типов переменных (параметры + new X()).
     if let Some(body_node) = node
         .child_by_field_name("body")
         .or_else(|| find_child_by_kind(node, "compound_statement"))
     {
+        let param_types: std::collections::HashMap<String, String> = node
+            .child_by_field_name("parameters")
+            .map(|p| params_to_types(p, source))
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let prev = std::mem::replace(&mut ctx.var_types, param_types);
         let mut c = body_node.walk();
         for child in body_node.children(&mut c) {
             visit_node(child, ctx, class_name, Some(&name));
         }
+        ctx.var_types = prev;
     }
 }
 
@@ -321,15 +409,23 @@ fn visit_method(
         ..Default::default()
     });
 
-    // Рекурсия в тело метода (если не abstract)
+    // Рекурсия в тело метода (если не abstract) — со скоупом типов переменных.
     if let Some(body_node) = node
         .child_by_field_name("body")
         .or_else(|| find_child_by_kind(node, "compound_statement"))
     {
+        let param_types: std::collections::HashMap<String, String> = node
+            .child_by_field_name("parameters")
+            .map(|p| params_to_types(p, source))
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let prev = std::mem::replace(&mut ctx.var_types, param_types);
         let mut c = body_node.walk();
         for child in body_node.children(&mut c) {
             visit_node(child, ctx, class_name, Some(&name));
         }
+        ctx.var_types = prev;
     }
 }
 
@@ -552,10 +648,13 @@ fn visit_method_call(
         .unwrap_or_default();
 
     // Получатель: object (для member) либо scope (для scoped) — для ООП-резолва.
+    // Если получатель — переменная известного типа ($user: User), подменяем на тип,
+    // чтобы $user->save() резолвилось к User::save (а не оставалось "$user").
     let receiver = node
         .child_by_field_name("object")
         .or_else(|| node.child_by_field_name("scope"))
-        .and_then(|n| normalize_receiver(node_text(n, source)));
+        .and_then(|n| normalize_receiver(node_text(n, source)))
+        .map(|r| ctx.var_types.get(&r).cloned().unwrap_or(r));
 
     if !callee.is_empty() {
         ctx.calls.push(ParsedCall {
@@ -1481,6 +1580,44 @@ Route::get('/ping', function () {
         assert_eq!(result.routes.len(), 1);
         assert_eq!(result.routes[0].path, "/ping");
         assert!(result.routes[0].handler_class.is_none(), "closure → нет handler_class");
+    }
+
+    #[test]
+    fn test_type_inference_receiver() {
+        let parser = PhpParser::new();
+        let source = r#"<?php
+class Svc {
+    public function handle(User $user): void {
+        $user->save();
+        $repo = new UserRepo();
+        $repo->find(1);
+        $other->doThing();
+    }
+}
+"#;
+        let r = parser.parse(source, "Svc.php").unwrap();
+        let recv = |c: &str| r.calls.iter().find(|x| x.callee == c).unwrap().receiver.clone();
+        assert_eq!(recv("save").as_deref(), Some("User"), "типизированный параметр $user: User");
+        assert_eq!(recv("find").as_deref(), Some("UserRepo"), "$repo = new UserRepo()");
+        assert_eq!(recv("doThing").as_deref(), Some("$other"), "неизвестная переменная — без резолва");
+    }
+
+    #[test]
+    fn test_type_inference_closure_scope() {
+        let parser = PhpParser::new();
+        // Параметр замыкания затеняет внешний $u — типы не должны протекать/путаться.
+        let source = r#"<?php
+class C {
+    public function f(User $u): void {
+        $cb = function (Order $u) { $u->ship(); };
+        $u->save();
+    }
+}
+"#;
+        let r = parser.parse(source, "C.php").unwrap();
+        let recv = |c: &str| r.calls.iter().find(|x| x.callee == c).unwrap().receiver.clone();
+        assert_eq!(recv("ship").as_deref(), Some("Order"), "в замыкании $u: Order");
+        assert_eq!(recv("save").as_deref(), Some("User"), "снаружи $u: User (без протечки из замыкания)");
     }
 
     #[test]

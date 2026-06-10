@@ -1525,6 +1525,27 @@ class App:
         assert_eq!(a[0].target_class.as_deref(), Some("A"));
     }
 
+    /// Type-inference: `$user->save()` (где $user: User) резолвится к User::save —
+    /// get_callers("save", class="User") находит вызыватель через тип переменной.
+    #[test]
+    fn test_type_inference_resolves_caller() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("app")).unwrap();
+        fs::write(tmp.path().join("app/User.php"),
+            "<?php\nclass User {\n public function save() {}\n}\n").unwrap();
+        fs::write(tmp.path().join("app/Svc.php"),
+            "<?php\nclass Svc {\n public function handle(User $user) { $user->save(); }\n}\n").unwrap();
+        let mut storage = Storage::open_in_memory().unwrap();
+        Indexer::new(&mut storage).full_reindex(tmp.path(), false).unwrap();
+
+        // callers of User::save → Svc::handle, разрешённый через тип $user.
+        let (callers, _t, _a) = storage.get_callers_resolved("save", Some("User"), None, 50).unwrap();
+        assert_eq!(callers.len(), 1, "вызыватель User::save через тип переменной");
+        assert_eq!(callers[0].name, "handle");
+        assert_eq!(callers[0].target_class.as_deref(), Some("User"));
+        assert_eq!(callers[0].resolution, "own"); // save объявлен в самом User
+    }
+
     /// icode doctor: сверка индекса с диском детектит пропущенные/устаревшие/удалённые.
     #[test]
     fn test_doctor_detects_drift() {
