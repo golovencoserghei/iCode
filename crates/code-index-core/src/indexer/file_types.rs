@@ -180,7 +180,10 @@ mod tests {
 
     #[test]
     fn test_no_extension() {
-        assert_eq!(categorize_file(Path::new("Makefile")), FileCategory::Binary);
+        // Makefile без расширения — известный текстовый файл (NAMED_TEXT_FILES) → Text.
+        assert_eq!(categorize_file(Path::new("Makefile")), FileCategory::Text);
+        // Неизвестный файл без расширения → Binary (пропускаем при индексации).
+        assert_eq!(categorize_file(Path::new("randomblob")), FileCategory::Binary);
     }
 
     #[test]
