@@ -64,7 +64,9 @@ fn collect_type_names(clause: tree_sitter::Node, source: &[u8]) -> Vec<String> {
 /// Короткое имя класса из узла-типа: `?App\User` / `User|null` → `User`.
 fn simple_type_name(type_node: tree_sitter::Node, source: &[u8]) -> Option<String> {
     let raw = node_text(type_node, source).trim().trim_start_matches('?');
-    let first = raw.split('|').next().unwrap_or(raw).trim();
+    // union `A|B` и intersection `A&B`: берём первый класс (нет одного точного типа,
+    // но первый — допустимое приближение для резолва).
+    let first = raw.split(['|', '&']).next().unwrap_or(raw).trim();
     let short = first.rsplit('\\').next().unwrap_or(first).trim();
     (!short.is_empty()).then(|| short.to_string())
 }
@@ -83,6 +85,79 @@ fn params_to_types(params: tree_sitter::Node, source: &[u8]) -> Vec<(String, Str
                     out.push((n, t));
                 }
             }
+        }
+    }
+    out
+}
+
+/// Узел-тип у `property_declaration` (поле `type` либо первый type-подобный потомок).
+fn property_type_node(decl: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    if let Some(t) = decl.child_by_field_name("type") {
+        return Some(t);
+    }
+    for i in 0..decl.named_child_count() {
+        if let Some(ch) = decl.named_child(i) {
+            if matches!(
+                ch.kind(),
+                "primitive_type" | "named_type" | "optional_type" | "union_type" | "intersection_type" | "qualified_name"
+            ) {
+                return Some(ch);
+            }
+        }
+    }
+    None
+}
+
+/// Типы свойств класса: типизированные `property_declaration` + promoted-параметры
+/// конструктора. Возвращает `(имя_свойства_без_$, ТипКласс)`.
+fn class_property_types(class_node: tree_sitter::Node, source: &[u8]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let Some(body) = class_node
+        .child_by_field_name("body")
+        .or_else(|| find_child_by_kind(class_node, "declaration_list"))
+    else {
+        return out;
+    };
+    let mut bc = body.walk();
+    for member in body.named_children(&mut bc) {
+        match member.kind() {
+            "property_declaration" => {
+                if let Some(ty) = property_type_node(member).and_then(|t| simple_type_name(t, source)) {
+                    let mut pc = member.walk();
+                    for el in member.named_children(&mut pc) {
+                        if el.kind() == "property_element" {
+                            if let Some(vn) = find_child_by_kind(el, "variable_name") {
+                                let name = node_text(vn, source).trim_start_matches('$').to_string();
+                                if !name.is_empty() {
+                                    out.push((name, ty.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "method_declaration" => {
+                let mname = member.child_by_field_name("name").map(|n| node_text(n, source)).unwrap_or("");
+                if mname.eq_ignore_ascii_case("__construct") {
+                    if let Some(params) = member.child_by_field_name("parameters") {
+                        let mut prc = params.walk();
+                        for p in params.named_children(&mut prc) {
+                            if p.kind() == "property_promotion_parameter" {
+                                let ty = p.child_by_field_name("type").and_then(|t| simple_type_name(t, source));
+                                let nm = p
+                                    .child_by_field_name("name")
+                                    .map(|n| node_text(n, source).trim_start_matches('$').to_string());
+                                if let (Some(t), Some(n)) = (ty, nm) {
+                                    if !n.is_empty() {
+                                        out.push((n, t));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
     out
@@ -125,8 +200,11 @@ struct VisitContext<'a> {
     /// Вложенные группы аккумулируются; маршруты внутри получают объединённый путь.
     route_prefix: Vec<String>,
     /// Карта `$переменная → ТипКласс` в области текущей функции/метода (типизированные
-    /// параметры + `$x = new X()`). Позволяет резолвить `$x->m()` к классу X.
+    /// параметры + `$x = new X()`). Ключи `$this->prop` — для типизированных свойств.
     var_types: std::collections::HashMap<String, String>,
+    /// Типы свойств текущего класса (`свойство → ТипКласс`): типизированные property
+    /// и promoted-параметры конструктора. Позволяет резолвить `$this->repo->m()`.
+    class_prop_types: std::collections::HashMap<String, String>,
 }
 
 impl<'a> VisitContext<'a> {
@@ -141,6 +219,7 @@ impl<'a> VisitContext<'a> {
             routes: Vec::new(),
             route_prefix: Vec::new(),
             var_types: std::collections::HashMap::new(),
+            class_prop_types: std::collections::HashMap::new(),
         }
     }
 }
@@ -197,14 +276,22 @@ fn visit_node(
             }
         }
         "anonymous_function" | "arrow_function" => {
-            // У замыкания свой скоуп типов (PHP не авто-захватывает переменные):
-            // стартуем с его параметров, не наследуя/не мутируя родительский var_types.
-            let pm: std::collections::HashMap<String, String> = node
+            // У замыкания свой скоуп типов (PHP не авто-захватывает локальные
+            // переменные): стартуем с его параметров. Но `$this` в замыкании метода
+            // привязан → типизированные свойства класса ($this->prop) доступны.
+            let mut pm: std::collections::HashMap<String, String> = node
                 .child_by_field_name("parameters")
                 .map(|p| params_to_types(p, ctx.source))
                 .unwrap_or_default()
                 .into_iter()
                 .collect();
+            // `static function()` / `static fn` НЕ привязывает $this — не сеем свойства.
+            let is_static = node_text(node, ctx.source).trim_start().starts_with("static");
+            if !is_static {
+                for (prop, ty) in &ctx.class_prop_types {
+                    pm.insert(format!("$this->{}", prop), ty.clone());
+                }
+            }
             let prev = std::mem::replace(&mut ctx.var_types, pm);
             let mut c = node.walk();
             for child in node.children(&mut c) {
@@ -414,13 +501,17 @@ fn visit_method(
         .child_by_field_name("body")
         .or_else(|| find_child_by_kind(node, "compound_statement"))
     {
-        let param_types: std::collections::HashMap<String, String> = node
+        let mut scope: std::collections::HashMap<String, String> = node
             .child_by_field_name("parameters")
             .map(|p| params_to_types(p, source))
             .unwrap_or_default()
             .into_iter()
             .collect();
-        let prev = std::mem::replace(&mut ctx.var_types, param_types);
+        // Типизированные свойства класса доступны как $this->prop.
+        for (prop, ty) in &ctx.class_prop_types {
+            scope.insert(format!("$this->{}", prop), ty.clone());
+        }
+        let prev = std::mem::replace(&mut ctx.var_types, scope);
         let mut c = body_node.walk();
         for child in body_node.children(&mut c) {
             visit_node(child, ctx, class_name, Some(&name));
@@ -485,6 +576,11 @@ fn visit_class(node: tree_sitter::Node, ctx: &mut VisitContext) {
         node_hash,
     });
 
+    // Типы свойств класса — для резолва `$this->prop->m()` в методах.
+    let prop_types: std::collections::HashMap<String, String> =
+        class_property_types(node, source).into_iter().collect();
+    let prev_props = std::mem::replace(&mut ctx.class_prop_types, prop_types);
+
     // Рекурсия в тело класса
     if let Some(body_node) = node
         .child_by_field_name("body")
@@ -496,6 +592,7 @@ fn visit_class(node: tree_sitter::Node, ctx: &mut VisitContext) {
             visit_node(child, ctx, Some(&name), None);
         }
     }
+    ctx.class_prop_types = prev_props;
 }
 
 fn visit_use(node: tree_sitter::Node, ctx: &mut VisitContext) {
@@ -618,8 +715,19 @@ fn normalize_receiver(text: &str) -> Option<String> {
     match t {
         "$this" | "self" | "parent" | "static" => Some(t.to_string()),
         _ => {
-            // Цепочки/индексация/вызовы ($a->b, $a[0], foo()->bar) — резолв по типу
-            // пока не делаем.
+            // `$this->prop` (простое обращение к свойству) — сохраняем как ключ:
+            // резолвится по типу свойства класса ($this->repo->find()).
+            if let Some(prop) = t.strip_prefix("$this->") {
+                // Только простой идентификатор: не цепочка/вызов/индекс/динамическое
+                // ($this->$x, $this->{expr}) обращение.
+                if !prop.is_empty()
+                    && !prop.contains(|c: char| matches!(c, '-' | '>' | ':' | '(' | ')' | '[' | ']' | ' ' | '$' | '{' | '}'))
+                {
+                    return Some(t.to_string());
+                }
+            }
+            // Прочие цепочки/индексация/вызовы ($a->b, $a[0], foo()->bar) — резолв
+            // по типу пока не делаем.
             if t.contains("->") || t.contains("::") || t.contains('(') || t.contains('[') {
                 None
             } else if let Some(stripped) = t.strip_prefix('$') {
@@ -1600,6 +1708,27 @@ class Svc {
         assert_eq!(recv("save").as_deref(), Some("User"), "типизированный параметр $user: User");
         assert_eq!(recv("find").as_deref(), Some("UserRepo"), "$repo = new UserRepo()");
         assert_eq!(recv("doThing").as_deref(), Some("$other"), "неизвестная переменная — без резолва");
+    }
+
+    #[test]
+    fn test_type_inference_typed_property() {
+        let parser = PhpParser::new();
+        let source = r#"<?php
+class Svc {
+    private UserRepo $repo;
+    public function __construct(private Mailer $mailer) {}
+    public function handle(): void {
+        $this->repo->find(1);
+        $this->mailer->send();
+        $this->unknown->boom();
+    }
+}
+"#;
+        let r = parser.parse(source, "Svc.php").unwrap();
+        let recv = |c: &str| r.calls.iter().find(|x| x.callee == c).unwrap().receiver.clone();
+        assert_eq!(recv("find").as_deref(), Some("UserRepo"), "типизированное свойство $this->repo");
+        assert_eq!(recv("send").as_deref(), Some("Mailer"), "promoted-параметр конструктора $this->mailer");
+        assert_eq!(recv("boom").as_deref(), Some("$this->unknown"), "нетипизированное свойство — без резолва");
     }
 
     #[test]
