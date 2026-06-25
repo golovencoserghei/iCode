@@ -17,3 +17,9 @@ icode-serve = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+# Bin-level hook integration test: seed a temp central db row directly (no Ollama)
+# and drive the real `icode hook …` binary over it.
+rusqlite = { workspace = true }
+tempfile = "3"

@@ -666,6 +666,8 @@ dependencies = [
  "icode-embed",
  "icode-engine",
  "icode-serve",
+ "rusqlite",
+ "tempfile",
  "tokio",
 ]
 

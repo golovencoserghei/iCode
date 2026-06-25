@@ -76,6 +76,44 @@ enum Command {
         /// Optional project root to bake into the snippet (else a placeholder).
         project_path: Option<PathBuf>,
     },
+    /// Claude Code lifecycle hooks. Claude Code runs these on session events and
+    /// reads their stdout JSON to inject memory context. They are FAST, print
+    /// valid `hookSpecificOutput` JSON, and NEVER fail (a down Ollama degrades to
+    /// a minimal/empty additionalContext, exit 0).
+    Hook {
+        #[command(subcommand)]
+        action: HookAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum HookAction {
+    /// SessionStart hook: prime the agent with the developer profile + recent
+    /// project memory. Degrades to a behavioural trigger when memory is empty or
+    /// the embedder is down. Prints `hookSpecificOutput` JSON; always exits 0.
+    SessionStart {
+        /// Project name (else the basename of `--cwd`, else the process cwd).
+        #[arg(long)]
+        project: Option<String>,
+        /// Working directory whose basename is the project (when `--project` is absent).
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+    },
+    /// PreCompact hook: re-inject the L0 "always-on" rules (e.g. "answer in
+    /// Russian") so they survive context compaction. Reads L0 notes WITHOUT an
+    /// embedder (lexical list, no Ollama needed). Prints `hookSpecificOutput`
+    /// JSON; always exits 0 (empty additionalContext when there are no L0 rules).
+    Precompact {
+        /// Project name (else the basename of `--cwd`, else the process cwd).
+        #[arg(long)]
+        project: Option<String>,
+        /// Working directory whose basename is the project (when `--project` is absent).
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+    },
+    /// Print a ready-to-paste `~/.claude/settings.json` hooks snippet wiring the
+    /// SessionStart / PreCompact events to `icode hook …`, plus where to put it.
+    Config,
 }
 
 #[derive(Subcommand)]
@@ -102,6 +140,20 @@ fn main() -> anyhow::Result<()> {
         Command::Doctor { path } => run_doctor(&path),
         Command::Setup { project_path } => run_setup(project_path.as_deref()),
         Command::McpConfig { project_path } => run_mcp_config(project_path.as_deref()),
+        Command::Hook { action } => match action {
+            HookAction::SessionStart { project, cwd } => {
+                run_hook_session_start(project.as_deref(), cwd.as_deref());
+                Ok(())
+            }
+            HookAction::Precompact { project, cwd } => {
+                run_hook_precompact(project.as_deref(), cwd.as_deref());
+                Ok(())
+            }
+            HookAction::Config => {
+                run_hook_config();
+                Ok(())
+            }
+        },
     }
 }
 
@@ -532,4 +584,270 @@ fn build_serve_embedder() -> Option<Arc<dyn icode_core::traits::Embedder>> {
     // Box<dyn Embedder> → Arc<dyn Embedder>.
     let arc: Arc<dyn Embedder> = Arc::from(embedder);
     Some(arc)
+}
+
+// ──────────────────────────── Claude Code lifecycle hooks ────────────────────────────
+//
+// Claude Code runs an external command on lifecycle events (SessionStart,
+// PreCompact, …), reads its stdout, and — when the stdout is a JSON object of the
+// shape `{"hookSpecificOutput": {"hookEventName": "<event>", "additionalContext":
+// "<text>"}}` — injects `additionalContext` into the model's context for that
+// turn. Our `icode hook …` subcommands print exactly that.
+//
+// Hard contract for EVERY hook: be fast, print a VALID JSON object (or nothing),
+// and NEVER fail the process. A down Ollama, a missing central db, a poisoned
+// lock — all degrade to a minimal/empty `additionalContext` and exit 0. A hook
+// that errored or hung would stall Claude Code on every event.
+
+/// How many recent project memories `session-start` surfaces.
+const HOOK_SESSION_PROJECT_N: usize = 6;
+/// How many developer-profile notes `session-start` surfaces.
+const HOOK_SESSION_PROFILE_N: usize = 5;
+/// Per-line content cap in the injected context (keeps the prompt budget small).
+const HOOK_LINE_MAX: usize = 200;
+
+/// Resolve the project name for a hook: explicit `--project`, else the basename of
+/// `--cwd`, else the basename of the process cwd, else `"general"`. Never empty.
+fn hook_project(project: Option<&str>, cwd: Option<&std::path::Path>) -> String {
+    if let Some(p) = project {
+        let p = p.trim();
+        if !p.is_empty() {
+            return p.to_string();
+        }
+    }
+    let dir = cwd
+        .map(|p| p.to_path_buf())
+        .or_else(|| std::env::current_dir().ok());
+    dir.as_deref()
+        .and_then(|d| d.file_name())
+        .and_then(|n| n.to_str())
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "general".to_string())
+}
+
+/// Full JSON string escaping for arbitrary memory content (which can carry quotes,
+/// newlines, and other control chars). Unlike `json_escape` (paths only), this
+/// also `\u`-escapes every control char below 0x20, so the hand-built hook JSON
+/// stays valid no matter what a memory holds.
+fn json_escape_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0C}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Render the `hookSpecificOutput` envelope Claude Code reads. `event` is the
+/// `hookEventName` (e.g. "SessionStart" / "PreCompact"); `context` is the text to
+/// inject (already plain text — escaped here). Built by hand (no serde_json dep in
+/// the bin) but kept strictly valid via [`json_escape_str`].
+fn hook_output_json(event: &str, context: &str) -> String {
+    format!(
+        "{{\"hookSpecificOutput\":{{\"hookEventName\":\"{}\",\"additionalContext\":\"{}\"}}}}",
+        json_escape_str(event),
+        json_escape_str(context),
+    )
+}
+
+/// One-line summary of a memory for the injected context: `[category] content`,
+/// whitespace-collapsed and truncated to `HOOK_LINE_MAX` chars.
+fn hook_memory_line(rec: &icode_core::model::MemoryRecord) -> String {
+    let category = format!("{:?}", rec.category).to_lowercase();
+    let content = collapse_ws(&rec.content);
+    let content = truncate_chars(&content, HOOK_LINE_MAX);
+    format!("[{category}] {content}")
+}
+
+/// Collapse runs of whitespace (incl. newlines) to single spaces and trim — so a
+/// multi-line memory becomes one tidy context line.
+fn collapse_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Char-boundary-safe truncation with an ellipsis (never splits a UTF-8 char).
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
+/// `icode hook session-start` — prime the agent with the developer profile +
+/// recent project memory. Opens the central memory store read-only (no embedder
+/// needed: `session_start` only `list`s + `record_access`es), runs the engine's
+/// `session_start`, and prints a `SessionStart` envelope. On any failure (no db,
+/// lock poisoned, …) it falls back to a light behavioural trigger. Always exit 0.
+fn run_hook_session_start(project: Option<&str>, cwd: Option<&std::path::Path>) {
+    let project = hook_project(project, cwd);
+    let context = build_session_start_context(&project);
+    println!("{}", hook_output_json("SessionStart", &context));
+}
+
+/// Behavioural fallback when no memory is available (no db / empty / open failed).
+/// A light trigger telling the agent the MCP memory tools exist for this project.
+fn hook_session_fallback(project: &str) -> String {
+    format!(
+        "This project (`{project}`) has iCode cross-session memory. \
+         Call `session_start`/`recall`/`search_memory` via the iCode MCP server when you need \
+         past context, decisions, or the developer profile."
+    )
+}
+
+/// Build the SessionStart `additionalContext` text for `project`. Best-effort:
+/// returns the behavioural fallback string on any error or empty store.
+fn build_session_start_context(project: &str) -> String {
+    use icode_engine::SqliteMemoryStore;
+
+    let db_path = central_db_path();
+    let store = match SqliteMemoryStore::open_readonly(&db_path) {
+        Ok(s) => s,
+        Err(_) => return hook_session_fallback(project),
+    };
+
+    let session = match icode_engine::session_start(
+        &store,
+        project,
+        HOOK_SESSION_PROJECT_N,
+        HOOK_SESSION_PROFILE_N,
+    ) {
+        Ok(s) => s,
+        Err(_) => return hook_session_fallback(project),
+    };
+
+    if session.developer_profile.is_empty() && session.project_context.is_empty() {
+        return hook_session_fallback(project);
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(format!("# iCode memory — session start for `{project}`"));
+
+    if !session.developer_profile.is_empty() {
+        lines.push(String::new());
+        lines.push("## Developer profile (cross-project, always honour these):".to_string());
+        // L0/important notes first so the critical always-on rules lead.
+        let cfg = icode_core::config::RankingConfig::default();
+        let mut profile = session.developer_profile.clone();
+        profile.sort_by(|a, b| {
+            let al = icode_engine::is_l0(a, &cfg);
+            let bl = icode_engine::is_l0(b, &cfg);
+            bl.cmp(&al).then(
+                b.importance
+                    .partial_cmp(&a.importance)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+        });
+        for rec in &profile {
+            lines.push(format!("- {}", hook_memory_line(rec)));
+        }
+    }
+
+    if !session.project_context.is_empty() {
+        lines.push(String::new());
+        lines.push("## Recent project memory:".to_string());
+        for rec in &session.project_context {
+            lines.push(format!("- {}", hook_memory_line(rec)));
+        }
+    }
+
+    lines.join("\n")
+}
+
+/// `icode hook precompact` — re-inject the L0 "always-on" rules before/after
+/// context compaction so critical standing rules (e.g. "answer in Russian") are
+/// not lost. Reads L0 notes WITHOUT an embedder (a lexical `list`, no Ollama),
+/// from the developer profile AND the project. Prints a `PreCompact` envelope with
+/// an empty `additionalContext` when there are no L0 rules. Always exit 0.
+fn run_hook_precompact(project: Option<&str>, cwd: Option<&std::path::Path>) {
+    let project = hook_project(project, cwd);
+    let context = build_precompact_context(&project);
+    println!("{}", hook_output_json("PreCompact", &context));
+}
+
+/// Build the PreCompact `additionalContext`: the L0 rules from the developer
+/// profile + the project, listed for re-injection. Empty string when there are
+/// none (or the store can't open). Uses `list` only — NO embedding backend.
+fn build_precompact_context(project: &str) -> String {
+    use icode_core::ids::DEVELOPER_PROJECT;
+    use icode_core::traits::ReadableMemoryStore;
+    use icode_engine::SqliteMemoryStore;
+
+    let db_path = central_db_path();
+    // Read-only: no embedder, so this works even with Ollama down.
+    let store = match SqliteMemoryStore::open_readonly(&db_path) {
+        Ok(s) => s,
+        Err(_) => return String::new(),
+    };
+
+    let cfg = icode_core::config::RankingConfig::default();
+    // Pull a generous slice of recent rows from each side; the L0 filter is applied
+    // in-process via `is_l0` (importance >= 5, or >= l0_min with an l0/always-on/
+    // critical tag). `list` reads SQLite directly — no vectors, no Ollama.
+    let mut l0: Vec<icode_core::model::MemoryRecord> = Vec::new();
+    if let Ok(profile) = store.list(DEVELOPER_PROJECT, None, 100, false) {
+        l0.extend(profile.into_iter().filter(|r| icode_engine::is_l0(r, &cfg)));
+    }
+    if let Ok(proj) = store.list(project, None, 100, false) {
+        l0.extend(proj.into_iter().filter(|r| icode_engine::is_l0(r, &cfg)));
+    }
+
+    if l0.is_empty() {
+        return String::new();
+    }
+
+    // Highest importance first (the most critical rule leads).
+    l0.sort_by(|a, b| {
+        b.importance
+            .partial_cmp(&a.importance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(
+        "# iCode L0 rules — these ALWAYS-ON rules must survive context compaction:".to_string(),
+    );
+    for rec in &l0 {
+        lines.push(format!("- {}", hook_memory_line(rec)));
+    }
+    lines.join("\n")
+}
+
+/// `icode hook config` — print a ready-to-paste `~/.claude/settings.json` hooks
+/// snippet wiring SessionStart / PreCompact to `icode hook …`, plus where to put
+/// it. The JSON is valid on its own (pipe-friendly); the guidance goes to stderr
+/// so `icode hook config > snippet.json` stays clean.
+fn run_hook_config() {
+    eprintln!("# Add the `hooks` block below to ~/.claude/settings.json (merge into an");
+    eprintln!("# existing \"hooks\" object if you already have one). Claude Code will then");
+    eprintln!("# run `icode hook …` on SessionStart and PreCompact to inject memory and");
+    eprintln!("# re-assert L0 rules across compaction. (stdout below is the JSON snippet.)");
+    eprintln!();
+    println!("{}", hook_settings_json());
+}
+
+/// The `~/.claude/settings.json` hooks snippet. Hand-built but valid JSON: the
+/// SessionStart and PreCompact events each run this binary's hook subcommand,
+/// passing the live `--cwd` via Claude Code's `$CLAUDE_PROJECT_DIR` so the project
+/// is resolved from the working directory.
+fn hook_settings_json() -> String {
+    let exe = json_escape(&icode_exe_path());
+    // `$CLAUDE_PROJECT_DIR` is expanded by Claude Code's shell when it runs the
+    // hook, so the project is the live working directory's basename.
+    let cmd_session = format!("{exe} hook session-start --cwd \\\"$CLAUDE_PROJECT_DIR\\\"");
+    let cmd_precompact = format!("{exe} hook precompact --cwd \\\"$CLAUDE_PROJECT_DIR\\\"");
+    format!(
+        "{{\n  \"hooks\": {{\n    \"SessionStart\": [\n      {{\n        \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \"{cmd_session}\" }}\n        ]\n      }}\n    ],\n    \"PreCompact\": [\n      {{\n        \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \"{cmd_precompact}\" }}\n        ]\n      }}\n    ]\n  }}\n}}"
+    )
 }

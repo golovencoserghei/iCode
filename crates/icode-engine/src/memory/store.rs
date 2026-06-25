@@ -85,6 +85,38 @@ fn store_err<E: std::fmt::Display>(e: E) -> Error {
     Error::Store(e.to_string())
 }
 
+// ──────────────────────────── read-only stub embedder ────────────────────────────
+
+/// A do-nothing embedder for [`SqliteMemoryStore::open_readonly`].
+///
+/// Its `dim()` equals `schema::VEC_DIM` so the `open` dim guard passes, but it owns
+/// no backend: `embed` always errors. This lets the embed-FREE read methods
+/// (`list` / `get` / `list_projects` / `record_access`) work with no Ollama, while
+/// any path that would actually vectorise (`search` / `add` / `update` content)
+/// fails loudly with `Error::Embed` instead of producing bogus vectors.
+struct NoEmbedder;
+
+impl Embedder for NoEmbedder {
+    fn model_id(&self) -> &str {
+        "noop-readonly"
+    }
+    fn dim(&self) -> usize {
+        schema::VEC_DIM
+    }
+    fn backend(&self) -> &str {
+        "noop"
+    }
+    fn embed(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        Err(Error::Embed(
+            "memory store opened read-only (no embedder): semantic search and writes are unavailable"
+                .into(),
+        ))
+    }
+    fn health(&self) -> Result<()> {
+        Err(Error::Embed("read-only memory store has no embedding backend".into()))
+    }
+}
+
 // ──────────────────────────── category mapping ────────────────────────────
 
 fn category_str(c: Category) -> &'static str {
@@ -202,6 +234,25 @@ impl SqliteMemoryStore {
             dedup_distance: icode_core::config::IndexConfig::default().dedup_distance,
             ranking: icode_core::config::RankingConfig::default(),
         })
+    }
+
+    /// Open the central memory db for READ-ONLY access, WITHOUT a live embedder.
+    ///
+    /// The hooks (`icode hook precompact`, and the degraded `session-start`) only
+    /// need the embed-free read methods (`list` / `get` / `list_projects` /
+    /// `record_access`), which never touch the embedder — so they must work even
+    /// when Ollama is down. `open` requires an `Arc<dyn Embedder>` and validates its
+    /// dim against `vec_memory`; here we install an internal [`NoEmbedder`] stub
+    /// whose `dim()` matches the vec0 column width (so the dim guard passes) but
+    /// whose `embed()` always errors. The result: the read list path is fully
+    /// functional, while `search` / `add` / `update` (the embed paths) return an
+    /// `Error::Embed` — exactly the "read-only, no semantic search" contract.
+    ///
+    /// Used by the lifecycle hooks so L0 rules can be re-injected at compaction
+    /// even with no embedding backend available. The db itself is opened normally
+    /// (it is never wiped on a version mismatch — same guard as `open`).
+    pub fn open_readonly(central_db_path: &str) -> Result<Self> {
+        Self::open(central_db_path, Arc::new(NoEmbedder))
     }
 
     /// Set the near-duplicate gate distance (builder style). Wire the resolved
