@@ -1,11 +1,15 @@
 //! `icode-engine` — parse / index / store / memory / search.
 //!
-//! Modules are filled in from M1 (code-graph + lexical search), M2 (embeddings),
-//! M3 (parsers/OOP/graph), M4 (memory), M5 (recall). All build on the frozen
-//! `icode-core` contracts.
+//! M0.5 walking skeleton: `store` (SqliteCodeStore), `parse` (Rust functions),
+//! and `index` (walk + upsert) are implemented against the frozen `icode-core`
+//! contracts. Embeddings (M2), full parsers/OOP/graph (M3), memory (M4), and
+//! recall (M5) fill in later.
 
-// pub mod parse;   // M1/M3
-// pub mod store;   // M1
-// pub mod index;   // M1/M2
+pub mod index;
+pub mod parse;
+pub mod store;
 // pub mod search;  // M2
 // pub mod memory;  // M4
+
+pub use index::{index_path, IndexStats};
+pub use store::SqliteCodeStore;

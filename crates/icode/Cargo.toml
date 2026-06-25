@@ -15,3 +15,5 @@ icode-engine = { workspace = true }
 icode-embed = { workspace = true }
 icode-serve = { workspace = true }
 anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }

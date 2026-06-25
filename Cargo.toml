@@ -35,6 +35,9 @@ reqwest = { version = "0.12", features = ["blocking", "json"] }
 rmcp = { version = "1.8", features = ["server", "transport-io", "macros"] }
 # parsing
 tree-sitter = "0.25"
+tree-sitter-rust = "0.24"
+# cli
+clap = { version = "4", features = ["derive"] }
 # parallelism / fs
 rayon = "1"
 walkdir = "2"

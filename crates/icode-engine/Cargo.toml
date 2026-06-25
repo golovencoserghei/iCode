@@ -8,3 +8,12 @@ description = "iCode v2 engine: parse / index / store / memory / search (impl fr
 [dependencies]
 icode-core = { workspace = true }
 anyhow = { workspace = true }
+rusqlite = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-rust = { workspace = true }
+walkdir = { workspace = true }
+sha2 = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
