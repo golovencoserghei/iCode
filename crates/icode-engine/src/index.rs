@@ -12,7 +12,10 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::chunk::chunks_for_file;
-use crate::parse::{parse_javascript, parse_php, parse_python, parse_rust, parse_tsx, parse_typescript, ParseResult};
+use crate::parse::{
+    parse_go, parse_html, parse_java, parse_javascript, parse_php, parse_python, parse_rust, parse_tsx,
+    parse_typescript, ParseResult,
+};
 use crate::store::SqliteCodeStore;
 
 /// Counters returned by an indexing run.
@@ -176,6 +179,9 @@ fn language_for(path: &Path) -> Option<Language> {
         Some("js") | Some("jsx") | Some("mjs") | Some("cjs") => Some(Language::JavaScript),
         // TypeScript family (`.tsx` uses the JSX-aware grammar — see parse_for).
         Some("ts") | Some("tsx") => Some(Language::TypeScript),
+        Some("go") => Some(Language::Go),
+        Some("java") => Some(Language::Java),
+        Some("html") | Some("htm") => Some(Language::Html),
         _ => None,
     }
 }
@@ -195,6 +201,9 @@ fn parse_for(language: Language, source: &str, path: &str, os_path: &Path) -> Pa
                 parse_typescript(source, path)
             }
         }
+        Language::Go => parse_go(source, path),
+        Language::Java => parse_java(source, path),
+        Language::Html => parse_html(source, path),
         // Other languages land with their parsers later; until then, no nodes.
         _ => ParseResult {
             lines_total: source.lines().count().max(1) as u32,

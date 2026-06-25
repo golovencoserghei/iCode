@@ -7,6 +7,9 @@
 //! in the indexer. The fields mirror the frozen `icode-core` node types so the
 //! indexer can forward them straight into `CodeWriteStore::upsert_file`.
 
+pub mod go;
+pub mod html;
+pub mod java;
 pub mod javascript;
 mod jsts;
 pub mod php;
@@ -43,6 +46,9 @@ pub struct ParseResult {
     pub routes: Vec<Route>,
 }
 
+pub use go::parse_go;
+pub use html::parse_html;
+pub use java::parse_java;
 pub use javascript::parse_javascript;
 pub use php::parse_php;
 pub use python::parse_python;
