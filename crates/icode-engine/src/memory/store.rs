@@ -28,8 +28,17 @@ use icode_core::traits::{Embedder, ReadableMemoryStore, WritableMemoryStore};
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
+use super::ranking::effective_score;
+use super::sanitizer::{sanitize_fts5, sanitize_nl};
 use super::schema;
 use crate::store::register_sqlite_vec;
+
+/// Tunable for how strongly the usage-aware ranking signal nudges RRF relevance.
+/// The fused score is `rrf_score + RANK_BLEND * effective_score`, so this is the
+/// weight of a *tiebreak/nudge*, NOT a co-equal term — RRF still dominates
+/// ordering, ranking only lifts important/L0 records that are otherwise close in
+/// relevance so they don't sink. See `rrf_fuse_memory`.
+const RANK_BLEND: f32 = 0.1;
 
 // ──────────────────────────── age buckets ────────────────────────────
 
@@ -116,6 +125,16 @@ pub struct SqliteMemoryStore {
     conn: Arc<Mutex<Connection>>,
     embedder: Arc<dyn Embedder>,
     dim: usize,
+    /// Near-duplicate gate distance. An `add` whose nearest same-project neighbour
+    /// sits at a vec0 cosine distance BELOW this is rejected as a `Duplicate`
+    /// rather than inserted. Calibrated against the legacy embedding model; for
+    /// qwen3-embedding:0.6b the `IndexConfig::dedup_distance` default (0.12) is a
+    /// reasonable starting point — tune via `with_dedup_distance` / config.
+    dedup_distance: f32,
+    /// Usage-aware ranking weights (importance/access boost/decay/L0 floor). Used
+    /// in `search`/`search_all` to nudge RRF relevance so important/L0 records do
+    /// not sink. Tune via `with_ranking` / config.
+    ranking: icode_core::config::RankingConfig,
 }
 
 impl SqliteMemoryStore {
@@ -137,6 +156,13 @@ impl SqliteMemoryStore {
         let conn = Connection::open(&path).map_err(store_err)?;
         conn.pragma_update(None, "journal_mode", "WAL").map_err(store_err)?;
         conn.pragma_update(None, "foreign_keys", "ON").map_err(store_err)?;
+        // Inter-process write contention guard: the central db is shared by the
+        // daemon and any number of CLI/MCP sessions. WAL lets readers proceed
+        // during a writer, but two writers still serialize on the db lock — wait
+        // up to 5s for it instead of failing fast with SQLITE_BUSY. (In-process
+        // the `Mutex<Connection>` already serializes; this is the cross-process
+        // belt-and-braces.)
+        conn.pragma_update(None, "busy_timeout", 5000_i64).map_err(store_err)?;
 
         // Guard the schema generation. A FRESH db reports user_version 0 → stamp
         // it. A db at the current version is fine. Any OTHER version is an
@@ -171,7 +197,26 @@ impl SqliteMemoryStore {
             conn: Arc::new(Mutex::new(conn)),
             embedder,
             dim,
+            // Default to the shared IndexConfig gate (0.12). Override with
+            // `with_dedup_distance` from the resolved IcodeConfig at wiring time.
+            dedup_distance: icode_core::config::IndexConfig::default().dedup_distance,
+            ranking: icode_core::config::RankingConfig::default(),
         })
+    }
+
+    /// Set the near-duplicate gate distance (builder style). Wire the resolved
+    /// `IcodeConfig.index.dedup_distance` here so the threshold is config-driven
+    /// rather than the hardcoded default.
+    pub fn with_dedup_distance(mut self, dedup_distance: f32) -> Self {
+        self.dedup_distance = dedup_distance;
+        self
+    }
+
+    /// Set the usage-aware ranking config (builder style). Wire the resolved
+    /// `IcodeConfig.ranking` here so search blending is config-driven.
+    pub fn with_ranking(mut self, ranking: icode_core::config::RankingConfig) -> Self {
+        self.ranking = ranking;
+        self
     }
 
     /// Embed one piece of text to a single vector, validating the dim against the
@@ -188,6 +233,18 @@ impl SqliteMemoryStore {
             });
         }
         Ok(v)
+    }
+
+    /// Best-effort access warm-up after a search: bump access_count /
+    /// last_accessed_at for the returned ids so usage-aware ranking actually
+    /// moves (without this, access_count stays 0 and the access boost is dead).
+    /// Swallows errors — a warm-up must never fail a read.
+    fn warm_up(&self, hits: &[MemoryHit]) {
+        if hits.is_empty() {
+            return;
+        }
+        let ids: Vec<MemoryId> = hits.iter().map(|h| h.record.id.clone()).collect();
+        let _ = self.record_access(&ids);
     }
 
     /// Resolve a TEXT mem id to its bridge rowid (`None` if unknown).
@@ -215,10 +272,22 @@ impl WritableMemoryStore for SqliteMemoryStore {
         let model = self.embedder.model_id().to_string();
 
         let mut conn = self.conn.lock().map_err(store_err)?;
+
+        // Dedup gate: KNN the SAME-project memory space for the nearest existing
+        // vector. If it sits below the gate distance, this content is a near-
+        // duplicate — return the existing id WITHOUT inserting (a normal outcome,
+        // not an error). vec0 cannot pre-filter, so we oversample a few neighbours
+        // and post-filter to the project, taking the closest survivor. The
+        // threshold is calibrated for the legacy model; for qwen3 the 0.12 default
+        // is a reasonable start (configurable via `with_dedup_distance`).
+        if let Some((existing, distance)) = nearest_same_project(&conn, &vector, &mem.project)? {
+            if distance < self.dedup_distance {
+                return Ok(AddOutcome::Duplicate { existing, distance });
+            }
+        }
+
         let tx = conn.transaction().map_err(store_err)?;
 
-        // (M4.2: a dedup gate would KNN here and short-circuit to Duplicate; for
-        // now every add is a real insert.)
         tx.execute(
             "INSERT INTO memories \
              (id, project, content, category, tags, importance, status, \
@@ -431,35 +500,44 @@ impl ReadableMemoryStore for SqliteMemoryStore {
         if query.trim().is_empty() || n == 0 {
             return Ok(vec![]);
         }
-        let qvec = self.embed_one(query)?;
+        // Defend recall: a prompt-polluted NL query is reduced to its real ask
+        // BEFORE embedding (a 2000-char system prompt otherwise swamps the dense
+        // vector). The lexical arm sanitizes FTS5 syntax separately (in `fts_records`).
+        let clean = sanitize_nl(query);
+        let qvec = self.embed_one(&clean)?;
         let over = oversample(n);
         let conn = self.conn.lock().map_err(store_err)?;
 
         let semantic = knn_records(&conn, &qvec, over, Some(project), category, include_resolved)?;
-        let lexical = fts_records(&conn, query, over, Some(project), category, include_resolved)?;
+        let lexical = fts_records(&conn, &clean, over, Some(project), category, include_resolved)?;
         drop(conn);
 
-        Ok(rrf_fuse_memory(&[semantic, lexical], n))
+        let hits = rrf_fuse_memory(&[semantic, lexical], n, &self.ranking);
+        self.warm_up(&hits);
+        Ok(hits)
     }
 
     fn search_all(&self, query: &str, n: usize, include_resolved: bool) -> Result<Vec<MemoryHit>> {
         if query.trim().is_empty() || n == 0 {
             return Ok(vec![]);
         }
-        let qvec = self.embed_one(query)?;
+        let clean = sanitize_nl(query);
+        let qvec = self.embed_one(&clean)?;
         let over = oversample(n);
         let conn = self.conn.lock().map_err(store_err)?;
 
         // No project filter — one KNN over the whole space — but reserved
         // (`__*`) projects are excluded from cross-project recall.
         let semantic = knn_records(&conn, &qvec, over, None, None, include_resolved)?;
-        let lexical = fts_records(&conn, query, over, None, None, include_resolved)?;
+        let lexical = fts_records(&conn, &clean, over, None, None, include_resolved)?;
         drop(conn);
 
         let semantic = semantic.into_iter().filter(|r| !is_reserved_project(&r.project)).collect();
         let lexical = lexical.into_iter().filter(|r| !is_reserved_project(&r.project)).collect();
 
-        Ok(rrf_fuse_memory(&[semantic, lexical], n))
+        let hits = rrf_fuse_memory(&[semantic, lexical], n, &self.ranking);
+        self.warm_up(&hits);
+        Ok(hits)
     }
 
     fn list(
@@ -527,6 +605,48 @@ impl ReadableMemoryStore for SqliteMemoryStore {
         }
         Ok(out)
     }
+}
+
+// ──────────────────────────── dedup gate ────────────────────────────
+
+/// Number of vec0 neighbours to pull for the dedup gate before the project
+/// post-filter. vec0 has no pre-filter, so a cross-project nearest could mask the
+/// real same-project nearest; oversampling a few (k=3) makes that unlikely.
+const DEDUP_K: usize = 3;
+
+/// Nearest existing SAME-project memory to `vector`: `(id, distance)` of the
+/// closest survivor after the project post-filter, or `None` if the project has
+/// no neighbours yet. Used by the `add` dedup gate. Resolved memories still count
+/// as duplicates (re-adding a resolved fact is still a dup).
+fn nearest_same_project(
+    conn: &Connection,
+    vector: &[f32],
+    project: &str,
+) -> Result<Option<(MemoryId, f32)>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT m.id, m.project, v.distance \
+             FROM vec_memory v \
+             JOIN mem_rowid b ON b.rowid = v.rowid \
+             JOIN memories m ON m.id = b.mem_id \
+             WHERE v.embedding MATCH ?1 AND k = ?2 \
+             ORDER BY v.distance",
+        )
+        .map_err(store_err)?;
+    let rows = stmt
+        .query_map(params![f32_blob(vector), DEDUP_K as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)? as f32))
+        })
+        .map_err(store_err)?;
+    // Neighbours are already ascending by distance; the first same-project row is
+    // the nearest one.
+    for row in rows {
+        let (id, p, dist) = row.map_err(store_err)?;
+        if p == project {
+            return Ok(Some((MemoryId(id), dist)));
+        }
+    }
+    Ok(None)
 }
 
 // ──────────────────────────── retrieval helpers ────────────────────────────
@@ -602,7 +722,7 @@ fn fts_records(
         )
         .map_err(store_err)?;
 
-    let match_expr = fts_match_expr(query);
+    let match_expr = sanitize_fts5(query);
     let rows = match stmt.query_map(params![match_expr, k as i64], map_record) {
         Ok(rows) => rows,
         // A query fts5 cannot parse is a soft miss (the dense list still answers).
@@ -644,33 +764,28 @@ fn passes_filters(
     true
 }
 
-/// Build a safe fts5 MATCH expression: split the query into alphanumeric tokens,
-/// quote each as a literal phrase, OR-join them. Empty → a token that matches
-/// nothing. This avoids fts5 syntax errors from punctuation in NL queries (a full
-/// NL/FTS sanitizer is M4.2).
-fn fts_match_expr(query: &str) -> String {
-    let tokens: Vec<String> = query
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .map(|t| format!("\"{}\"", t.to_lowercase()))
-        .collect();
-    if tokens.is_empty() {
-        // A phrase that cannot match any real content.
-        "\"\u{0}\"".to_string()
-    } else {
-        tokens.join(" OR ")
-    }
-}
-
 /// Reciprocal-Rank-Fusion over several best-first record lists, keyed by memory
-/// id. An item's fused score is `Σ 1/(RRF_K + rank)` (0-based rank per list). The
-/// first/best record seen for an id carries it (deterministic representative);
-/// the result is annotated into `MemoryHit`s (age + fused score), sorted by score
-/// desc (ties → id), truncated to `top`.
-fn rrf_fuse_memory(lists: &[Vec<MemoryRecord>], top: usize) -> Vec<MemoryHit> {
+/// id, with a usage-aware ranking nudge. An item's RRF relevance is
+/// `Σ 1/(RRF_K + rank)` (0-based rank per list); the FINAL fused score is
+/// `rrf_score + RANK_BLEND * effective_score(rec)`.
+///
+/// Why blend rather than replace: RRF measures relevance to *this* query, while
+/// `effective_score` (importance + access boost − decay, L0-immune) measures
+/// standing relevance. We keep RRF as the dominant term and add a small
+/// (`RANK_BLEND = 0.1`) ranking lift so an important/L0 record that is already
+/// close in relevance does not sink below near-tied noise — but a genuinely
+/// irrelevant high-importance record (absent from both retrieval lists) never
+/// appears here at all, so it can't be force-promoted. The first/best record seen
+/// for an id is the representative; results are annotated into `MemoryHit`s
+/// (age + final score), sorted by score desc (ties → id), truncated to `top`.
+fn rrf_fuse_memory(
+    lists: &[Vec<MemoryRecord>],
+    top: usize,
+    ranking: &icode_core::config::RankingConfig,
+) -> Vec<MemoryHit> {
     use std::collections::HashMap;
     let now = Utc::now();
-    // id -> (accumulated score, representative record)
+    // id -> (accumulated rrf score, representative record)
     let mut acc: HashMap<String, (f64, MemoryRecord)> = HashMap::new();
     for list in lists {
         for (rank, rec) in list.iter().enumerate() {
@@ -683,7 +798,11 @@ fn rrf_fuse_memory(lists: &[Vec<MemoryRecord>], top: usize) -> Vec<MemoryHit> {
 
     let mut fused: Vec<MemoryHit> = acc
         .into_iter()
-        .map(|(_, (score, rec))| annotate(rec, score as f32, now))
+        .map(|(_, (rrf_score, rec))| {
+            // Final score = RRF relevance + small usage-aware nudge.
+            let final_score = rrf_score as f32 + RANK_BLEND * effective_score(&rec, ranking, now);
+            annotate(rec, final_score, now)
+        })
         .collect();
 
     fused.sort_by(|a, b| {
@@ -778,14 +897,8 @@ fn expand_tilde(path: &str) -> PathBuf {
 mod tests {
     use super::*;
 
-    #[test]
-    fn fts_match_expr_tokenizes_and_quotes() {
-        assert_eq!(fts_match_expr("race condition"), "\"race\" OR \"condition\"");
-        // Punctuation is stripped; NL noise can't break fts5 syntax.
-        assert_eq!(fts_match_expr("auth: race-condition!"), "\"auth\" OR \"race\" OR \"condition\"");
-        // No real tokens → an unmatchable phrase (not an fts syntax error).
-        assert_eq!(fts_match_expr("!!! ???"), "\"\u{0}\"");
-    }
+    // (fts MATCH expression building moved to `sanitizer::sanitize_fts5`, tested
+    // in that module.)
 
     #[test]
     fn age_buckets_from_days() {
@@ -827,10 +940,39 @@ mod tests {
             last_accessed_at: Utc::now().to_rfc3339(),
             updated_at: None,
         };
-        // "x" appears in both lists → must outrank single-list heads.
+        // "x" appears in both lists → must outrank single-list heads. All records
+        // share importance 0 / access 0, so the ranking blend is uniform and RRF
+        // alone decides the order here.
         let a = vec![rec("x"), rec("a"), rec("b")];
         let b = vec![rec("y"), rec("x"), rec("c")];
-        let fused = rrf_fuse_memory(&[a, b], 10);
+        let fused = rrf_fuse_memory(&[a, b], 10, &icode_core::config::RankingConfig::default());
         assert_eq!(fused[0].record.id.0, "x");
+    }
+
+    #[test]
+    fn ranking_blend_lifts_l0_among_near_ties() {
+        // Two records sharing rank 0 in one list each (equal RRF). One is L0
+        // (importance 5), the other importance 0. The 0.1*effective_score blend
+        // must tip the tie to the L0 record.
+        let mk = |id: &str, importance: f32| MemoryRecord {
+            id: MemoryId(id.into()),
+            project: "p".into(),
+            content: "c".into(),
+            category: Category::General,
+            tags: vec![],
+            importance,
+            status: MemoryStatus::Active,
+            resolved_at: None,
+            resolve_reason: None,
+            session_id: None,
+            access_count: 0,
+            created_at: Utc::now().to_rfc3339(),
+            last_accessed_at: Utc::now().to_rfc3339(),
+            updated_at: None,
+        };
+        let a = vec![mk("low", 0.0)];
+        let b = vec![mk("l0", 5.0)];
+        let fused = rrf_fuse_memory(&[a, b], 10, &icode_core::config::RankingConfig::default());
+        assert_eq!(fused[0].record.id.0, "l0", "L0 record wins the RRF tie via the ranking blend");
     }
 }

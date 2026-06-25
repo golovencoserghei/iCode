@@ -687,6 +687,7 @@ dependencies = [
  "sha2",
  "sqlite-vec",
  "tempfile",
+ "tracing",
  "tree-sitter",
  "tree-sitter-go",
  "tree-sitter-html",
