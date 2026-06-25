@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::chunk::chunks_for_file;
-use crate::parse::{parse_python, parse_rust, ParseResult};
+use crate::parse::{parse_php, parse_python, parse_rust, ParseResult};
 use crate::store::SqliteCodeStore;
 
 /// Counters returned by an indexing run.
@@ -171,6 +171,7 @@ fn language_for(path: &Path) -> Option<Language> {
     match path.extension().and_then(|e| e.to_str()) {
         Some("rs") => Some(Language::Rust),
         Some("py") => Some(Language::Python),
+        Some("php") | Some("phtml") => Some(Language::Php),
         _ => None,
     }
 }
@@ -181,6 +182,7 @@ fn parse_for(language: Language, source: &str, path: &str) -> ParseResult {
     match language {
         Language::Rust => parse_rust(source, path),
         Language::Python => parse_python(source, path),
+        Language::Php => parse_php(source, path),
         // Other languages land with their parsers (M3); until then, no nodes.
         _ => ParseResult {
             lines_total: source.lines().count().max(1) as u32,
