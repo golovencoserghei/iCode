@@ -50,6 +50,12 @@ clap = { version = "4", features = ["derive"] }
 rayon = "1"
 walkdir = "2"
 globset = "0.4"
+# file-watching (live daemon: notify + debounced batch). debouncer-full re-exports
+# the matching `notify` so events arrive coalesced (rename pairs, write storms).
+notify = "8"
+notify-debouncer-full = "0.5"
+# pid-lock for the single-writer daemon guard (flock + liveness via kill(pid,0)).
+libc = "0.2"
 # hashing / ids / time
 sha2 = "0.10"
 ulid = "1"

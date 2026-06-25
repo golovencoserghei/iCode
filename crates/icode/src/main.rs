@@ -16,6 +16,7 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use icode_core::config::EmbedConfig;
 use icode_core::traits::CodeReadStore;
+use icode_core::traits::Embedder;
 use icode_engine::SqliteCodeStore;
 
 #[derive(Parser)]
@@ -46,6 +47,11 @@ enum Command {
         /// Project root whose <path>/.icode/index.db is served.
         path: PathBuf,
     },
+    /// Live daemon: watch a project and keep its index up to date as files change.
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
     /// Open the store at <path> and print code-graph statistics.
     Stats {
         /// Project root whose <path>/.icode/index.db is read.
@@ -72,12 +78,26 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum DaemonAction {
+    /// Run the watcher in the foreground: initial sync, then live-reindex on every
+    /// change until Ctrl-C. One daemon per project (PID-locked). status/stop over
+    /// IPC are future work — for now stop the foreground process directly.
+    Run {
+        /// Project root to watch and keep indexed.
+        path: PathBuf,
+    },
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Index { path } => run_index(&path),
         Command::Embed { path } => run_embed(&path),
         Command::Serve { path } => run_serve(path),
+        Command::Daemon { action } => match action {
+            DaemonAction::Run { path } => run_daemon_cmd(&path),
+        },
         Command::Stats { path } => run_stats(&path),
         Command::Doctor { path } => run_doctor(&path),
         Command::Setup { project_path } => run_setup(project_path.as_deref()),
@@ -410,6 +430,37 @@ fn run_serve(path: PathBuf) -> anyhow::Result<()> {
         // against the live source tree (it walks `root` like the indexer does).
         icode_serve::serve_stdio(Arc::new(store), path, embedder, memory).await
     })
+}
+
+/// `icode daemon run <path>` — foreground live-indexing daemon. Opens the store,
+/// builds the embedder best-effort (a down Ollama is non-fatal: the graph stays
+/// live and vectors just aren't refreshed — a note goes to stderr, mirroring
+/// `serve`), then watches the tree until Ctrl-C. The single-writer PID-lock inside
+/// `run_daemon` rejects a second daemon on the same project with a clear error.
+fn run_daemon_cmd(path: &std::path::Path) -> anyhow::Result<()> {
+    let store = SqliteCodeStore::open(path).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let embedder = build_daemon_embedder();
+    icode_engine::run_daemon(path, store, embedder).map_err(|e| anyhow::anyhow!(e.to_string()))
+}
+
+/// Build the embedder for the daemon, probing health and reporting the mode on
+/// stderr. Returns `Some(Box<dyn Embedder>)` when ready, else `None` (graph-only,
+/// no vector refresh). Never fails — same best-effort contract as `serve`.
+fn build_daemon_embedder() -> Option<Box<dyn Embedder>> {
+    let cfg = EmbedConfig::default();
+    let embedder = match icode_embed::build_embedder(&cfg) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("daemon: semantic refresh disabled: {e} (graph kept live)");
+            return None;
+        }
+    };
+    if let Err(e) = embedder.health() {
+        eprintln!("daemon: semantic refresh disabled: {e} (graph kept live)");
+        return None;
+    }
+    eprintln!("daemon: semantic refresh enabled (model {})", embedder.model_id());
+    Some(embedder)
 }
 
 /// Central memory db path (`~/.icode/icode.db`). `~` is expanded against `$HOME`

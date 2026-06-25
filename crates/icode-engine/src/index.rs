@@ -112,6 +112,59 @@ pub fn index_path(root: &Path, store: &SqliteCodeStore) -> Result<IndexStats> {
     Ok(stats)
 }
 
+/// Index a SINGLE source file into the store: parse → `upsert_file` (replaces the
+/// file's rows, cascading away the old graph) → chunk → `upsert_chunks`. This is
+/// the exact per-file path [`index_path`] runs in its walk, lifted out so the live
+/// daemon ([`crate::daemon`]) can re-index one changed file without re-walking the
+/// whole tree.
+///
+/// CRITICAL — path form: the row keys (`files.path`, `code_chunks.path`, …) are
+/// `path.to_string_lossy()` of `path` *exactly as given*. [`index_path`] feeds the
+/// paths `walk_source_files(root)` yields (so for an absolute `root` they are
+/// absolute, for a relative `root` relative). A caller (the daemon) MUST pass a
+/// `path` in that same form, or the keys won't match the indexed rows and
+/// delete/upsert silently miss. The daemon canonicalises `root` and rebuilds the
+/// changed path under it so this holds.
+///
+/// Returns the per-file [`IndexStats`] for one file (`files_indexed = 1` on
+/// success). An unsupported extension or a read/parse failure is an `Err` — the
+/// daemon turns that into a `record_parse_error` and keeps running.
+pub fn index_one_file(path: &Path, store: &SqliteCodeStore) -> Result<IndexStats> {
+    let counts = index_file(path, store)?;
+    Ok(IndexStats {
+        files_indexed: 1,
+        functions: counts.functions,
+        classes: counts.classes,
+        imports: counts.imports,
+        calls: counts.calls,
+        routes: counts.routes,
+        code_chunks: counts.code_chunks,
+        errors: 0,
+    })
+}
+
+/// True when `path`'s extension maps to a parser we support (the daemon uses this
+/// to skip non-source files before touching the store). Mirrors the extension
+/// dispatch [`index_path`] walks through [`walk_source_files`].
+pub fn is_supported_source(path: &Path) -> bool {
+    language_for(path).is_some()
+}
+
+/// Directory component names the indexer (and therefore the daemon) skips wholesale
+/// — build artefacts, VCS metadata, dependency caches. Exposed so the daemon's
+/// watch loop can drop events under any excluded directory using the *same* set the
+/// indexer walks with (a divergence would make the daemon index files `index_path`
+/// never sees). Includes `.icode` so the daemon never reacts to its own db writes.
+pub fn is_in_excluded_dir(path: &Path) -> bool {
+    path.components().any(|c| match c {
+        std::path::Component::Normal(name) => name
+            .to_str()
+            .map(|n| EXCLUDED_DIRS.contains(&n) || n == ".icode")
+            .unwrap_or(false),
+        _ => false,
+    })
+}
+
 /// Per-file node counts (rolled up into `IndexStats`).
 #[derive(Clone, Copy, Default)]
 struct FileCounts {
