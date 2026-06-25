@@ -10,10 +10,15 @@
 pub mod ranking;
 pub mod sanitizer;
 mod schema;
+pub mod session;
 mod store;
 mod wal;
 
 pub use ranking::{effective_score, is_l0, rank};
 pub use sanitizer::{sanitize_fts5, sanitize_nl};
+pub use session::{
+    session_end, session_start, SessionEnd, SessionStart, DEFAULT_PROFILE_NOTES,
+    DEFAULT_PROJECT_MEMORIES,
+};
 pub use store::SqliteMemoryStore;
 pub use wal::WalStore;

@@ -17,7 +17,9 @@ pub use chunk::{chunk_text_for_class, chunk_text_for_function, chunks_for_file, 
 pub use embed::{embed_pending, EmbedStats};
 pub use index::{index_path, IndexStats};
 pub use memory::{
-    effective_score, is_l0, rank, sanitize_fts5, sanitize_nl, SqliteMemoryStore, WalStore,
+    effective_score, is_l0, rank, sanitize_fts5, sanitize_nl, session_end, session_start,
+    SessionEnd, SessionStart, SqliteMemoryStore, WalStore, DEFAULT_PROFILE_NOTES,
+    DEFAULT_PROJECT_MEMORIES,
 };
 pub use search::{find_similar, hybrid_search, rrf_fuse, semantic_search, RRF_K};
 pub use store::{SqliteCodeStore, Vec0Index};

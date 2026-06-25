@@ -161,12 +161,67 @@ fn run_serve(path: PathBuf) -> anyhow::Result<()> {
     // MCP stdio transport and must carry only protocol frames).
     let embedder = build_serve_embedder();
 
+    // Build the cross-session memory store from the SAME embedder. The central
+    // memory db OWNS an embedder (write-time vectors), so memory is available ONLY
+    // when the embedder is. `icode-serve` stays decoupled from `icode-embed`: the
+    // bin builds the concrete `SqliteMemoryStore`/`WalStore` and hands it over as
+    // `Arc<dyn MemoryStore>`. A build failure degrades to memory-less (never fatal).
+    let memory = build_serve_memory(embedder.clone());
+
     // Serving is async (rmcp/tokio); the rest of the CLI stays sync.
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
         let store = SqliteCodeStore::open(&path).map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        icode_serve::serve_stdio(Arc::new(store), embedder).await
+        icode_serve::serve_stdio(Arc::new(store), embedder, memory).await
     })
+}
+
+/// Central memory db path (`~/.icode/icode.db`). `~` is expanded against `$HOME`
+/// here so the store's `open` gets an absolute path (its own tilde-expansion is a
+/// belt-and-braces fallback). Falls back to the literal `~/...` if `$HOME` is
+/// unset (the store will then try to expand it, or fail cleanly).
+fn central_db_path() -> String {
+    match std::env::var("HOME") {
+        Ok(home) => format!("{home}/.icode/icode.db"),
+        Err(_) => "~/.icode/icode.db".to_string(),
+    }
+}
+
+/// Build the cross-session memory store for `serve`, wrapped in the WAL audit
+/// decorator. Returns `None` (memory-less mode) when there is no embedder or the
+/// central db could not be opened — `serve` never fails here. A stderr note
+/// records the resulting mode (stdout is the MCP transport).
+fn build_serve_memory(
+    embedder: Option<Arc<dyn icode_core::traits::Embedder>>,
+) -> Option<Arc<dyn icode_core::traits::MemoryStore>> {
+    use icode_engine::{SqliteMemoryStore, WalStore};
+
+    let embedder = match embedder {
+        Some(e) => e,
+        None => {
+            eprintln!("cross-session memory disabled: no embedder (lexical code tools only)");
+            return None;
+        }
+    };
+
+    let db_path = central_db_path();
+    let base = match SqliteMemoryStore::open(&db_path, embedder) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("cross-session memory disabled: cannot open {db_path}: {e}");
+            return None;
+        }
+    };
+
+    // WAL audit log lives next to the central db (`~/.icode/wal.jsonl`).
+    let wal_path = match std::env::var("HOME") {
+        Ok(home) => format!("{home}/.icode/wal.jsonl"),
+        Err(_) => "~/.icode/wal.jsonl".to_string(),
+    };
+    let store: Arc<dyn icode_core::traits::MemoryStore> =
+        Arc::new(WalStore::new(Arc::new(base), wal_path));
+    eprintln!("cross-session memory enabled (db {db_path})");
+    Some(store)
 }
 
 /// Build the configured embedder for `serve`, probing its health, and report the

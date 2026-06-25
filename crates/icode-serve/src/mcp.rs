@@ -7,8 +7,9 @@
 
 use std::sync::Arc;
 
-use icode_core::model::{CodeQuery, Language, SearchMode, SymbolKind};
-use icode_core::traits::{CodeReadStore, Embedder};
+use icode_core::ids::{MemoryId, DEVELOPER_PROJECT};
+use icode_core::model::{Category, CodeQuery, Language, NewMemory, SearchMode, SymbolKind};
+use icode_core::traits::{CodeReadStore, Embedder, MemoryStore};
 use icode_engine::SqliteCodeStore;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -20,6 +21,16 @@ use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 const NO_EMBEDDER_ERR: &str =
     "semantic search unavailable: no embedder (is ollama running?)";
 
+/// Error string returned by EVERY memory tool when the cross-session memory store
+/// could not be built (no embedder → no central memory db). The code-graph tools
+/// stay fully usable; only memory degrades.
+const NO_MEMORY_ERR: &str = "memory unavailable: no embedder (is ollama running?)";
+
+/// Default project memories `session_start` returns when the caller omits the arg.
+const DEFAULT_N_PROJECT_MEMORIES: usize = 8;
+/// Default profile notes `session_start` returns when the caller omits the arg.
+const DEFAULT_N_PROFILE_NOTES: usize = 5;
+
 #[derive(Clone)]
 pub struct CodeMcpServer {
     store: Arc<SqliteCodeStore>,
@@ -27,6 +38,12 @@ pub struct CodeMcpServer {
     /// could not reach Ollama at startup: semantic tools then return a clear
     /// error and `find_existing` / `get_symbol_context` degrade to lexical-only.
     embedder: Option<Arc<dyn Embedder>>,
+    /// Optional cross-session memory store. `None` when no embedder was available
+    /// at startup (the central memory db OWNS an embedder for write-time vectors),
+    /// in which case every memory tool returns [`NO_MEMORY_ERR`]. The bin builds
+    /// the concrete `SqliteMemoryStore`/`WalStore` and passes it as `Arc<dyn
+    /// MemoryStore>` — `icode-serve` stays decoupled from `icode-embed`.
+    memory: Option<Arc<dyn MemoryStore>>,
     // Consumed by the `#[tool_handler]` macro expansion (routes tool calls);
     // dead-code analysis can't see that path, so the read is suppressed here.
     #[allow(dead_code)]
@@ -222,14 +239,149 @@ pub struct ReadFileArgs {
     pub end: Option<u32>,
 }
 
+// ──────────────────────────── memory arg structs ────────────────────────────
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct SessionStartArgs {
+    /// Project to resume (its recent context is loaded). Required.
+    pub project: String,
+    /// How many recent project memories to load (default 8).
+    pub n_project_memories: Option<usize>,
+    /// How many developer-profile notes to load (default 5).
+    pub n_profile_notes: Option<usize>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct SessionEndArgs {
+    /// Project being wrapped up.
+    pub project: String,
+    /// One-paragraph narrative of what was accomplished (saved as a Progress memory).
+    pub summary: String,
+    /// Finished items (each saved as Progress; each auto-resolves the bug/todo it closes).
+    pub completed: Option<Vec<String>>,
+    /// Decisions made (each saved as a Decision memory).
+    pub decisions: Option<Vec<String>>,
+    /// Open next-steps (each saved as a Todo memory).
+    pub todos: Option<Vec<String>>,
+    /// Optional session id to stamp a session touch (last_session_at).
+    pub session_id: Option<String>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct AddMemoryArgs {
+    /// Project the memory belongs to.
+    pub project: String,
+    /// The self-contained fact to remember.
+    pub content: String,
+    /// Category: decision|progress|context|bug|todo|code|general (default general).
+    pub category: Option<String>,
+    /// Free-form tags for later filtering.
+    pub tags: Option<Vec<String>>,
+    /// Importance 0..5 (L0 floor at 5); default 0.
+    pub importance: Option<f32>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct SearchMemoryArgs {
+    /// Project to search within.
+    pub project: String,
+    /// Natural-language query (dense + lexical RRF fusion).
+    pub query: String,
+    /// Max hits to return (default 5).
+    pub n_results: Option<usize>,
+    /// Optional category filter (decision|progress|context|bug|todo|code|general).
+    pub category: Option<String>,
+    /// Include resolved memories too (default false).
+    pub include_resolved: Option<bool>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct SearchAllArgs {
+    /// Natural-language query across ALL projects (reserved projects excluded).
+    pub query: String,
+    /// Max hits to return (default 5).
+    pub n_results: Option<usize>,
+    /// Optional category filter (decision|progress|context|bug|todo|code|general).
+    pub category: Option<String>,
+    /// Include resolved memories too (default false).
+    pub include_resolved: Option<bool>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct ListMemoriesArgs {
+    /// Project whose memories to list (newest first).
+    pub project: String,
+    /// Optional category filter (decision|progress|context|bug|todo|code|general).
+    pub category: Option<String>,
+    /// Max rows to return (default 20).
+    pub limit: Option<usize>,
+    /// Include resolved memories too (default false).
+    pub include_resolved: Option<bool>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct UpdateMemoryArgs {
+    /// Id of the memory to update (`mem_<ulid>__<project>`).
+    pub memory_id: String,
+    /// New content (omit to leave unchanged; a real change re-embeds).
+    pub content: Option<String>,
+    /// Replacement tags (omit to leave unchanged).
+    pub tags: Option<Vec<String>>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct DeleteMemoryArgs {
+    /// Id of the memory to delete (`mem_<ulid>__<project>`).
+    pub memory_id: String,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct ResolveMemoryArgs {
+    /// Id of the bug/todo to mark resolved (`mem_<ulid>__<project>`).
+    pub memory_id: String,
+    /// Why it is resolved (recorded with the resolution).
+    pub reason: String,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct AddDeveloperNoteArgs {
+    /// The cross-project preference / rule about how this developer works.
+    pub content: String,
+    /// Category (default general).
+    pub category: Option<String>,
+    /// Free-form tags.
+    pub tags: Option<Vec<String>>,
+    /// Importance 0..5 (default 0).
+    pub importance: Option<f32>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct GetDeveloperProfileArgs {
+    /// Optional query — when given, semantically searches the profile; else lists it.
+    pub query: Option<String>,
+    /// Max notes to return (default 5).
+    pub n_results: Option<usize>,
+}
+
 // ──────────────────────────── tools ────────────────────────────
 
 #[tool_router]
 impl CodeMcpServer {
     /// Construct the server. `embedder` is `Some` when semantic/hybrid search is
-    /// available, `None` for lexical-only (Ollama down at startup).
-    pub fn new(store: Arc<SqliteCodeStore>, embedder: Option<Arc<dyn Embedder>>) -> Self {
-        Self { store, embedder, tool_router: Self::tool_router() }
+    /// available, `None` for lexical-only (Ollama down at startup). `memory` is
+    /// `Some` when the cross-session memory store was wired up (it needs an
+    /// embedder), `None` to make every memory tool report [`NO_MEMORY_ERR`].
+    pub fn new(
+        store: Arc<SqliteCodeStore>,
+        embedder: Option<Arc<dyn Embedder>>,
+        memory: Option<Arc<dyn MemoryStore>>,
+    ) -> Self {
+        Self {
+            store,
+            embedder,
+            memory,
+            tool_router: Self::tool_router(),
+        }
     }
 
     #[tool(description = "Return code-graph statistics (file/function/class/call/import/route counts) as JSON.")]
@@ -653,6 +805,284 @@ impl CodeMcpServer {
             Err(e) => err_json(&e.to_string()),
         }
     }
+
+    // ──────────────────────────── memory tools ────────────────────────────
+
+    #[tool(description = "Start a session: load the developer profile (cross-project preferences) AND recent project context in one call. Returns {developer_profile, project_context}. Call this FIRST.")]
+    async fn session_start(&self, Parameters(args): Parameters<SessionStartArgs>) -> String {
+        let mem = match self.memory.clone() {
+            Some(m) => m,
+            None => return err_json(NO_MEMORY_ERR),
+        };
+        let n_project = args.n_project_memories.unwrap_or(DEFAULT_N_PROJECT_MEMORIES);
+        let n_profile = args.n_profile_notes.unwrap_or(DEFAULT_N_PROFILE_NOTES);
+        let project = args.project;
+        let result = tokio::task::spawn_blocking(move || {
+            icode_engine::session_start(mem.as_ref(), &project, n_project, n_profile)
+        })
+        .await;
+        match result {
+            Ok(Ok(s)) => serde_json::json!({
+                "developer_profile": s.developer_profile,
+                "project_context": s.project_context,
+            })
+            .to_string(),
+            Ok(Err(e)) => err_json(&e.to_string()),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }
+
+    #[tool(description = "End a session: save summary (Progress), decisions (Decision), completed (Progress), todos (Todo); auto-resolve the bug/todo memories each completed item closes. Returns {saved, auto_resolved}.")]
+    async fn session_end(&self, Parameters(args): Parameters<SessionEndArgs>) -> String {
+        let mem = match self.memory.clone() {
+            Some(m) => m,
+            None => return err_json(NO_MEMORY_ERR),
+        };
+        let SessionEndArgs {
+            project,
+            summary,
+            completed,
+            decisions,
+            todos,
+            session_id,
+        } = args;
+        let completed = completed.unwrap_or_default();
+        let decisions = decisions.unwrap_or_default();
+        let todos = todos.unwrap_or_default();
+        let result = tokio::task::spawn_blocking(move || {
+            icode_engine::session_end(
+                mem.as_ref(),
+                &project,
+                &summary,
+                &completed,
+                &decisions,
+                &todos,
+                session_id.as_deref(),
+            )
+        })
+        .await;
+        match result {
+            Ok(Ok(s)) => serde_json::json!({
+                "saved": s.saved,
+                "auto_resolved": s.auto_resolved,
+            })
+            .to_string(),
+            Ok(Err(e)) => err_json(&e.to_string()),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }
+
+    #[tool(description = "Save one memory. category: decision|progress|context|bug|todo|code|general (default general). A near-duplicate is reported as {outcome:duplicate} (not an error).")]
+    async fn add_memory(&self, Parameters(args): Parameters<AddMemoryArgs>) -> String {
+        let mem = match self.memory.clone() {
+            Some(m) => m,
+            None => return err_json(NO_MEMORY_ERR),
+        };
+        let category = args
+            .category
+            .as_deref()
+            .map(parse_category_arg)
+            .unwrap_or(Category::General);
+        let new = NewMemory {
+            project: args.project,
+            content: args.content,
+            category,
+            tags: args.tags.unwrap_or_default(),
+            importance: args.importance.unwrap_or(0.0),
+            session_id: None,
+        };
+        let result = tokio::task::spawn_blocking(move || mem.add(new)).await;
+        match result {
+            Ok(Ok(outcome)) => to_json(&outcome),
+            Ok(Err(e)) => err_json(&e.to_string()),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }
+
+    #[tool(description = "Semantic + lexical (RRF) search of one project's memories. JSON array of MemoryHit.")]
+    async fn search_memory(&self, Parameters(args): Parameters<SearchMemoryArgs>) -> String {
+        let mem = match self.memory.clone() {
+            Some(m) => m,
+            None => return err_json(NO_MEMORY_ERR),
+        };
+        let category = args.category.as_deref().map(parse_category_arg);
+        let n = args.n_results.unwrap_or(5);
+        let include_resolved = args.include_resolved.unwrap_or(false);
+        let project = args.project;
+        let query = args.query;
+        let result = tokio::task::spawn_blocking(move || {
+            mem.search(&project, &query, n, category, include_resolved)
+        })
+        .await;
+        match result {
+            Ok(Ok(hits)) => to_json(&hits),
+            Ok(Err(e)) => err_json(&e.to_string()),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }
+
+    #[tool(description = "Cross-project semantic memory search (reserved projects excluded). JSON array of MemoryHit.")]
+    async fn search_all(&self, Parameters(args): Parameters<SearchAllArgs>) -> String {
+        let mem = match self.memory.clone() {
+            Some(m) => m,
+            None => return err_json(NO_MEMORY_ERR),
+        };
+        // search_all has no per-call category filter on the trait; an explicit
+        // category is honoured by post-filtering the fused hits here.
+        let category = args.category.as_deref().map(parse_category_arg);
+        let n = args.n_results.unwrap_or(5);
+        let include_resolved = args.include_resolved.unwrap_or(false);
+        let query = args.query;
+        let result = tokio::task::spawn_blocking(move || {
+            mem.search_all(&query, n, include_resolved).map(|hits| match category {
+                Some(c) => hits.into_iter().filter(|h| h.record.category == c).collect(),
+                None => hits,
+            })
+        })
+        .await;
+        match result {
+            Ok(Ok(hits)) => to_json(&hits),
+            Ok(Err(e)) => err_json(&e.to_string()),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }
+
+    #[tool(description = "List a project's memories (newest first; optional category filter). JSON array of MemoryRecord.")]
+    async fn list_memories(&self, Parameters(args): Parameters<ListMemoriesArgs>) -> String {
+        let mem = match self.memory.clone() {
+            Some(m) => m,
+            None => return err_json(NO_MEMORY_ERR),
+        };
+        let category = args.category.as_deref().map(parse_category_arg);
+        let limit = args.limit.unwrap_or(20);
+        let include_resolved = args.include_resolved.unwrap_or(false);
+        let project = args.project;
+        let result = tokio::task::spawn_blocking(move || {
+            mem.list(&project, category, limit, include_resolved)
+        })
+        .await;
+        match result {
+            Ok(Ok(recs)) => to_json(&recs),
+            Ok(Err(e)) => err_json(&e.to_string()),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }
+
+    #[tool(description = "List known projects with their memory counts (reserved projects excluded). JSON array of [name, count].")]
+    async fn list_projects(&self) -> String {
+        let mem = match self.memory.clone() {
+            Some(m) => m,
+            None => return err_json(NO_MEMORY_ERR),
+        };
+        let result = tokio::task::spawn_blocking(move || mem.list_projects()).await;
+        match result {
+            Ok(Ok(rows)) => to_json(&rows),
+            Ok(Err(e)) => err_json(&e.to_string()),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }
+
+    #[tool(description = "Update a memory's content and/or tags by id. Re-embeds only when the content actually changes. Returns {ok:true} or an error.")]
+    async fn update_memory(&self, Parameters(args): Parameters<UpdateMemoryArgs>) -> String {
+        let mem = match self.memory.clone() {
+            Some(m) => m,
+            None => return err_json(NO_MEMORY_ERR),
+        };
+        let id = MemoryId(args.memory_id);
+        let content = args.content;
+        let tags = args.tags;
+        let result = tokio::task::spawn_blocking(move || {
+            mem.update(&id, content.as_deref(), tags.as_deref())
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => serde_json::json!({ "ok": true }).to_string(),
+            Ok(Err(e)) => err_json(&e.to_string()),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }
+
+    #[tool(description = "Delete a memory by id (removes its vector + lexical row too). Returns {ok:true} or an error.")]
+    async fn delete_memory(&self, Parameters(args): Parameters<DeleteMemoryArgs>) -> String {
+        let mem = match self.memory.clone() {
+            Some(m) => m,
+            None => return err_json(NO_MEMORY_ERR),
+        };
+        let id = MemoryId(args.memory_id);
+        let result = tokio::task::spawn_blocking(move || mem.delete(&id)).await;
+        match result {
+            Ok(Ok(())) => serde_json::json!({ "ok": true }).to_string(),
+            Ok(Err(e)) => err_json(&e.to_string()),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }
+
+    #[tool(description = "Mark a bug/todo memory resolved by id, recording the reason. Returns {ok:true} or an error.")]
+    async fn resolve_memory(&self, Parameters(args): Parameters<ResolveMemoryArgs>) -> String {
+        let mem = match self.memory.clone() {
+            Some(m) => m,
+            None => return err_json(NO_MEMORY_ERR),
+        };
+        let id = MemoryId(args.memory_id);
+        let reason = args.reason;
+        let result = tokio::task::spawn_blocking(move || mem.resolve(&id, &reason)).await;
+        match result {
+            Ok(Ok(())) => serde_json::json!({ "ok": true }).to_string(),
+            Ok(Err(e)) => err_json(&e.to_string()),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }
+
+    #[tool(description = "Save a cross-project developer note (preference / rule about how this developer works). Stored under the reserved profile project. Returns Added/Duplicate JSON.")]
+    async fn add_developer_note(&self, Parameters(args): Parameters<AddDeveloperNoteArgs>) -> String {
+        let mem = match self.memory.clone() {
+            Some(m) => m,
+            None => return err_json(NO_MEMORY_ERR),
+        };
+        let category = args
+            .category
+            .as_deref()
+            .map(parse_category_arg)
+            .unwrap_or(Category::General);
+        let new = NewMemory {
+            project: DEVELOPER_PROJECT.to_string(),
+            content: args.content,
+            category,
+            tags: args.tags.unwrap_or_default(),
+            importance: args.importance.unwrap_or(0.0),
+            session_id: None,
+        };
+        let result = tokio::task::spawn_blocking(move || mem.add(new)).await;
+        match result {
+            Ok(Ok(outcome)) => to_json(&outcome),
+            Ok(Err(e)) => err_json(&e.to_string()),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }
+
+    #[tool(description = "Read the developer profile: with a query, semantically search it; without, list it newest-first. JSON array of MemoryRecord (list) or MemoryHit (search).")]
+    async fn get_developer_profile(&self, Parameters(args): Parameters<GetDeveloperProfileArgs>) -> String {
+        let mem = match self.memory.clone() {
+            Some(m) => m,
+            None => return err_json(NO_MEMORY_ERR),
+        };
+        let n = args.n_results.unwrap_or(5);
+        let query = args.query.filter(|q| !q.trim().is_empty());
+        let result = tokio::task::spawn_blocking(move || match query {
+            Some(q) => mem
+                .search(DEVELOPER_PROJECT, &q, n, None, false)
+                .map(|hits| serde_json::to_value(hits).unwrap_or(serde_json::Value::Null)),
+            None => mem
+                .list(DEVELOPER_PROJECT, None, n, false)
+                .map(|recs| serde_json::to_value(recs).unwrap_or(serde_json::Value::Null)),
+        })
+        .await;
+        match result {
+            Ok(Ok(v)) => v.to_string(),
+            Ok(Err(e)) => err_json(&e.to_string()),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }
 }
 
 #[tool_handler]
@@ -666,16 +1096,37 @@ impl ServerHandler for CodeMcpServer {
 }
 
 /// Serve the MCP protocol over stdio until the client disconnects. `embedder` is
-/// `Some` to enable the semantic/hybrid tools, `None` for lexical-only.
+/// `Some` to enable the semantic/hybrid code tools, `None` for lexical-only.
+/// `memory` is `Some` to enable the cross-session memory tools, `None` to make
+/// them return [`NO_MEMORY_ERR`]. The bin builds `memory` and passes it as an
+/// `Arc<dyn MemoryStore>`, so `icode-serve` never depends on `icode-embed`.
 pub async fn serve_stdio(
     store: Arc<SqliteCodeStore>,
     embedder: Option<Arc<dyn Embedder>>,
+    memory: Option<Arc<dyn MemoryStore>>,
 ) -> anyhow::Result<()> {
-    let service = CodeMcpServer::new(store, embedder)
+    let service = CodeMcpServer::new(store, embedder, memory)
         .serve((tokio::io::stdin(), tokio::io::stdout()))
         .await?;
     service.waiting().await?;
     Ok(())
+}
+
+/// Parse a `category` argument string into a `Category`. The mapping mirrors
+/// `Category`'s lowercase serde names; an unknown/empty value falls back to
+/// `General` (a lenient default — a memory is still saved rather than rejected
+/// over a typo'd category). Callers with an `Option<&str>` use this via
+/// `.map(parse_category_arg)` (filter) or with `.unwrap_or(General)` (add).
+fn parse_category_arg(s: &str) -> Category {
+    match s.trim().to_lowercase().as_str() {
+        "decision" => Category::Decision,
+        "progress" => Category::Progress,
+        "context" => Category::Context,
+        "bug" => Category::Bug,
+        "todo" => Category::Todo,
+        "code" => Category::Code,
+        _ => Category::General,
+    }
 }
 
 /// Parse an optional `language` argument string into `Option<Language>`.
@@ -720,7 +1171,7 @@ mod tests {
     #[tokio::test]
     async fn semantic_tools_degrade_without_embedder() {
         let store = Arc::new(SqliteCodeStore::open_in_memory().expect("store"));
-        let server = CodeMcpServer::new(store, None);
+        let server = CodeMcpServer::new(store, None, None);
 
         let s = server
             .semantic_search_code(Parameters(SemanticSearchArgs {
@@ -764,5 +1215,67 @@ mod tests {
                 .unwrap_or(false),
             "similar_symbols is empty without an embedder, got {ctx}"
         );
+    }
+
+    /// With `memory: None` every memory tool must return the documented
+    /// unavailable-error JSON (and NOT panic / hang). Deterministic — no store,
+    /// no Ollama. Covers a representative read, write, and the session lifecycle.
+    #[tokio::test]
+    async fn memory_tools_report_unavailable_without_memory() {
+        let store = Arc::new(SqliteCodeStore::open_in_memory().expect("store"));
+        let server = CodeMcpServer::new(store, None, None);
+        let want = err_json(NO_MEMORY_ERR);
+
+        let add = server
+            .add_memory(Parameters(AddMemoryArgs {
+                project: "demo".into(),
+                content: "x".into(),
+                category: None,
+                tags: None,
+                importance: None,
+            }))
+            .await;
+        assert_eq!(add, want, "add_memory unavailable");
+
+        let search = server
+            .search_memory(Parameters(SearchMemoryArgs {
+                project: "demo".into(),
+                query: "x".into(),
+                n_results: None,
+                category: None,
+                include_resolved: None,
+            }))
+            .await;
+        assert_eq!(search, want, "search_memory unavailable");
+
+        let ss = server
+            .session_start(Parameters(SessionStartArgs {
+                project: "demo".into(),
+                n_project_memories: None,
+                n_profile_notes: None,
+            }))
+            .await;
+        assert_eq!(ss, want, "session_start unavailable");
+
+        let lp = server.list_projects().await;
+        assert_eq!(lp, want, "list_projects unavailable");
+
+        let gp = server
+            .get_developer_profile(Parameters(GetDeveloperProfileArgs {
+                query: None,
+                n_results: None,
+            }))
+            .await;
+        assert_eq!(gp, want, "get_developer_profile unavailable");
+    }
+
+    /// `parse_category_arg` maps the wire strings and falls back to General.
+    #[test]
+    fn category_arg_parsing() {
+        assert_eq!(parse_category_arg("decision"), Category::Decision);
+        assert_eq!(parse_category_arg("BUG"), Category::Bug);
+        assert_eq!(parse_category_arg(" todo "), Category::Todo);
+        assert_eq!(parse_category_arg("nonsense"), Category::General);
+        assert_eq!(parse_category_arg(""), Category::General);
     }
 }
