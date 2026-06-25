@@ -11,6 +11,7 @@ anyhow = { workspace = true }
 rusqlite = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-rust = { workspace = true }
+tree-sitter-python = { workspace = true }
 walkdir = { workspace = true }
 sha2 = { workspace = true }
 serde_json = { workspace = true }

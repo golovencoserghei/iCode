@@ -7,6 +7,7 @@
 //! in the indexer. The fields mirror the frozen `icode-core` node types so the
 //! indexer can forward them straight into `CodeWriteStore::upsert_file`.
 
+pub mod python;
 pub mod rust;
 
 use icode_core::model::{Call, ClassDef, FunctionDef, Import, Route};
@@ -38,4 +39,5 @@ pub struct ParseResult {
     pub routes: Vec<Route>,
 }
 
+pub use python::parse_python;
 pub use rust::parse_rust;

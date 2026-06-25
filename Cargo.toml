@@ -36,6 +36,7 @@ rmcp = { version = "1.8", features = ["server", "transport-io", "macros"] }
 # parsing
 tree-sitter = "0.25"
 tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
 # cli
 clap = { version = "4", features = ["derive"] }
 # parallelism / fs
