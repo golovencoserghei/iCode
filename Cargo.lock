@@ -679,6 +679,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "icode-core",
+ "icode-embed",
  "regex",
  "rusqlite",
  "serde_json",

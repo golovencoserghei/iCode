@@ -11,6 +11,7 @@ use icode_core::traits::CodeWriteStore;
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
+use crate::chunk::chunks_for_file;
 use crate::parse::{parse_python, parse_rust, ParseResult};
 use crate::store::SqliteCodeStore;
 
@@ -23,6 +24,10 @@ pub struct IndexStats {
     pub imports: u64,
     pub calls: u64,
     pub routes: u64,
+    /// Embeddable chunks written to `code_chunks` (without vectors — the embed
+    /// pass fills those). Counts overflow sub-chunks too, so it can exceed
+    /// `functions + classes` for files with very large symbols.
+    pub code_chunks: u64,
     pub errors: u64,
 }
 
@@ -85,6 +90,7 @@ pub fn index_path(root: &Path, store: &SqliteCodeStore) -> Result<IndexStats> {
                 stats.imports += counts.imports;
                 stats.calls += counts.calls;
                 stats.routes += counts.routes;
+                stats.code_chunks += counts.code_chunks;
             }
             Err(e) => {
                 stats.errors += 1;
@@ -105,10 +111,12 @@ struct FileCounts {
     imports: u64,
     calls: u64,
     routes: u64,
+    code_chunks: u64,
 }
 
 fn index_file(path: &Path, store: &SqliteCodeStore) -> Result<FileCounts> {
-    let language = language_for(path).ok_or_else(|| Error::Invalid("unsupported extension".into()))?;
+    let language =
+        language_for(path).ok_or_else(|| Error::Invalid("unsupported extension".into()))?;
     let source = std::fs::read_to_string(path).map_err(|e| Error::Io(e.to_string()))?;
     let path_str = path.to_string_lossy().to_string();
 
@@ -132,13 +140,6 @@ fn index_file(path: &Path, store: &SqliteCodeStore) -> Result<FileCounts> {
         file_size: meta.len(),
     };
 
-    let counts = FileCounts {
-        functions: parsed.functions.len() as u64,
-        classes: parsed.classes.len() as u64,
-        imports: parsed.imports.len() as u64,
-        calls: parsed.calls.len() as u64,
-        routes: parsed.routes.len() as u64,
-    };
     store.upsert_file(
         &file,
         &parsed.functions,
@@ -147,7 +148,21 @@ fn index_file(path: &Path, store: &SqliteCodeStore) -> Result<FileCounts> {
         &parsed.calls,
         &parsed.routes,
     )?;
-    Ok(counts)
+
+    // Chunk+persist the file's symbols (graph-fast path: writes code_chunks with
+    // NO vectors, so this never blocks on the network — the embed pass fills
+    // vectors asynchronously). Keyed by path, idempotent per file.
+    let chunks = chunks_for_file(&parsed.functions, &parsed.classes);
+    store.upsert_chunks(&file.path, &chunks)?;
+
+    Ok(FileCounts {
+        functions: parsed.functions.len() as u64,
+        classes: parsed.classes.len() as u64,
+        imports: parsed.imports.len() as u64,
+        calls: parsed.calls.len() as u64,
+        routes: parsed.routes.len() as u64,
+        code_chunks: chunks.len() as u64,
+    })
 }
 
 /// Map a path's extension to a language we have a parser for. Returns `None` for
