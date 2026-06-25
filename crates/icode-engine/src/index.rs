@@ -26,9 +26,37 @@ pub struct IndexStats {
     pub errors: u64,
 }
 
-/// Walk `root` recursively, indexing every supported source file (skipping
-/// `target`, `.git`, `node_modules`, `vendor`). Each file is parsed and upserted
-/// in one store transaction.
+/// Directory names (path components) skipped wholesale by the walk: build
+/// artefacts, VCS metadata, and language dependency caches. Matching is by exact
+/// component name, so a nested copy (`a/b/.venv/...`) is excluded too. Critically
+/// this keeps Python projects from dragging their whole `.venv`/`site-packages`
+/// into the index.
+const EXCLUDED_DIRS: &[&str] = &[
+    // build artefacts
+    "target",
+    "dist",
+    "build",
+    // VCS metadata
+    ".git",
+    ".svn",
+    // JS deps / vendored code
+    "node_modules",
+    "vendor",
+    // Python virtualenvs & caches
+    ".venv",
+    "venv",
+    "site-packages",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".tox",
+    // editor metadata
+    ".idea",
+];
+
+/// Walk `root` recursively, indexing every supported source file (skipping the
+/// build/VCS/dependency directories in [`EXCLUDED_DIRS`]). Each file is parsed and
+/// upserted in one store transaction.
 pub fn index_path(root: &Path, store: &SqliteCodeStore) -> Result<IndexStats> {
     let mut stats = IndexStats::default();
 
@@ -158,10 +186,11 @@ fn content_hash(source: &str) -> String {
     out
 }
 
-/// Exclude build/VCS/dependency dirs (and any nested copies) from the walk.
+/// Exclude build/VCS/dependency dirs (and any nested copies) from the walk by
+/// matching the path's final component against [`EXCLUDED_DIRS`].
 fn is_excluded_dir(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
-        .map(|n| matches!(n, "target" | ".git" | "node_modules" | "vendor"))
+        .map(|n| EXCLUDED_DIRS.contains(&n))
         .unwrap_or(false)
 }

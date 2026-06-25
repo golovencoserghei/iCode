@@ -15,6 +15,7 @@ tree-sitter-python = { workspace = true }
 walkdir = { workspace = true }
 sha2 = { workspace = true }
 serde_json = { workspace = true }
+regex = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
