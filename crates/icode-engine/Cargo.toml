@@ -9,6 +9,7 @@ description = "iCode v2 engine: parse / index / store / memory / search (impl fr
 icode-core = { workspace = true }
 anyhow = { workspace = true }
 rusqlite = { workspace = true }
+sqlite-vec = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-rust = { workspace = true }
 tree-sitter-python = { workspace = true }

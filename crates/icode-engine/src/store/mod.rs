@@ -10,10 +10,11 @@
 //! makes this the correct serialization point anyway.
 
 mod schema;
+mod vector;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, Once};
 
 use icode_core::error::{Error, Result};
 use icode_core::model::*;
@@ -21,10 +22,46 @@ use icode_core::traits::{CodeReadStore, CodeWriteStore};
 use regex::Regex;
 use rusqlite::Connection;
 
+pub use vector::Vec0Index;
+
 /// Schema generation. Bumped whenever the on-disk layout changes incompatibly;
 /// a per-project index with a different `PRAGMA user_version` is discarded and
 /// rebuilt from source (the index is disposable).
-const SCHEMA_VERSION: i64 = 1;
+///
+/// v2 (M2): adds the semantic layer — `meta`, `code_chunks`, the `vec_code` vec0
+/// virtual table, and the delete-mirror trigger. A v1 db is wiped and rebuilt.
+const SCHEMA_VERSION: i64 = 2;
+
+/// Gate the one-time sqlite-vec auto-extension registration.
+static VEC_INIT: Once = Once::new();
+
+/// Register the sqlite-vec (vec0) extension as a SQLite auto-extension exactly
+/// ONCE per process. Auto-extensions run for every `Connection` opened *after*
+/// registration, so this MUST be called before any connection that touches a
+/// `vec0` table — hence it runs at the top of `open()` / `open_in_memory()`.
+///
+/// Mirrors the proven `spikes/vec_spike.rs` path: register the C init function
+/// via `sqlite3_auto_extension`. `Once` makes a double registration impossible
+/// even across threads (a second registration is harmless but wasteful).
+fn register_sqlite_vec() {
+    VEC_INIT.call_once(|| {
+        // SAFETY: transmuting the well-typed `sqlite3_vec_init` to the
+        // `sqlite3_auto_extension` entry-point signature is the documented usage
+        // for sqlite-vec; it is the exact pattern validated by the M0 spike. The
+        // target type is spelled out so clippy's missing-transmute-annotations
+        // lint is satisfied.
+        type AutoExtFn = unsafe extern "C" fn(
+            *mut rusqlite::ffi::sqlite3,
+            *mut *mut std::os::raw::c_char,
+            *const rusqlite::ffi::sqlite3_api_routines,
+        ) -> std::os::raw::c_int;
+        unsafe {
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<*const (), AutoExtFn>(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
+        }
+    });
+}
 
 /// Map any rusqlite error into the framework-free `Error::Store` variant.
 fn store_err<E: std::fmt::Display>(e: E) -> Error {
@@ -32,8 +69,12 @@ fn store_err<E: std::fmt::Display>(e: E) -> Error {
 }
 
 /// Per-project code store backed by a single SQLite file at `<root>/.icode/index.db`.
+///
+/// The connection is an `Arc<Mutex<…>>` so the vector index ([`Vec0Index`]) can
+/// share it: one connection, one writer, one serialization point for both the
+/// code graph and its vectors.
 pub struct SqliteCodeStore {
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl SqliteCodeStore {
@@ -45,6 +86,9 @@ impl SqliteCodeStore {
     /// it is deleted and rebuilt rather than crashing on a schema mismatch — the
     /// per-project index is regenerable from source.
     pub fn open(root: &Path) -> Result<Self> {
+        // Register vec0 BEFORE opening any connection that will see `vec_code`.
+        register_sqlite_vec();
+
         let dir = root.join(".icode");
         std::fs::create_dir_all(&dir).map_err(|e| Error::Io(e.to_string()))?;
         let db_path = dir.join("index.db");
@@ -62,8 +106,32 @@ impl SqliteCodeStore {
 
     /// Open an in-memory store (tests / ephemeral use). Always fresh.
     pub fn open_in_memory() -> Result<Self> {
+        // Register vec0 BEFORE opening the connection (auto-extensions only apply
+        // to connections opened after registration).
+        register_sqlite_vec();
         let conn = Connection::open_in_memory().map_err(store_err)?;
         Self::from_conn(conn)
+    }
+
+    /// A vector index sharing this store's connection (single-writer). `dim` is
+    /// fixed at [`schema::VEC_DIM`] — the `vec_code` column width.
+    pub fn vector_index(&self) -> Vec0Index {
+        Vec0Index::new(Arc::clone(&self.conn), schema::VEC_DIM)
+    }
+
+    /// Stamp a chunk as embedded with `model`/`dim` after its vector has been
+    /// written via [`Vec0Index`]. This is what drains the `pending_chunks` queue:
+    /// the queue keys on a missing vector OR a NULL/stale `embed_model`, so the
+    /// indexer must record the model it used. Inherent (not part of the frozen
+    /// `CodeWriteStore` contract) — the embed loop owns this final stamp.
+    pub fn mark_chunk_embedded(&self, rowid: i64, model: &str, dim: usize) -> Result<()> {
+        let conn = self.conn.lock().map_err(store_err)?;
+        conn.execute(
+            "UPDATE code_chunks SET embed_model = ?1, embed_dim = ?2 WHERE id = ?3",
+            rusqlite::params![model, dim as i64, rowid],
+        )
+        .map_err(store_err)?;
+        Ok(())
     }
 
     /// Read `PRAGMA user_version` from an existing db file via a throwaway
@@ -82,7 +150,7 @@ impl SqliteCodeStore {
         conn.execute_batch(schema::SCHEMA).map_err(store_err)?;
         // Stamp the schema generation so a future incompatible version is detected.
         conn.pragma_update(None, "user_version", SCHEMA_VERSION).map_err(store_err)?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
 
     fn count_table(conn: &Connection, table: &str) -> Result<u64> {
@@ -105,8 +173,10 @@ impl CodeReadStore for SqliteCodeStore {
             calls: Self::count_table(&conn, "calls")?,
             imports: Self::count_table(&conn, "imports")?,
             routes: Self::count_table(&conn, "routes")?,
+            code_chunks: Self::count_table(&conn, "code_chunks")?,
+            // Doctor invariant: vec_rows should track embedded code_chunks.
+            vec_rows: Self::count_table(&conn, "vec_code")?,
             parse_errors: Self::count_table(&conn, "parse_errors")?,
-            ..DbStats::default()
         })
     }
 
@@ -902,8 +972,48 @@ impl CodeReadStore for SqliteCodeStore {
         }
         Ok(out)
     }
-    fn chunk_hits(&self, _rowids: &[i64]) -> Result<Vec<(i64, CodeHit)>> {
-        Ok(vec![])
+    /// Re-hydrate KNN rowids (== `code_chunks.id`) into lean `CodeHit`s. Returns
+    /// one `(rowid, hit)` per matched chunk; missing rowids are silently dropped.
+    /// `score` is a `0.0` placeholder — the caller folds in the KNN distance — and
+    /// `snippet` is `None` (lean). `name` is the last segment of `qualified_name`.
+    fn chunk_hits(&self, rowids: &[i64]) -> Result<Vec<(i64, CodeHit)>> {
+        if rowids.is_empty() {
+            return Ok(vec![]);
+        }
+        let conn = self.conn.lock().map_err(store_err)?;
+        // Bind each rowid as a positional param to avoid string-built IN lists.
+        let placeholders = std::iter::repeat_n("?", rowids.len()).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id, symbol_kind, qualified_name, path, line_start, line_end \
+             FROM code_chunks WHERE id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(store_err)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> =
+            rowids.iter().map(|r| r as &dyn rusqlite::types::ToSql).collect();
+        let rows = stmt
+            .query_map(params.as_slice(), |row| {
+                let id: i64 = row.get(0)?;
+                let kind_str: Option<String> = row.get(1)?;
+                let qualified_name: Option<String> = row.get(2)?;
+                let path: Option<String> = row.get(3)?;
+                let qn = qualified_name.unwrap_or_default();
+                Ok((
+                    id,
+                    CodeHit {
+                        kind: parse_symbol_kind(kind_str.as_deref()),
+                        name: last_name_segment(&qn),
+                        qualified_name: qn,
+                        path: path.unwrap_or_default(),
+                        line_start: row.get::<_, Option<i64>>(4)?.unwrap_or(0) as u32,
+                        line_end: row.get::<_, Option<i64>>(5)?.unwrap_or(0) as u32,
+                        score: 0.0,
+                        snippet: None,
+                        stale: false,
+                    },
+                ))
+            })
+            .map_err(store_err)?;
+        collect(rows)
     }
 }
 
@@ -1073,13 +1183,69 @@ impl CodeWriteStore for SqliteCodeStore {
         Ok(())
     }
 
-    fn upsert_chunks(&self, _path: &str, _chunks: &[CodeChunk]) -> Result<Vec<i64>> {
-        // No embeddings/chunks in the skeleton.
-        Ok(vec![])
+    /// Replace all chunks of one `path` (idempotent per file): delete the old
+    /// rows (the `code_chunks_ad` trigger drops their vectors too), insert the new
+    /// ones, and return the assigned rowids in INPUT ORDER so the caller can pair
+    /// them with freshly-computed embeddings. Does NOT embed — vectors are written
+    /// separately via the [`Vec0Index`].
+    fn upsert_chunks(&self, path: &str, chunks: &[CodeChunk]) -> Result<Vec<i64>> {
+        let mut conn = self.conn.lock().map_err(store_err)?;
+        let tx = conn.transaction().map_err(store_err)?;
+
+        // Drop the file's old chunks (trigger mirrors the delete into vec_code).
+        tx.execute("DELETE FROM code_chunks WHERE path = ?1", rusqlite::params![path])
+            .map_err(store_err)?;
+
+        let mut rowids = Vec::with_capacity(chunks.len());
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO code_chunks \
+                     (symbol_kind, symbol_id, qualified_name, path, line_start, line_end, \
+                      chunk_text, content_hash, embed_model, embed_dim) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,NULL,NULL)",
+                )
+                .map_err(store_err)?;
+            for c in chunks {
+                stmt.execute(rusqlite::params![
+                    symbol_kind_str(c.symbol_kind),
+                    c.symbol_id,
+                    c.qualified_name,
+                    c.path,
+                    c.line_start as i64,
+                    c.line_end as i64,
+                    c.chunk_text,
+                    c.content_hash,
+                ])
+                .map_err(store_err)?;
+                rowids.push(tx.last_insert_rowid());
+            }
+        }
+
+        tx.commit().map_err(store_err)?;
+        Ok(rowids)
     }
 
-    fn pending_chunks(&self, _embed_model: &str, _limit: usize) -> Result<Vec<(i64, String)>> {
-        Ok(vec![])
+    /// Chunks whose embedding is missing or stamped with a different model: no
+    /// `vec_code` row yet, OR `embed_model` is NULL, OR it differs from the active
+    /// model. Returns `(rowid, chunk_text)` (capped at `limit`) for the embed queue.
+    fn pending_chunks(&self, embed_model: &str, limit: usize) -> Result<Vec<(i64, String)>> {
+        let conn = self.conn.lock().map_err(store_err)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT c.id, c.chunk_text FROM code_chunks c \
+                 WHERE NOT EXISTS (SELECT 1 FROM vec_code v WHERE v.rowid = c.id) \
+                    OR c.embed_model IS NULL \
+                    OR c.embed_model != ?1 \
+                 ORDER BY c.id LIMIT ?2",
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![embed_model, limit as i64], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(store_err)?;
+        collect(rows)
     }
 
     fn record_parse_error(&self, path: &str, error: &str) -> Result<()> {
@@ -1552,6 +1718,26 @@ fn map_file_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRecord> {
         mtime: row.get(5)?,
         file_size: row.get::<_, i64>(6)? as u64,
     })
+}
+
+/// Stable lowercase tag for a `SymbolKind` (stored in `code_chunks.symbol_kind`).
+/// `icode-core` is frozen, so the mapping lives here next to its inverse.
+fn symbol_kind_str(kind: SymbolKind) -> &'static str {
+    match kind {
+        SymbolKind::Function => "function",
+        SymbolKind::Class => "class",
+        SymbolKind::FileWindow => "filewindow",
+    }
+}
+
+/// Inverse of [`symbol_kind_str`]. Unknown/NULL maps to `Function` (the common
+/// case for symbol chunks); kept total so a re-hydrated hit never errors.
+fn parse_symbol_kind(s: Option<&str>) -> SymbolKind {
+    match s {
+        Some("class") => SymbolKind::Class,
+        Some("filewindow") => SymbolKind::FileWindow,
+        _ => SymbolKind::Function,
+    }
 }
 
 /// Reverse of `Language::as_str` for the few languages the skeleton stores.

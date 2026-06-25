@@ -1,12 +1,27 @@
 //! SQLite schema for the per-project code graph (M1: full node set —
 //! files + functions + classes + imports + calls + routes, with FTS5 over
-//! functions and classes). Vector/`code_chunks` tables land in M2.
+//! functions and classes). M2 adds the semantic layer: `meta`, `code_chunks`,
+//! and the sqlite-vec `vec_code` virtual table.
+
+/// Embedding dimensionality baked into the `vec_code` vec0 column.
+///
+/// 1024 is the default for the qwen3-embedding:0.6b model (the M2 default
+/// `Embedder`). The vec0 column width is FIXED at table-creation time — vec0 has
+/// no dim-templating, so a different embedder dim requires a schema rebuild. This
+/// is hard-coded for now; templating `[VEC_DIM]` from `core::config` is a future
+/// refinement (the `meta` row `embed_dim`/`embed_model` records what was actually
+/// used so `doctor` can detect a mismatch).
+pub const VEC_DIM: usize = 1024;
 
 /// DDL applied once at store open. Idempotent (`IF NOT EXISTS`). The FTS5 indexes
 /// are contentless-external over `functions`/`classes` (rowid == table id), so a
 /// search `MATCH` yields the owning rows without duplicating body text. All child
 /// tables cascade-delete from `files`, so re-indexing a file (DELETE + INSERT)
 /// transparently clears its old graph rows.
+///
+/// vec0 has NO foreign-key cascade: deleting a `code_chunks` row does not drop its
+/// vector. The `code_chunks_ad` trigger mirrors deletes into `vec_code` manually
+/// so `count(vec_code) == count(code_chunks-with-embedding)` stays an invariant.
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS files (
     id           INTEGER PRIMARY KEY,
@@ -175,5 +190,48 @@ CREATE TRIGGER IF NOT EXISTS classes_au AFTER UPDATE ON classes BEGIN
     VALUES ('delete', old.id, old.name, old.qualified_name, old.docstring, old.body);
     INSERT INTO fts_classes(rowid, name, qualified_name, docstring, body)
     VALUES (new.id, new.name, new.qualified_name, new.docstring, new.body);
+END;
+
+-- ──────────────────────────── meta (key/value) ────────────────────────────
+
+-- Free-form store metadata. M2 stamps `embed_model` / `embed_dim` here once the
+-- indexer embeds the first chunk (so `doctor` can detect a model/dim change vs
+-- the fixed `vec_code` column width). Empty until then.
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+
+-- ──────────────────────────── code chunks ────────────────────────────
+
+-- One row per embeddable unit of text. `id` is the rowid the vector index keys
+-- on (vec_code.rowid == code_chunks.id). `embed_model`/`embed_dim` are stamped
+-- when a vector is written; NULL means "not yet embedded" (feeds pending_chunks).
+CREATE TABLE IF NOT EXISTS code_chunks (
+    id             INTEGER PRIMARY KEY,
+    symbol_kind    TEXT,
+    symbol_id      INTEGER,
+    qualified_name TEXT,
+    path           TEXT,
+    line_start     INTEGER,
+    line_end       INTEGER,
+    chunk_text     TEXT NOT NULL,
+    content_hash   TEXT NOT NULL,
+    embed_model    TEXT,
+    embed_dim      INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_code_chunks_hash ON code_chunks(content_hash);
+CREATE INDEX IF NOT EXISTS idx_code_chunks_path ON code_chunks(path);
+
+-- vec0 virtual table: f32 little-endian blobs, cosine distance. The column width
+-- is FIXED (see VEC_DIM). Requires the sqlite-vec extension to be registered on
+-- the connection BEFORE it is opened (see store::register_sqlite_vec).
+CREATE VIRTUAL TABLE IF NOT EXISTS vec_code USING vec0(embedding float[1024] distance_metric=cosine);
+
+-- vec0 has no FK cascade: mirror code_chunks deletes into vec_code by hand so the
+-- two stay in lock-step (re-indexing a path DELETEs its chunks → drops vectors).
+CREATE TRIGGER IF NOT EXISTS code_chunks_ad AFTER DELETE ON code_chunks BEGIN
+    DELETE FROM vec_code WHERE rowid = old.id;
 END;
 "#;

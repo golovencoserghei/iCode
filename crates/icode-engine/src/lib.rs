@@ -12,4 +12,4 @@ pub mod store;
 // pub mod memory;  // M4
 
 pub use index::{index_path, IndexStats};
-pub use store::SqliteCodeStore;
+pub use store::{SqliteCodeStore, Vec0Index};
