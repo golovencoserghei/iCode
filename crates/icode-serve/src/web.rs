@@ -64,6 +64,7 @@ pub fn router(state: WebState) -> Router {
         .route("/", get(index))
         .route("/api/stats", get(api_stats))
         .route("/api/repo-map", get(api_repo_map))
+        .route("/api/classes", get(api_classes))
         .route("/api/search/code", get(api_search_code))
         .route("/api/symbol", get(api_symbol))
         .route("/api/routes", get(api_routes))
@@ -99,6 +100,11 @@ pub async fn serve(
 #[derive(Deserialize)]
 struct RepoMapParams {
     top: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct ClassesParams {
+    limit: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -160,6 +166,19 @@ async fn api_repo_map(
     let store = st.store.clone();
     let top = p.top.unwrap_or(30);
     blocking_json(move || store.repo_map(top)).await
+}
+
+/// `GET /api/classes?limit=300` → `Vec<ClassDef>` (lean — no `body`), ordered by
+/// `path, name`. Feeds the dashboard "Map" tab's inheritance overview, which only
+/// needs each class's `bases`. Degrades like the other endpoints (a store error
+/// becomes an `{"error": "..."}` body, never a 500).
+async fn api_classes(
+    State(st): State<WebState>,
+    Query(p): Query<ClassesParams>,
+) -> impl IntoResponse {
+    let store = st.store.clone();
+    let limit = p.limit.unwrap_or(300);
+    blocking_json(move || store.list_classes(limit)).await
 }
 
 /// `GET /api/search/code?q=...&limit=20` → `Vec<CodeHit>`.
@@ -363,6 +382,24 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_string(resp).await, "[]");
+    }
+
+    /// `/api/classes` returns a JSON array (empty store → `[]`, never a 500).
+    #[tokio::test]
+    async fn classes_endpoint_returns_array() {
+        let app = router(empty_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/classes?limit=50")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert!(v.is_array());
     }
 
     /// `/api/recall` degrades cleanly without embedder/memory: a well-formed

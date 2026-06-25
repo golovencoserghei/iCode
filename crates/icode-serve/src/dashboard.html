@@ -162,6 +162,18 @@
   h3.sec { font-size: 13px; text-transform: uppercase; letter-spacing: .5px; color: var(--fg-dim); margin: 18px 0 8px; }
   .tags { display: inline-flex; gap: 5px; flex-wrap: wrap; }
   .tag { font-size: 11px; color: var(--fg-dim); font-family: var(--mono); }
+
+  /* Map tab: module size bars + clickable class chips. */
+  .mod-row { margin-bottom: 8px; }
+  .mod-row .mod-head { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
+  .mod-row .mod-path { font-family: var(--mono); font-size: 12px; color: var(--fg); word-break: break-all; }
+  .mod-row .mod-meta { color: var(--fg-dim); font-size: 11px; font-family: var(--mono); white-space: nowrap; }
+  .mod-bar { height: 6px; border-radius: 4px; background: var(--bg-soft2); border: 1px solid var(--border); margin-top: 4px; overflow: hidden; }
+  .mod-bar > span { display: block; height: 100%; background: var(--accent-dim); }
+  .chip.click { cursor: pointer; color: var(--accent); border-color: var(--accent-dim); }
+  .chip.click:hover { background: var(--bg-soft); border-color: var(--accent); }
+  .tree-base { font-family: var(--mono); font-size: 12px; color: var(--fg-dim); margin: 8px 0 4px; }
+  .tree-children { display: flex; flex-wrap: wrap; gap: 6px; margin-left: 14px; }
 </style>
 </head>
 <body>
@@ -173,6 +185,7 @@
 
 <nav class="tabs">
   <button data-tab="code" class="active">Code</button>
+  <button data-tab="map">Map</button>
   <button data-tab="memory">Memory</button>
   <button data-tab="recall">Recall</button>
 </nav>
@@ -188,13 +201,22 @@
     <div class="cols">
       <div>
         <div class="colhead">Results</div>
-        <div id="code-results"><div class="empty">Type a query and hit Search.</div></div>
+        <div id="code-results"><div class="empty">Type a query and hit Search (e.g. <code>audit</code>, <code>client ip</code>) — the project overview is on the right →</div></div>
       </div>
       <div>
         <div class="colhead">Detail</div>
         <div id="code-detail"><div class="empty">Click a result to see its definition, callers and callees.</div></div>
       </div>
     </div>
+  </section>
+
+  <!-- ─────────────────── MAP ─────────────────── -->
+  <section class="panel" id="panel-map">
+    <div class="row">
+      <button class="btn ghost" id="map-refresh-btn">Refresh map</button>
+      <span class="state" id="map-hint">A visual overview of the indexed project: modules, hotspots and class inheritance.</span>
+    </div>
+    <div id="map-body"><div class="empty">Loading the project map…</div></div>
   </section>
 
   <!-- ─────────────────── MEMORY ─────────────────── -->
@@ -263,13 +285,17 @@ function setState(target, kind, msg) {
 }
 
 // ──────────────── tabs ────────────────
+// Programmatic tab switch (reused by Map → Code drill-down). Lazily loads the
+// Map the first time it is shown.
+function activateTab(name) {
+  document.querySelectorAll("nav.tabs button").forEach((b) =>
+    b.classList.toggle("active", b.dataset.tab === name));
+  document.querySelectorAll(".panel").forEach((p) =>
+    p.classList.toggle("active", p.id === "panel-" + name));
+  if (name === "map" && !mapLoaded) loadMap();
+}
 document.querySelectorAll("nav.tabs button").forEach((btn) => {
-  btn.addEventListener("click", () => {
-    document.querySelectorAll("nav.tabs button").forEach((b) => b.classList.remove("active"));
-    document.querySelectorAll(".panel").forEach((p) => p.classList.remove("active"));
-    btn.classList.add("active");
-    $("#panel-" + btn.dataset.tab).classList.add("active");
-  });
+  btn.addEventListener("click", () => activateTab(btn.dataset.tab));
 });
 
 // ──────────────── header stats ────────────────
@@ -408,6 +434,183 @@ async function loadRepoMap() {
   }
 }
 
+// ──────────────── MAP tab ────────────────
+let mapLoaded = false; // lazy-load guard (see activateTab); Refresh forces a reload
+
+// Jump from the Map into the Code tab and show a symbol's detail.
+function openSymbolInCode(name) {
+  activateTab("code");
+  loadSymbol(name);
+}
+
+// A simple module-size bar (relative to the busiest module by function count).
+function moduleRow(mod, maxFns) {
+  const row = el("div", "mod-row");
+  const head = el("div", "mod-head");
+  head.appendChild(el("div", "mod-path", esc(mod.module)));
+  head.appendChild(el("div", "mod-meta", `${mod.files} files · ${mod.functions} fn · ${mod.classes} cls`));
+  row.appendChild(head);
+  const bar = el("div", "mod-bar");
+  const pct = maxFns > 0 ? Math.max(2, Math.round((mod.functions / maxFns) * 100)) : 2;
+  const fill = el("span");
+  fill.style.width = pct + "%";
+  bar.appendChild(fill);
+  row.appendChild(bar);
+  return row;
+}
+
+// One clickable class chip → drills into the Code tab (loadSymbol by name).
+function classChip(cls) {
+  const chip = el("span", "chip click", esc(cls.name));
+  chip.title = cls.qualified_name || cls.name;
+  chip.addEventListener("click", () => openSymbolInCode(cls.name));
+  return chip;
+}
+
+// Build an inheritance overview from the flat class list. A base is "local" when
+// it matches a known class's `name` OR `qualified_name`; classes whose bases are
+// all external (or have none) are listed separately under "(no local base)".
+function renderInheritance(box, classes) {
+  box.appendChild(el("h3", "sec", "Inheritance (classes)"));
+  if (!classes || !classes.length) { box.appendChild(el("div", "empty", "no classes indexed")); return; }
+
+  // Index known class names (and qualified names) so we can tell local bases apart.
+  const known = new Set();
+  classes.forEach((c) => { known.add(c.name); if (c.qualified_name) known.add(c.qualified_name); });
+
+  // base name → child classes that extend it (only for bases we know locally).
+  const childrenOf = new Map();
+  const rootless = []; // classes with no local base (no bases, or all external)
+  classes.forEach((c) => {
+    const localBases = (c.bases || []).filter((b) => known.has(b));
+    if (localBases.length === 0) { rootless.push(c); return; }
+    localBases.forEach((b) => {
+      if (!childrenOf.has(b)) childrenOf.set(b, []);
+      childrenOf.get(b).push(c);
+    });
+  });
+
+  if (childrenOf.size) {
+    const bases = [...childrenOf.keys()].sort();
+    bases.forEach((base) => {
+      const wrap = el("div", "card");
+      const head = el("div", "tree-base", esc(base) + " ←");
+      // If the base is itself an indexed class, make its label clickable too.
+      if (known.has(base)) {
+        head.style.cursor = "pointer";
+        head.style.color = "var(--accent)";
+        head.addEventListener("click", () => openSymbolInCode(base.split("::").pop().split(".").pop()));
+      }
+      wrap.appendChild(head);
+      const kids = el("div", "tree-children");
+      childrenOf.get(base)
+        .sort((a, b) => a.name.localeCompare(b.name))
+        .forEach((c) => kids.appendChild(classChip(c)));
+      wrap.appendChild(kids);
+      box.appendChild(wrap);
+    });
+  } else {
+    box.appendChild(el("div", "empty", "no local inheritance edges found"));
+  }
+
+  box.appendChild(el("h3", "sec", `(no local base) — ${rootless.length}`));
+  if (rootless.length) {
+    const chips = el("div", "chips");
+    rootless
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .forEach((c) => chips.appendChild(classChip(c)));
+    box.appendChild(chips);
+  } else {
+    box.appendChild(el("div", "empty", "—"));
+  }
+}
+
+async function loadMap() {
+  const box = $("#map-body");
+  setState(box, "", "loading…");
+  const [mapRes, clsRes] = await Promise.all([
+    api("/api/repo-map?top=30"),
+    api("/api/classes?limit=300"),
+  ]);
+  if (!mapRes.ok) { setState(box, "err", "request failed: " + mapRes.error); return; }
+  if (apiErr(mapRes)) { setState(box, "warn", "backend unavailable: " + mapRes.data.error); return; }
+  const m = mapRes.data;
+  // Classes degrade independently: an error there just hides the inheritance view.
+  const classes = (clsRes.ok && Array.isArray(clsRes.data)) ? clsRes.data : [];
+  mapLoaded = true;
+  box.innerHTML = "";
+
+  // ── Overview ──
+  const s = m.stats || {};
+  const grid = el("div", "grid-stats");
+  [["files", s.files], ["functions", s.functions], ["classes", s.classes],
+   ["calls", s.calls], ["routes", s.routes], ["chunks", s.code_chunks]].forEach(([l, n]) => {
+    const st = el("div", "stat");
+    st.appendChild(el("div", "n", n == null ? "0" : esc(n)));
+    st.appendChild(el("div", "l", l));
+    grid.appendChild(st);
+  });
+  box.appendChild(grid);
+
+  // ── Languages ──
+  if (m.languages && m.languages.length) {
+    box.appendChild(el("h3", "sec", "Languages"));
+    const chips = el("div", "chips");
+    m.languages.forEach(([lang, n]) => chips.appendChild(el("span", "chip", esc(lang) + " · " + n)));
+    box.appendChild(chips);
+  }
+
+  // ── Modules (by directory, sized by function count) ──
+  if (m.modules && m.modules.length) {
+    box.appendChild(el("h3", "sec", "Modules"));
+    const mods = m.modules.slice().sort((a, b) => b.functions - a.functions);
+    const maxFns = mods.reduce((mx, x) => Math.max(mx, x.functions), 0);
+    mods.forEach((mod) => box.appendChild(moduleRow(mod, maxFns)));
+  }
+
+  // ── Hotspots: complex functions (clickable → Code) ──
+  if (m.complex_functions && m.complex_functions.length) {
+    box.appendChild(el("h3", "sec", "Hotspots — complex functions"));
+    m.complex_functions.forEach((f) => {
+      const card = el("div", "card click");
+      const lastName = String(f.qualified_name || "").split("::").pop().split(".").pop();
+      card.appendChild(el("div", "qn", esc(f.qualified_name)));
+      card.appendChild(el("div", "loc", esc(f.path) + ":" + f.line_start));
+      card.appendChild(el("div", "meta",
+        `span ${f.span} · fan-out ${f.fan_out} · callers ${f.callers} · <span class="score">${(+f.score).toFixed(2)}</span>`));
+      card.addEventListener("click", () => openSymbolInCode(lastName));
+      box.appendChild(card);
+    });
+  }
+
+  // ── Hotspots: most-called names ──
+  if (m.call_hotspots && m.call_hotspots.length) {
+    box.appendChild(el("h3", "sec", "Hotspots — most called"));
+    const chips = el("div", "chips");
+    m.call_hotspots.forEach(([name, n]) => {
+      const chip = el("span", "chip click", esc(name) + " · " + n + " calls");
+      chip.addEventListener("click", () => openSymbolInCode(name));
+      chips.appendChild(chip);
+    });
+    box.appendChild(chips);
+  }
+
+  // ── Entry points ──
+  if (m.entry_points && m.entry_points.length) {
+    box.appendChild(el("h3", "sec", "Entry points"));
+    const chips = el("div", "chips");
+    m.entry_points.forEach((name) => {
+      const chip = el("span", "chip click", esc(name));
+      chip.addEventListener("click", () => openSymbolInCode(name));
+      chips.appendChild(chip);
+    });
+    box.appendChild(chips);
+  }
+
+  // ── Inheritance (classes) ──
+  renderInheritance(box, classes);
+}
+
 // ──────────────── MEMORY tab ────────────────
 function memCard(m) {
   // search → MemoryHit ({...record, score, age_days, age_status});
@@ -496,6 +699,7 @@ async function loadProjects() {
 $("#code-search-btn").addEventListener("click", searchCode);
 $("#code-q").addEventListener("keydown", (e) => { if (e.key === "Enter") searchCode(); });
 $("#repomap-btn").addEventListener("click", loadRepoMap);
+$("#map-refresh-btn").addEventListener("click", loadMap);
 $("#mem-search-btn").addEventListener("click", searchMemory);
 $("#mem-q").addEventListener("keydown", (e) => { if (e.key === "Enter") searchMemory(); });
 $("#mem-project").addEventListener("change", searchMemory);
@@ -505,6 +709,7 @@ $("#recall-q").addEventListener("keydown", (e) => { if (e.key === "Enter") runRe
 
 loadStats();
 loadProjects();
+loadRepoMap(); // show the project overview immediately so the dashboard has content on open
 </script>
 </body>
 </html>

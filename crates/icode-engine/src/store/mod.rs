@@ -134,6 +134,43 @@ impl SqliteCodeStore {
         Ok(())
     }
 
+    /// Lean listing of all classes (no `body`) ordered by `path, name`, capped at
+    /// `limit`. Inherent (not part of the frozen `CodeReadStore` contract) — the
+    /// web dashboard's "Map" tab builds an inheritance overview from `bases`, for
+    /// which the heavy `body` is dead weight. Mirrors `get_class`'s column/JSON
+    /// handling: `bases` is a JSON array (empty on bad data), `body` is left blank.
+    pub fn list_classes(&self, limit: usize) -> Result<Vec<ClassDef>> {
+        let conn = self.conn.lock().map_err(store_err)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT name, qualified_name, path, language, line_start, line_end, \
+                        bases, docstring \
+                 FROM classes ORDER BY path, name LIMIT ?1",
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![limit as i64], |row| {
+                let lang_str: String = row.get(3)?;
+                let bases_json: String = row.get(6)?;
+                // `bases` is stored as a JSON array; fall back to empty on bad data.
+                let bases: Vec<String> = serde_json::from_str(&bases_json).unwrap_or_default();
+                Ok(ClassDef {
+                    name: row.get(0)?,
+                    qualified_name: row.get(1)?,
+                    path: row.get(2)?,
+                    language: parse_language(&lang_str),
+                    line_start: row.get::<_, i64>(4)? as u32,
+                    line_end: row.get::<_, i64>(5)? as u32,
+                    bases,
+                    docstring: row.get(7)?,
+                    // Lean: no body (dead weight for the Map/inheritance view).
+                    body: String::new(),
+                })
+            })
+            .map_err(store_err)?;
+        collect(rows)
+    }
+
     /// Read `PRAGMA user_version` from an existing db file via a throwaway
     /// connection (dropped before the caller may delete the file).
     fn db_is_current(db_path: &Path) -> Result<bool> {
