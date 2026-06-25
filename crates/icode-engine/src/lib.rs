@@ -6,6 +6,7 @@
 //! recall (M5) fill in later.
 
 pub mod chunk;
+pub mod doctor;
 pub mod embed;
 pub mod index;
 pub mod memory;
@@ -15,8 +16,9 @@ pub mod search;
 pub mod store;
 
 pub use chunk::{chunk_text_for_class, chunk_text_for_function, chunks_for_file, CHUNK_BUDGET_BYTES};
+pub use doctor::{diagnose, DiagnosticReport};
 pub use embed::{embed_pending, EmbedStats};
-pub use index::{index_path, IndexStats};
+pub use index::{index_path, walk_source_files, IndexStats};
 pub use memory::{
     effective_score, is_l0, rank, sanitize_fts5, sanitize_nl, session_end, session_start,
     SessionEnd, SessionStart, SqliteMemoryStore, WalStore, DEFAULT_PROFILE_NOTES,

@@ -159,6 +159,37 @@ impl SqliteCodeStore {
             .map(|n| n as u64)
             .map_err(store_err)
     }
+
+    /// Read-only: chunks with NO vector yet (`code_chunks` rows whose id has no
+    /// matching `vec_code` rowid). This is the embed backlog — a normal, transient
+    /// background state (it does NOT make the index unhealthy). Used by `doctor`.
+    pub fn pending_embeddings_count(&self) -> Result<u64> {
+        let conn = self.conn.lock().map_err(store_err)?;
+        conn.query_row(
+            "SELECT COUNT(*) FROM code_chunks c \
+             WHERE NOT EXISTS (SELECT 1 FROM vec_code v WHERE v.rowid = c.id)",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n as u64)
+        .map_err(store_err)
+    }
+
+    /// Read-only: orphan vectors — `vec_code` rowids with no backing `code_chunks`
+    /// row. The `code_chunks_ad` delete-mirror trigger keeps this at 0; a non-zero
+    /// value means the invariant broke (e.g. a manual delete that bypassed the
+    /// trigger). Used by `doctor` as a hard health signal.
+    pub fn orphan_vectors_count(&self) -> Result<u64> {
+        let conn = self.conn.lock().map_err(store_err)?;
+        conn.query_row(
+            "SELECT COUNT(*) FROM vec_code v \
+             WHERE NOT EXISTS (SELECT 1 FROM code_chunks c WHERE c.id = v.rowid)",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n as u64)
+        .map_err(store_err)
+    }
 }
 
 // ──────────────────────────── read side ────────────────────────────

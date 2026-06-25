@@ -34,6 +34,11 @@ const DEFAULT_N_PROFILE_NOTES: usize = 5;
 #[derive(Clone)]
 pub struct CodeMcpServer {
     store: Arc<SqliteCodeStore>,
+    /// Project root this store was indexed from. Carried so the read-only
+    /// `doctor` tool can reconcile the index against the live source tree on
+    /// disk (it walks `root` exactly as the indexer does). Empty/`.` is harmless
+    /// for stores that never call doctor (e.g. in-memory test fixtures).
+    root: std::path::PathBuf,
     /// Optional embedder for the semantic / hybrid tools. `None` when the binary
     /// could not reach Ollama at startup: semantic tools then return a clear
     /// error and `find_existing` / `get_symbol_context` degrade to lexical-only.
@@ -404,11 +409,13 @@ impl CodeMcpServer {
     /// embedder), `None` to make every memory tool report [`NO_MEMORY_ERR`].
     pub fn new(
         store: Arc<SqliteCodeStore>,
+        root: std::path::PathBuf,
         embedder: Option<Arc<dyn Embedder>>,
         memory: Option<Arc<dyn MemoryStore>>,
     ) -> Self {
         Self {
             store,
+            root,
             embedder,
             memory,
             tool_router: Self::tool_router(),
@@ -421,6 +428,18 @@ impl CodeMcpServer {
         let result = tokio::task::spawn_blocking(move || store.stats()).await;
         match result {
             Ok(Ok(stats)) => to_json(&stats),
+            Ok(Err(e)) => err_json(&e.to_string()),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }
+
+    #[tool(description = "Read-only index health check: drift vs the source tree on disk (missing/outdated/stale files) plus embedding/orphan invariants. Returns a DiagnosticReport as JSON. Re-run `icode index <path>` to heal any reported drift.")]
+    async fn doctor(&self) -> String {
+        let store = self.store.clone();
+        let root = self.root.clone();
+        let result = tokio::task::spawn_blocking(move || icode_engine::diagnose(&store, &root)).await;
+        match result {
+            Ok(Ok(report)) => to_json(&report),
             Ok(Err(e)) => err_json(&e.to_string()),
             Err(e) => err_json(&e.to_string()),
         }
@@ -1204,10 +1223,11 @@ impl ServerHandler for CodeMcpServer {
 /// `Arc<dyn MemoryStore>`, so `icode-serve` never depends on `icode-embed`.
 pub async fn serve_stdio(
     store: Arc<SqliteCodeStore>,
+    root: std::path::PathBuf,
     embedder: Option<Arc<dyn Embedder>>,
     memory: Option<Arc<dyn MemoryStore>>,
 ) -> anyhow::Result<()> {
-    let service = CodeMcpServer::new(store, embedder, memory)
+    let service = CodeMcpServer::new(store, root, embedder, memory)
         .serve((tokio::io::stdin(), tokio::io::stdout()))
         .await?;
     service.waiting().await?;
@@ -1273,7 +1293,7 @@ mod tests {
     #[tokio::test]
     async fn semantic_tools_degrade_without_embedder() {
         let store = Arc::new(SqliteCodeStore::open_in_memory().expect("store"));
-        let server = CodeMcpServer::new(store, None, None);
+        let server = CodeMcpServer::new(store, std::path::PathBuf::from("."), None, None);
 
         let s = server
             .semantic_search_code(Parameters(SemanticSearchArgs {
@@ -1325,7 +1345,7 @@ mod tests {
     #[tokio::test]
     async fn memory_tools_report_unavailable_without_memory() {
         let store = Arc::new(SqliteCodeStore::open_in_memory().expect("store"));
-        let server = CodeMcpServer::new(store, None, None);
+        let server = CodeMcpServer::new(store, std::path::PathBuf::from("."), None, None);
         let want = err_json(NO_MEMORY_ERR);
 
         let add = server
@@ -1396,7 +1416,7 @@ mod tests {
     #[tokio::test]
     async fn recall_degrades_without_embedder_or_memory() {
         let store = Arc::new(SqliteCodeStore::open_in_memory().expect("store"));
-        let server = CodeMcpServer::new(store, None, None);
+        let server = CodeMcpServer::new(store, std::path::PathBuf::from("."), None, None);
 
         let out = server
             .recall(Parameters(RecallArgs {

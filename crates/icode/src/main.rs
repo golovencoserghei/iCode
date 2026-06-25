@@ -46,6 +46,12 @@ enum Command {
         /// Project root whose <path>/.icode/index.db is read.
         path: PathBuf,
     },
+    /// Read-only health check: index drift vs disk + embedding/orphan invariants.
+    /// Exits 0 when healthy, 1 otherwise.
+    Doctor {
+        /// Project root whose <path>/.icode/index.db is diagnosed against disk.
+        path: PathBuf,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -55,6 +61,7 @@ fn main() -> anyhow::Result<()> {
         Command::Embed { path } => run_embed(&path),
         Command::Serve { path } => run_serve(path),
         Command::Stats { path } => run_stats(&path),
+        Command::Doctor { path } => run_doctor(&path),
     }
 }
 
@@ -69,6 +76,47 @@ fn run_stats(path: &std::path::Path) -> anyhow::Result<()> {
     println!("routes:       {}", s.routes);
     println!("parse_errors: {}", s.parse_errors);
     Ok(())
+}
+
+/// Read-only diagnostics: open the store, diagnose drift vs disk + invariants,
+/// print a human-readable report, and exit 0 (healthy) or 1 (drift/invariant
+/// broken). Never panics — a real failure (e.g. can't open the db) is an `Err`.
+fn run_doctor(path: &std::path::Path) -> anyhow::Result<()> {
+    let store = SqliteCodeStore::open(path).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let r = icode_engine::diagnose(&store, path).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    println!("healthy:            {}", if r.healthy { "yes" } else { "no" });
+    println!("files indexed:      {}", r.files_indexed);
+    println!("missing (on disk, not indexed):  {}", r.missing_count);
+    println!("outdated (mtime/size drift):     {}", r.outdated_count);
+    println!("stale (indexed, gone from disk): {}", r.stale_count);
+    println!("parse errors:       {}", r.parse_errors);
+    println!("chunks:             {}", r.chunks);
+    println!("embedded:           {}", r.embedded);
+    println!("pending embeddings: {}", r.pending_embeddings);
+    println!("orphan vectors:     {}", r.orphan_vectors);
+
+    print_examples("missing", &r.missing, r.missing_count);
+    print_examples("outdated", &r.outdated, r.outdated_count);
+    print_examples("stale", &r.stale, r.stale_count);
+
+    if !r.healthy {
+        // Drift / broken invariant is a non-zero exit, but NOT a process error
+        // (the diagnosis itself succeeded). Re-run `icode index <path>` to heal.
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Print up to a few example paths for one drift category (nothing if empty).
+fn print_examples(label: &str, examples: &[String], total: u64) {
+    if examples.is_empty() {
+        return;
+    }
+    println!("  {label} examples ({}/{}):", examples.len(), total);
+    for p in examples.iter().take(10) {
+        println!("    {p}");
+    }
 }
 
 fn run_index(path: &std::path::Path) -> anyhow::Result<()> {
@@ -172,7 +220,9 @@ fn run_serve(path: PathBuf) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
         let store = SqliteCodeStore::open(&path).map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        icode_serve::serve_stdio(Arc::new(store), embedder, memory).await
+        // Pass the project root so the `doctor` MCP tool can reconcile the index
+        // against the live source tree (it walks `root` like the indexer does).
+        icode_serve::serve_stdio(Arc::new(store), path, embedder, memory).await
     })
 }
 

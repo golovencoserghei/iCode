@@ -62,28 +62,34 @@ const EXCLUDED_DIRS: &[&str] = &[
     ".idea",
 ];
 
+/// Walk `root` recursively and yield every *supported* source file path (the same
+/// excludes + extension dispatch the indexer uses). This is the single source of
+/// truth for "which files belong in the index" — both [`index_path`] and the
+/// read-only `doctor` diagnostics walk via this helper so a file the indexer would
+/// skip is never reported as drift.
+///
+/// Returns absolute/`root`-relative paths exactly as `WalkDir` yields them, so a
+/// caller comparing against the `files` table must compare on the same string form
+/// the indexer stored (the indexer stores `path.to_string_lossy()` of this path).
+pub fn walk_source_files(root: &Path) -> Vec<std::path::PathBuf> {
+    WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|e| !is_excluded_dir(e.path()))
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.into_path())
+        .filter(|p| language_for(p).is_some())
+        .collect()
+}
+
 /// Walk `root` recursively, indexing every supported source file (skipping the
 /// build/VCS/dependency directories in [`EXCLUDED_DIRS`]). Each file is parsed and
 /// upserted in one store transaction.
 pub fn index_path(root: &Path, store: &SqliteCodeStore) -> Result<IndexStats> {
     let mut stats = IndexStats::default();
 
-    for entry in WalkDir::new(root)
-        .into_iter()
-        .filter_entry(|e| !is_excluded_dir(e.path()))
-    {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        let path = entry.path();
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        // Skip files we have no parser for (dispatch decides support).
-        if language_for(path).is_none() {
-            continue;
-        }
+    for path in walk_source_files(root) {
+        let path = path.as_path();
 
         match index_file(path, store) {
             Ok(counts) => {

@@ -683,6 +683,7 @@ dependencies = [
  "icode-embed",
  "regex",
  "rusqlite",
+ "serde",
  "serde_json",
  "sha2",
  "sqlite-vec",
