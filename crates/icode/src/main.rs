@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
+use icode_core::traits::CodeReadStore;
 use icode_engine::SqliteCodeStore;
 
 #[derive(Parser)]
@@ -30,6 +31,11 @@ enum Command {
         /// Project root whose <path>/.icode/index.db is served.
         path: PathBuf,
     },
+    /// Open the store at <path> and print code-graph statistics.
+    Stats {
+        /// Project root whose <path>/.icode/index.db is read.
+        path: PathBuf,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -37,7 +43,21 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Index { path } => run_index(&path),
         Command::Serve { path } => run_serve(path),
+        Command::Stats { path } => run_stats(&path),
     }
+}
+
+fn run_stats(path: &std::path::Path) -> anyhow::Result<()> {
+    let store = SqliteCodeStore::open(path).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let s = store.stats().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    println!("files:        {}", s.files);
+    println!("functions:    {}", s.functions);
+    println!("classes:      {}", s.classes);
+    println!("calls:        {}", s.calls);
+    println!("imports:      {}", s.imports);
+    println!("routes:       {}", s.routes);
+    println!("parse_errors: {}", s.parse_errors);
+    Ok(())
 }
 
 fn run_index(path: &std::path::Path) -> anyhow::Result<()> {
