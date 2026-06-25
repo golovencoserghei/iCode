@@ -5,6 +5,7 @@
 //!   `icode index <path>`   — index the tree under <path>, print counters.
 //!   `icode embed <path>`   — embed any pending chunks (catch-up pass).
 //!   `icode serve <path>`   — open the store and serve the MCP protocol over stdio.
+//!   `icode web <path>`     — open the store and serve the local web dashboard (127.0.0.1).
 //!   `icode stats <path>`   — print code-graph statistics.
 //!   `icode doctor <path>`  — read-only index health check (exit 1 on drift).
 //!   `icode setup [path]`   — friendly onboarding: probe Ollama, print MCP config.
@@ -46,6 +47,14 @@ enum Command {
     Serve {
         /// Project root whose <path>/.icode/index.db is served.
         path: PathBuf,
+    },
+    /// Open the store at <path> and serve the local web dashboard on 127.0.0.1.
+    Web {
+        /// Project root whose <path>/.icode/index.db is served.
+        path: PathBuf,
+        /// TCP port to bind on 127.0.0.1 (loopback only). Default 7420.
+        #[arg(long, default_value_t = 7420)]
+        port: u16,
     },
     /// Live daemon: watch a project and keep its index up to date as files change.
     Daemon {
@@ -133,6 +142,7 @@ fn main() -> anyhow::Result<()> {
         Command::Index { path } => run_index(&path),
         Command::Embed { path } => run_embed(&path),
         Command::Serve { path } => run_serve(path),
+        Command::Web { path, port } => run_web(path, port),
         Command::Daemon { action } => match action {
             DaemonAction::Run { path } => run_daemon_cmd(&path),
         },
@@ -481,6 +491,24 @@ fn run_serve(path: PathBuf) -> anyhow::Result<()> {
         // Pass the project root so the `doctor` MCP tool can reconcile the index
         // against the live source tree (it walks `root` like the indexer does).
         icode_serve::serve_stdio(Arc::new(store), path, embedder, memory).await
+    })
+}
+
+/// `icode web <path> [--port N]` — open the store and serve the local web
+/// dashboard on `127.0.0.1:<port>` (default 7420). Mirrors `serve`: builds the
+/// embedder + cross-session memory best-effort BEFORE the async runtime (a down
+/// Ollama degrades code search to lexical and disables the memory views, never
+/// fatal). Binding is loopback-only — the locality invariant is enforced in
+/// `icode-serve::web::serve`, not configurable here. The startup URL is printed
+/// to stderr by the serve layer.
+fn run_web(path: PathBuf, port: u16) -> anyhow::Result<()> {
+    let embedder = build_serve_embedder();
+    let memory = build_serve_memory(embedder.clone());
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async move {
+        let store = SqliteCodeStore::open(&path).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        icode_serve::serve_web(Arc::new(store), embedder, memory, port).await
     })
 }
 

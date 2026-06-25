@@ -6,6 +6,7 @@
 //! rmcp API drift isolated to one routing layer.
 
 pub mod mcp;
-// pub mod web;  // M7
+pub mod web;
 
 pub use mcp::{serve_stdio, CodeMcpServer};
+pub use web::{serve as serve_web, WebState};
