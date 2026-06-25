@@ -43,7 +43,7 @@ static VEC_INIT: Once = Once::new();
 /// Mirrors the proven `spikes/vec_spike.rs` path: register the C init function
 /// via `sqlite3_auto_extension`. `Once` makes a double registration impossible
 /// even across threads (a second registration is harmless but wasteful).
-fn register_sqlite_vec() {
+pub(crate) fn register_sqlite_vec() {
     VEC_INIT.call_once(|| {
         // SAFETY: transmuting the well-typed `sqlite3_vec_init` to the
         // `sqlite3_auto_extension` entry-point signature is the documented usage
