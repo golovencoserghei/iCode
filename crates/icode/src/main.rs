@@ -1,9 +1,14 @@
 //! `icode` — thin CLI dispatcher. Subcommands delegate to the engine or serve
 //! layer; no business logic lives here.
 //!
-//! M0.5 walking skeleton wires two commands:
-//!   `icode index <path>`  — index the tree under <path>, print counters.
-//!   `icode serve <path>`  — open the store and serve the MCP protocol over stdio.
+//! Commands:
+//!   `icode index <path>`   — index the tree under <path>, print counters.
+//!   `icode embed <path>`   — embed any pending chunks (catch-up pass).
+//!   `icode serve <path>`   — open the store and serve the MCP protocol over stdio.
+//!   `icode stats <path>`   — print code-graph statistics.
+//!   `icode doctor <path>`  — read-only index health check (exit 1 on drift).
+//!   `icode setup [path]`   — friendly onboarding: probe Ollama, print MCP config.
+//!   `icode mcp-config [p]` — print only the Claude Code MCP registration JSON.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -52,6 +57,19 @@ enum Command {
         /// Project root whose <path>/.icode/index.db is diagnosed against disk.
         path: PathBuf,
     },
+    /// Friendly onboarding: probe Ollama (pull the embedding model if missing),
+    /// print the Claude Code MCP registration snippet, and list the next steps.
+    /// Never panics — a down Ollama just degrades to lexical-only and keeps going.
+    Setup {
+        /// Optional project root to bake into the MCP snippet (else a placeholder).
+        project_path: Option<PathBuf>,
+    },
+    /// Print ONLY the Claude Code MCP registration JSON for this binary to stdout
+    /// (so `icode mcp-config /my/proj > .mcp.json` works). No other output.
+    McpConfig {
+        /// Optional project root to bake into the snippet (else a placeholder).
+        project_path: Option<PathBuf>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -62,6 +80,8 @@ fn main() -> anyhow::Result<()> {
         Command::Serve { path } => run_serve(path),
         Command::Stats { path } => run_stats(&path),
         Command::Doctor { path } => run_doctor(&path),
+        Command::Setup { project_path } => run_setup(project_path.as_deref()),
+        Command::McpConfig { project_path } => run_mcp_config(project_path.as_deref()),
     }
 }
 
@@ -199,6 +219,172 @@ fn report_pending(store: &SqliteCodeStore, model: &str, reason: &str) {
         .map(|p| p.len())
         .unwrap_or(0);
     println!("{pending} chunks pending embedding (ollama unavailable: {reason})");
+}
+
+// ──────────────────────────── setup / mcp-config ────────────────────────────
+
+/// Absolute path to THIS binary, for the MCP `command` field. Falls back to the
+/// bare name `icode` (resolved via PATH) when the exe path can't be determined.
+fn icode_exe_path() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string))
+        .unwrap_or_else(|| "icode".to_string())
+}
+
+/// Render the Claude Code MCP registration snippet for this binary. `project`
+/// is the path baked into `args` (a placeholder when the user gave none). Built
+/// by hand (no serde_json dep in the bin) but kept strictly valid: the only
+/// interpolated values are filesystem paths, which we JSON-escape.
+fn mcp_config_json(project: &str) -> String {
+    let exe = json_escape(&icode_exe_path());
+    let proj = json_escape(project);
+    format!(
+        "{{\n  \"mcpServers\": {{\n    \"icode\": {{\n      \"command\": \"{exe}\",\n      \"args\": [\"serve\", \"{proj}\"]\n    }}\n  }}\n}}"
+    )
+}
+
+/// Minimal JSON string escaping (backslash, quote, and the control chars that
+/// can appear in a path). Enough to keep the hand-built snippet valid.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// The project path to bake into the snippet: the absolute form of the user's
+/// argument when given (so the registration is portable), else a placeholder.
+fn snippet_project(project_path: Option<&std::path::Path>) -> String {
+    match project_path {
+        Some(p) => std::fs::canonicalize(p)
+            .ok()
+            .and_then(|c| c.to_str().map(str::to_string))
+            .unwrap_or_else(|| p.display().to_string()),
+        None => "/path/to/project".to_string(),
+    }
+}
+
+/// `icode mcp-config [project]` — print ONLY the JSON registration snippet to
+/// stdout (pipe-friendly: `icode mcp-config /my/proj > .mcp.json`).
+fn run_mcp_config(project_path: Option<&std::path::Path>) -> anyhow::Result<()> {
+    println!("{}", mcp_config_json(&snippet_project(project_path)));
+    Ok(())
+}
+
+/// `icode setup [project]` — friendly onboarding. Probes Ollama (pulling the
+/// embedding model if it's missing), prints the MCP registration snippet, and
+/// lists the next steps. Never panics and never returns `Err`: a down/incomplete
+/// Ollama degrades to lexical-only and the rest of the guidance still prints.
+fn run_setup(project_path: Option<&std::path::Path>) -> anyhow::Result<()> {
+    println!("iCode setup — local code-graph + memory RAG\n");
+
+    // Step 1: Ollama / embedding model.
+    println!("1. Checking Ollama (embedding backend)");
+    let cfg = EmbedConfig::default();
+    check_ollama(&cfg);
+
+    // Step 2: MCP registration snippet.
+    let project = snippet_project(project_path);
+    println!("\n2. Connect iCode to Claude Code (MCP server)");
+    println!("   Add this to `.mcp.json` in your project root (or your");
+    println!("   `~/.claude` settings) so Claude Code launches the iCode server:\n");
+    for line in mcp_config_json(&project).lines() {
+        println!("   {line}");
+    }
+    if project_path.is_none() {
+        println!("\n   (replace `/path/to/project` with the project you want indexed,");
+        println!("    or re-run `icode setup <project_path>` to bake it in.)");
+    }
+
+    // Step 3: next steps.
+    let hint = project_path.map(|_| project.as_str()).unwrap_or("<project>");
+    println!("\n3. Next steps");
+    println!("   icode index  {hint}    # build the code-graph + embeddings");
+    println!("   icode doctor {hint}    # verify the index is healthy");
+    println!("   then connect the MCP server above and use `recall` from Claude Code");
+
+    Ok(())
+}
+
+/// Probe Ollama for `setup`: build the embedder, run its health check, and on a
+/// missing model attempt `ollama pull <model>` before re-probing. Prints a clear
+/// status for every branch; on hard unavailability it prints how to start Ollama
+/// and notes the lexical-only fallback. Never returns an error.
+fn check_ollama(cfg: &EmbedConfig) {
+    let embedder = match icode_embed::build_embedder(cfg) {
+        Ok(e) => e,
+        Err(e) => {
+            println!("   ! could not build embedder: {e}");
+            println!("   → semantic search and cross-session memory will be disabled");
+            println!("     (lexical code tools still work).");
+            return;
+        }
+    };
+
+    // First probe. Success = Ollama up AND the model is present.
+    if embedder.health().is_ok() {
+        println!(
+            "   ✓ Ollama reachable, model {} ready",
+            embedder.model_id()
+        );
+        return;
+    }
+
+    // Health failed. Distinguish "Ollama down" from "model missing" by checking
+    // reachability cheaply: if a pull connects, Ollama is up and we just lacked
+    // the model. We try the pull unconditionally — it's the right action for the
+    // common "fresh machine, model not pulled yet" case, and a clean no-op when
+    // the model is already there.
+    println!(
+        "   model {} not ready — attempting `ollama pull {}`",
+        embedder.model_id(),
+        embedder.model_id()
+    );
+    if try_pull_model(embedder.model_id()) {
+        // Re-probe after a successful pull.
+        if embedder.health().is_ok() {
+            println!(
+                "   ✓ Ollama reachable, model {} ready",
+                embedder.model_id()
+            );
+            return;
+        }
+        println!("   ! pull finished but health still failing for {}", embedder.model_id());
+    }
+
+    // Either the pull failed to run (ollama binary missing / daemon down) or it
+    // ran but health still fails. Give the actionable hint and degrade.
+    println!("   ! Ollama not available — start it with: ollama serve");
+    println!("     (then re-run `icode setup`; semantic/memory are disabled until then,");
+    println!("      lexical code tools work regardless.)");
+}
+
+/// Run `ollama pull <model>`, streaming its output to the terminal and waiting
+/// for completion. Returns `true` only when the command ran AND exited 0.
+/// Any failure to even launch `ollama` (not installed / daemon down) is caught
+/// and reported as `false` — never panics.
+fn try_pull_model(model: &str) -> bool {
+    use std::process::Command;
+    match Command::new("ollama").arg("pull").arg(model).status() {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            println!("   ! `ollama pull {model}` exited with {status}");
+            false
+        }
+        Err(e) => {
+            println!("   ! could not run `ollama pull {model}`: {e}");
+            false
+        }
+    }
 }
 
 fn run_serve(path: PathBuf) -> anyhow::Result<()> {
