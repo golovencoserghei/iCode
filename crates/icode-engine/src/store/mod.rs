@@ -21,6 +21,11 @@ use icode_core::traits::{CodeReadStore, CodeWriteStore};
 use regex::Regex;
 use rusqlite::Connection;
 
+/// Schema generation. Bumped whenever the on-disk layout changes incompatibly;
+/// a per-project index with a different `PRAGMA user_version` is discarded and
+/// rebuilt from source (the index is disposable).
+const SCHEMA_VERSION: i64 = 1;
+
 /// Map any rusqlite error into the framework-free `Error::Store` variant.
 fn store_err<E: std::fmt::Display>(e: E) -> Error {
     Error::Store(e.to_string())
@@ -34,24 +39,49 @@ pub struct SqliteCodeStore {
 impl SqliteCodeStore {
     /// Open (creating if needed) the index db under `<root>/.icode/index.db`.
     /// Creates the `.icode` directory, sets WAL + foreign_keys, applies schema.
+    ///
+    /// If an existing db carries an incompatible `user_version` (an older iCode
+    /// schema, or a stale `.icode` left by a different tool that reused the path),
+    /// it is deleted and rebuilt rather than crashing on a schema mismatch — the
+    /// per-project index is regenerable from source.
     pub fn open(root: &Path) -> Result<Self> {
         let dir = root.join(".icode");
         std::fs::create_dir_all(&dir).map_err(|e| Error::Io(e.to_string()))?;
         let db_path = dir.join("index.db");
+
+        if db_path.exists() && !Self::db_is_current(&db_path)? {
+            // Discard the incompatible db and its WAL/SHM sidecars.
+            let _ = std::fs::remove_file(&db_path);
+            let _ = std::fs::remove_file(dir.join("index.db-wal"));
+            let _ = std::fs::remove_file(dir.join("index.db-shm"));
+        }
+
         let conn = Connection::open(&db_path).map_err(store_err)?;
         Self::from_conn(conn)
     }
 
-    /// Open an in-memory store (tests / ephemeral use).
+    /// Open an in-memory store (tests / ephemeral use). Always fresh.
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory().map_err(store_err)?;
         Self::from_conn(conn)
+    }
+
+    /// Read `PRAGMA user_version` from an existing db file via a throwaway
+    /// connection (dropped before the caller may delete the file).
+    fn db_is_current(db_path: &Path) -> Result<bool> {
+        let conn = Connection::open(db_path).map_err(store_err)?;
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .map_err(store_err)?;
+        Ok(v == SCHEMA_VERSION)
     }
 
     fn from_conn(conn: Connection) -> Result<Self> {
         conn.pragma_update(None, "journal_mode", "WAL").map_err(store_err)?;
         conn.pragma_update(None, "foreign_keys", "ON").map_err(store_err)?;
         conn.execute_batch(schema::SCHEMA).map_err(store_err)?;
+        // Stamp the schema generation so a future incompatible version is detected.
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION).map_err(store_err)?;
         Ok(Self { conn: Mutex::new(conn) })
     }
 
