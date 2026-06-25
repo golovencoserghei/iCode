@@ -68,6 +68,26 @@ pub fn chunks_for_file(functions: &[FunctionDef], classes: &[ClassDef]) -> Vec<C
     out
 }
 
+/// The embeddable text for one function symbol: the same parent-context header +
+/// body that [`chunks_for_file`] produces for the FIRST chunk of the symbol.
+///
+/// `find_similar` (search service) embeds a symbol to query the vector index, and
+/// the query vector MUST be computed exactly like the index-time vector or the KNN
+/// is comparing apples to oranges. Reusing [`function_header`] guarantees that.
+/// (An oversized symbol is split into `part i/N` sub-chunks at index time; this
+/// helper returns the un-split `header+body`, which is the right query text — we
+/// want the whole symbol's centroid, not one slice — and is identical to the
+/// single-chunk case that covers the overwhelming majority of symbols.)
+pub fn chunk_text_for_function(f: &FunctionDef) -> String {
+    format!("{}{}", function_header(f), f.body)
+}
+
+/// The embeddable text for one class symbol (see [`chunk_text_for_function`] for
+/// why the builder is shared with the index path).
+pub fn chunk_text_for_class(c: &ClassDef) -> String {
+    format!("{}{}", class_header(c), c.body)
+}
+
 /// Parent-context header for a function chunk: file path, qualified name with the
 /// argument list, and the docstring (when present), each on its own comment line.
 fn function_header(f: &FunctionDef) -> String {

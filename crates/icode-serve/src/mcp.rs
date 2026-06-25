@@ -8,16 +8,25 @@
 use std::sync::Arc;
 
 use icode_core::model::{CodeQuery, Language, SearchMode, SymbolKind};
-use icode_core::traits::CodeReadStore;
+use icode_core::traits::{CodeReadStore, Embedder};
 use icode_engine::SqliteCodeStore;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 
+/// Error string returned by the semantic tools when no embedder was wired up
+/// (Ollama unreachable at startup). The server stays useful in lexical-only mode.
+const NO_EMBEDDER_ERR: &str =
+    "semantic search unavailable: no embedder (is ollama running?)";
+
 #[derive(Clone)]
 pub struct CodeMcpServer {
     store: Arc<SqliteCodeStore>,
+    /// Optional embedder for the semantic / hybrid tools. `None` when the binary
+    /// could not reach Ollama at startup: semantic tools then return a clear
+    /// error and `find_existing` / `get_symbol_context` degrade to lexical-only.
+    embedder: Option<Arc<dyn Embedder>>,
     // Consumed by the `#[tool_handler]` macro expansion (routes tool calls);
     // dead-code analysis can't see that path, so the read is suppressed here.
     #[allow(dead_code)]
@@ -62,6 +71,23 @@ pub struct FindExistingArgs {
     pub query: String,
     /// Restrict to one symbol kind: "function" or "class" (default: both).
     pub kind: Option<String>,
+    /// Max hits to return (default 10).
+    pub limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct SemanticSearchArgs {
+    /// Natural-language description of the behaviour/code you want to find.
+    pub query: String,
+    /// Max hits to return (default 10).
+    pub limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct FindSimilarArgs {
+    /// Qualified name of an existing symbol to find semantic neighbours of
+    /// (e.g. "TreeWalker::walk" or "parse_rust_source").
+    pub qualified_name: String,
     /// Max hits to return (default 10).
     pub limit: Option<usize>,
 }
@@ -200,8 +226,10 @@ pub struct ReadFileArgs {
 
 #[tool_router]
 impl CodeMcpServer {
-    pub fn new(store: Arc<SqliteCodeStore>) -> Self {
-        Self { store, tool_router: Self::tool_router() }
+    /// Construct the server. `embedder` is `Some` when semantic/hybrid search is
+    /// available, `None` for lexical-only (Ollama down at startup).
+    pub fn new(store: Arc<SqliteCodeStore>, embedder: Option<Arc<dyn Embedder>>) -> Self {
+        Self { store, embedder, tool_router: Self::tool_router() }
     }
 
     #[tool(description = "Return code-graph statistics (file/function/class/call/import/route counts) as JSON.")]
@@ -227,11 +255,28 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Everything about a symbol in one call: definition, callers, callees, imports, routes, implementations.")]
+    #[tool(description = "Everything about a symbol in one call: definition, callers, callees, imports, routes, implementations, and (when an embedder is available) semantically similar symbols.")]
     async fn get_symbol_context(&self, Parameters(args): Parameters<SymbolContextArgs>) -> String {
         let store = self.store.clone();
+        let embedder = self.embedder.clone();
         let result = tokio::task::spawn_blocking(move || {
-            store.symbol_context(&args.name, args.file_hint.as_deref())
+            let mut ctx = store.symbol_context(&args.name, args.file_hint.as_deref())?;
+            // Enrich `similar_symbols` semantically when an embedder is wired up.
+            // Best-effort: a vector/embed failure must NOT sink the whole context
+            // call, so it leaves `similar_symbols` empty rather than erroring.
+            // With no embedder the field stays empty (the store left it empty).
+            if let Some(emb) = embedder.as_deref() {
+                if let Some(def) = ctx.definition.as_ref() {
+                    let qn = match def {
+                        icode_core::model::FunctionOrClass::Function(f) => f.qualified_name.clone(),
+                        icode_core::model::FunctionOrClass::Class(c) => c.qualified_name.clone(),
+                    };
+                    if let Ok(similar) = icode_engine::find_similar(&store, emb, &qn, 5) {
+                        ctx.similar_symbols = similar;
+                    }
+                }
+            }
+            Ok::<_, icode_core::error::Error>(ctx)
         })
         .await;
         match result {
@@ -279,7 +324,7 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Find existing functions/classes that already do what you describe (avoid duplicate work). Lexical for now; JSON array of CodeHit.")]
+    #[tool(description = "Find existing functions/classes that already do what you describe (avoid duplicate work). Semantic+lexical RRF fusion when an embedder is available, else lexical-only. JSON array of CodeHit.")]
     async fn find_existing(&self, Parameters(args): Parameters<FindExistingArgs>) -> String {
         let kind = match args.kind.as_deref() {
             None | Some("") | Some("all") => Ok(None),
@@ -292,15 +337,70 @@ impl CodeMcpServer {
             Err(e) => return err_json(&e),
         };
         let store = self.store.clone();
-        let query = CodeQuery {
-            text: args.query,
-            kind,
-            lang: None,
-            limit: args.limit.unwrap_or(10),
-            mode: SearchMode::Hybrid,
-            with_body: false,
+        let embedder = self.embedder.clone();
+        let limit = args.limit.unwrap_or(10);
+        let query = args.query;
+        let result = tokio::task::spawn_blocking(move || {
+            // Embedder present → semantic+lexical RRF (catches duplicates that use
+            // different words). Note: hybrid fuses BOTH symbol kinds; the `kind`
+            // filter is honoured only on the lexical-only fallback path, where the
+            // store applies it. (Kind-filtering a fused result would drop signal;
+            // documented limitation — pass kind only when you need lexical-only.)
+            match embedder.as_deref() {
+                Some(emb) if kind.is_none() => {
+                    icode_engine::hybrid_search(&store, emb, &query, limit)
+                }
+                _ => store.search_code(&CodeQuery {
+                    text: query,
+                    kind,
+                    lang: None,
+                    limit,
+                    mode: SearchMode::Hybrid,
+                    with_body: false,
+                }),
+            }
+        })
+        .await;
+        match result {
+            Ok(Ok(hits)) => to_json(&hits),
+            Ok(Err(e)) => err_json(&e.to_string()),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }
+
+    #[tool(description = "Semantic (vector KNN) search over the code base by natural-language meaning. Requires an embedder (Ollama); JSON array of CodeHit or an error if unavailable.")]
+    async fn semantic_search_code(&self, Parameters(args): Parameters<SemanticSearchArgs>) -> String {
+        let emb = match self.embedder.clone() {
+            Some(e) => e,
+            None => return err_json(NO_EMBEDDER_ERR),
         };
-        let result = tokio::task::spawn_blocking(move || store.search_code(&query)).await;
+        let store = self.store.clone();
+        let limit = args.limit.unwrap_or(10);
+        let query = args.query;
+        let result = tokio::task::spawn_blocking(move || {
+            icode_engine::semantic_search(&store, emb.as_ref(), &query, limit)
+        })
+        .await;
+        match result {
+            Ok(Ok(hits)) => to_json(&hits),
+            Ok(Err(e)) => err_json(&e.to_string()),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }
+
+    #[tool(description = "Find symbols semantically similar to an existing symbol (by qualified name). Requires an embedder (Ollama); the symbol itself is excluded. JSON array of CodeHit or an error if unavailable.")]
+    async fn find_similar(&self, Parameters(args): Parameters<FindSimilarArgs>) -> String {
+        let emb = match self.embedder.clone() {
+            Some(e) => e,
+            None => return err_json(NO_EMBEDDER_ERR),
+        };
+        let store = self.store.clone();
+        let limit = args.limit.unwrap_or(10);
+        let qn = args.qualified_name;
+        let result = tokio::task::spawn_blocking(move || {
+            icode_engine::find_similar(&store, emb.as_ref(), &qn, limit)
+        })
+        .await;
         match result {
             Ok(Ok(hits)) => to_json(&hits),
             Ok(Err(e)) => err_json(&e.to_string()),
@@ -565,9 +665,13 @@ impl ServerHandler for CodeMcpServer {
     }
 }
 
-/// Serve the MCP protocol over stdio until the client disconnects.
-pub async fn serve_stdio(store: Arc<SqliteCodeStore>) -> anyhow::Result<()> {
-    let service = CodeMcpServer::new(store)
+/// Serve the MCP protocol over stdio until the client disconnects. `embedder` is
+/// `Some` to enable the semantic/hybrid tools, `None` for lexical-only.
+pub async fn serve_stdio(
+    store: Arc<SqliteCodeStore>,
+    embedder: Option<Arc<dyn Embedder>>,
+) -> anyhow::Result<()> {
+    let service = CodeMcpServer::new(store, embedder)
         .serve((tokio::io::stdin(), tokio::io::stdout()))
         .await?;
     service.waiting().await?;
@@ -603,4 +707,62 @@ fn to_json<T: serde::Serialize>(value: &T) -> String {
 
 fn err_json(msg: &str) -> String {
     serde_json::json!({ "error": msg }).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// No-Ollama (lexical-only) behaviour: with `embedder: None` the semantic
+    /// tools must return the documented unavailable-error JSON, and the degrading
+    /// tools (`find_existing`, `get_symbol_context`) must still succeed lexically
+    /// with an empty `similar_symbols`. Deterministic — no network involved.
+    #[tokio::test]
+    async fn semantic_tools_degrade_without_embedder() {
+        let store = Arc::new(SqliteCodeStore::open_in_memory().expect("store"));
+        let server = CodeMcpServer::new(store, None);
+
+        let s = server
+            .semantic_search_code(Parameters(SemanticSearchArgs {
+                query: "anything".into(),
+                limit: None,
+            }))
+            .await;
+        assert_eq!(s, err_json(NO_EMBEDDER_ERR), "semantic_search_code reports unavailable");
+
+        let fs = server
+            .find_similar(Parameters(FindSimilarArgs {
+                qualified_name: "whatever".into(),
+                limit: None,
+            }))
+            .await;
+        assert_eq!(fs, err_json(NO_EMBEDDER_ERR), "find_similar reports unavailable");
+
+        // find_existing degrades to lexical-only and must NOT error (empty db → []).
+        let fe = server
+            .find_existing(Parameters(FindExistingArgs {
+                query: "read a file".into(),
+                kind: None,
+                limit: Some(5),
+            }))
+            .await;
+        assert_eq!(fe, "[]", "find_existing degrades to lexical (empty db → [])");
+
+        // get_symbol_context on an unknown symbol returns a context with empty
+        // similar_symbols (no embedder to enrich it).
+        let ctx = server
+            .get_symbol_context(Parameters(SymbolContextArgs {
+                name: "unknown_symbol".into(),
+                file_hint: None,
+            }))
+            .await;
+        let v: serde_json::Value = serde_json::from_str(&ctx).expect("ctx json");
+        assert!(
+            v.get("similar_symbols")
+                .and_then(|s| s.as_array())
+                .map(|a| a.is_empty())
+                .unwrap_or(false),
+            "similar_symbols is empty without an embedder, got {ctx}"
+        );
+    }
 }

@@ -154,10 +154,40 @@ fn report_pending(store: &SqliteCodeStore, model: &str, reason: &str) {
 }
 
 fn run_serve(path: PathBuf) -> anyhow::Result<()> {
+    // Build the embedder best-effort BEFORE entering the async runtime (the build
+    // + health probe are blocking). A down/unreachable Ollama must NOT fail
+    // `serve` — the code-graph tools stay fully useful; only the semantic/hybrid
+    // tools degrade. We report which mode we ended up in on stderr (stdout is the
+    // MCP stdio transport and must carry only protocol frames).
+    let embedder = build_serve_embedder();
+
     // Serving is async (rmcp/tokio); the rest of the CLI stays sync.
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
         let store = SqliteCodeStore::open(&path).map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        icode_serve::serve_stdio(Arc::new(store)).await
+        icode_serve::serve_stdio(Arc::new(store), embedder).await
     })
+}
+
+/// Build the configured embedder for `serve`, probing its health, and report the
+/// resulting mode on stderr. Returns `Some(Arc<dyn Embedder>)` when ready, or
+/// `None` (lexical-only) on any build/health failure — `serve` never fails here.
+fn build_serve_embedder() -> Option<Arc<dyn icode_core::traits::Embedder>> {
+    use icode_core::traits::Embedder;
+    let cfg = EmbedConfig::default();
+    let embedder = match icode_embed::build_embedder(&cfg) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("semantic search disabled: {e} (lexical only)");
+            return None;
+        }
+    };
+    if let Err(e) = embedder.health() {
+        eprintln!("semantic search disabled: {e} (lexical only)");
+        return None;
+    }
+    eprintln!("semantic search enabled (model {})", embedder.model_id());
+    // Box<dyn Embedder> → Arc<dyn Embedder>.
+    let arc: Arc<dyn Embedder> = Arc::from(embedder);
+    Some(arc)
 }
