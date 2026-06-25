@@ -8,3 +8,6 @@ description = "iCode v2 embedders: Ollama (default) + fastembed ONNX fallback (i
 [dependencies]
 icode-core = { workspace = true }
 anyhow = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
