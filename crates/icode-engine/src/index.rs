@@ -1,5 +1,7 @@
-//! Indexer: walk a directory tree, parse each `.rs` file, persist files +
-//! functions through the `CodeWriteStore`. M0.5 scope: Rust only, no embeddings.
+//! Indexer: walk a directory tree, parse each source file by extension, and
+//! persist the full code graph (files + functions + classes + imports + calls +
+//! routes) through the `CodeWriteStore`. M1 scope: Rust parser wired; the
+//! extension dispatch leaves a slot for `.py` (and others) to plug in later.
 
 use std::path::Path;
 
@@ -9,7 +11,7 @@ use icode_core::traits::CodeWriteStore;
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
-use crate::parse::parse_rust;
+use crate::parse::{parse_rust, ParseResult};
 use crate::store::SqliteCodeStore;
 
 /// Counters returned by an indexing run.
@@ -17,11 +19,16 @@ use crate::store::SqliteCodeStore;
 pub struct IndexStats {
     pub files_indexed: u64,
     pub functions: u64,
+    pub classes: u64,
+    pub imports: u64,
+    pub calls: u64,
+    pub routes: u64,
     pub errors: u64,
 }
 
-/// Walk `root` recursively, indexing every `.rs` file (skipping `target` and
-/// `.git`). Each file is parsed and upserted in one store transaction.
+/// Walk `root` recursively, indexing every supported source file (skipping
+/// `target`, `.git`, `node_modules`, `vendor`). Each file is parsed and upserted
+/// in one store transaction.
 pub fn index_path(root: &Path, store: &SqliteCodeStore) -> Result<IndexStats> {
     let mut stats = IndexStats::default();
 
@@ -37,14 +44,19 @@ pub fn index_path(root: &Path, store: &SqliteCodeStore) -> Result<IndexStats> {
         if !entry.file_type().is_file() {
             continue;
         }
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+        // Skip files we have no parser for (dispatch decides support).
+        if language_for(path).is_none() {
             continue;
         }
 
         match index_file(path, store) {
-            Ok(n_funcs) => {
+            Ok(counts) => {
                 stats.files_indexed += 1;
-                stats.functions += n_funcs;
+                stats.functions += counts.functions;
+                stats.classes += counts.classes;
+                stats.imports += counts.imports;
+                stats.calls += counts.calls;
+                stats.routes += counts.routes;
             }
             Err(e) => {
                 stats.errors += 1;
@@ -57,11 +69,22 @@ pub fn index_path(root: &Path, store: &SqliteCodeStore) -> Result<IndexStats> {
     Ok(stats)
 }
 
-fn index_file(path: &Path, store: &SqliteCodeStore) -> Result<u64> {
+/// Per-file node counts (rolled up into `IndexStats`).
+#[derive(Clone, Copy, Default)]
+struct FileCounts {
+    functions: u64,
+    classes: u64,
+    imports: u64,
+    calls: u64,
+    routes: u64,
+}
+
+fn index_file(path: &Path, store: &SqliteCodeStore) -> Result<FileCounts> {
+    let language = language_for(path).ok_or_else(|| Error::Invalid("unsupported extension".into()))?;
     let source = std::fs::read_to_string(path).map_err(|e| Error::Io(e.to_string()))?;
     let path_str = path.to_string_lossy().to_string();
 
-    let parsed = parse_rust(&source, &path_str);
+    let parsed = parse_for(language, &source, &path_str);
 
     let meta = std::fs::metadata(path).map_err(|e| Error::Io(e.to_string()))?;
     let mtime = meta
@@ -73,7 +96,7 @@ fn index_file(path: &Path, store: &SqliteCodeStore) -> Result<u64> {
 
     let file = FileRecord {
         path: path_str,
-        language: Language::Rust,
+        language,
         content_hash: content_hash(&source),
         ast_hash: parsed.ast_hash.clone(),
         lines_total: parsed.lines_total,
@@ -81,9 +104,45 @@ fn index_file(path: &Path, store: &SqliteCodeStore) -> Result<u64> {
         file_size: meta.len(),
     };
 
-    let n = parsed.functions.len() as u64;
-    store.upsert_file(&file, &parsed.functions, &[], &[], &[], &[])?;
-    Ok(n)
+    let counts = FileCounts {
+        functions: parsed.functions.len() as u64,
+        classes: parsed.classes.len() as u64,
+        imports: parsed.imports.len() as u64,
+        calls: parsed.calls.len() as u64,
+        routes: parsed.routes.len() as u64,
+    };
+    store.upsert_file(
+        &file,
+        &parsed.functions,
+        &parsed.classes,
+        &parsed.imports,
+        &parsed.calls,
+        &parsed.routes,
+    )?;
+    Ok(counts)
+}
+
+/// Map a path's extension to a language we have a parser for. Returns `None` for
+/// unsupported files so the walk skips them. `.py` (etc.) plug in here later.
+fn language_for(path: &Path) -> Option<Language> {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("rs") => Some(Language::Rust),
+        _ => None,
+    }
+}
+
+/// Dispatch to the per-language parser. Only Rust is wired in M1; the match arm
+/// is the single extension point other parsers slot into.
+fn parse_for(language: Language, source: &str, path: &str) -> ParseResult {
+    match language {
+        Language::Rust => parse_rust(source, path),
+        // Other languages land with their parsers (M3); until then, no nodes.
+        _ => ParseResult {
+            lines_total: source.lines().count().max(1) as u32,
+            ast_hash: content_hash(source),
+            ..Default::default()
+        },
+    }
 }
 
 fn content_hash(source: &str) -> String {
@@ -97,10 +156,10 @@ fn content_hash(source: &str) -> String {
     out
 }
 
-/// Exclude `target` and `.git` (and any nested copies) from the walk.
+/// Exclude build/VCS/dependency dirs (and any nested copies) from the walk.
 fn is_excluded_dir(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
-        .map(|n| n == "target" || n == ".git")
+        .map(|n| matches!(n, "target" | ".git" | "node_modules" | "vendor"))
         .unwrap_or(false)
 }

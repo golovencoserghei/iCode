@@ -1,7 +1,13 @@
-//! Rust parser (tree-sitter). Extracts top-level functions and `impl` methods
-//! with name, qualified_name, span (1-based), args text, async flag, and body.
+//! Rust parser (tree-sitter). Extracts the full M1 node set:
+//!
+//! - functions: top-level `fn` and `impl` methods (`Type::method`),
+//! - classes:   struct / enum / trait / union items (trait → supertraits as bases),
+//! - imports:   `use` declarations,
+//! - calls:     free / method / associated calls, attributed to the enclosing fn.
+//!
+//! Routes stay empty (Rust has no framework route DSL in scope here).
 
-use icode_core::model::{FunctionDef, Language};
+use icode_core::model::{Call, ClassDef, FunctionDef, Import, Language};
 use sha2::{Digest, Sha256};
 use tree_sitter::{Node, Parser};
 
@@ -16,66 +22,112 @@ pub fn parse_rust(source: &str, path: &str) -> ParseResult {
 
     let mut parser = Parser::new();
     if parser.set_language(&tree_sitter_rust::LANGUAGE.into()).is_err() {
-        return ParseResult { functions: vec![], lines_total, ast_hash };
+        return ParseResult { lines_total, ast_hash, ..Default::default() };
     }
     let tree = match parser.parse(source, None) {
         Some(t) => t,
-        None => return ParseResult { functions: vec![], lines_total, ast_hash },
+        None => return ParseResult { lines_total, ast_hash, ..Default::default() },
     };
 
-    let mut functions = Vec::new();
     let bytes = source.as_bytes();
-    walk(tree.root_node(), bytes, path, None, &mut functions);
+    let mut acc = Acc::default();
+    walk(tree.root_node(), bytes, path, &Ctx::default(), &mut acc);
 
-    ParseResult { functions, lines_total, ast_hash }
+    ParseResult {
+        lines_total,
+        ast_hash,
+        functions: acc.functions,
+        classes: acc.classes,
+        imports: acc.imports,
+        calls: acc.calls,
+        routes: Vec::new(),
+    }
+}
+
+/// Accumulated nodes for one file.
+#[derive(Default)]
+struct Acc {
+    functions: Vec<FunctionDef>,
+    classes: Vec<ClassDef>,
+    imports: Vec<Import>,
+    calls: Vec<Call>,
+}
+
+/// Lexical context carried down the walk. Owned (cloned at the few nesting
+/// boundaries — impl/fn entry) to keep the recursion lifetime-free.
+#[derive(Clone, Default)]
+struct Ctx {
+    /// Enclosing `impl <Type>` name (so methods get a `Type::method` qualified name).
+    impl_type: Option<String>,
+    /// Qualified name of the enclosing function/method (the call `caller`).
+    caller: Option<String>,
 }
 
 fn hash_source(source: &str) -> String {
     let mut h = Sha256::new();
     h.update(source.as_bytes());
-    let digest = h.finalize();
-    let mut out = String::with_capacity(64);
-    for b in digest {
+    hex(&h.finalize())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
         out.push_str(&format!("{b:02x}"));
     }
     out
 }
 
-/// Recursively collect `function_item` nodes. `impl_type` carries the enclosing
-/// `impl <Type>` name so methods get a `Type::method` qualified name.
-fn walk(node: Node<'_>, src: &[u8], path: &str, impl_type: Option<&str>, out: &mut Vec<FunctionDef>) {
+/// Recursive descent. Functions/classes/imports are extracted on the way down;
+/// `Ctx` threads the enclosing impl type and caller so methods and calls are
+/// attributed correctly.
+fn walk(node: Node<'_>, src: &[u8], path: &str, ctx: &Ctx, acc: &mut Acc) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
             "function_item" => {
-                if let Some(f) = extract_function(child, src, path, impl_type) {
-                    out.push(f);
+                if let Some(f) = extract_function(child, src, path, ctx.impl_type.as_deref()) {
+                    let qname = f.qualified_name.clone();
+                    acc.functions.push(f);
+                    // Recurse into the body with this function as the caller.
+                    let inner = Ctx { impl_type: ctx.impl_type.clone(), caller: Some(qname) };
+                    walk(child, src, path, &inner, acc);
                 }
             }
             "impl_item" => {
                 let ty = impl_type_name(child, src);
-                // Descend into the impl body to pick up its methods.
                 if let Some(body) = child.child_by_field_name("body") {
-                    walk(body, src, path, ty.as_deref(), out);
+                    let inner = Ctx { impl_type: ty, caller: ctx.caller.clone() };
+                    walk(body, src, path, &inner, acc);
                 }
             }
-            // Modules / blocks nest free functions; recurse with the same context.
-            "mod_item" | "source_file" | "declaration_list" | "block" => {
-                walk(child, src, path, impl_type, out);
+            "struct_item" | "enum_item" | "trait_item" | "union_item" => {
+                if let Some(c) = extract_class(child, src, path) {
+                    acc.classes.push(c);
+                }
+                // A trait body holds method signatures (no bodies) — descend for
+                // any default-method calls; struct/enum/union bodies have none.
+                walk(child, src, path, ctx, acc);
             }
-            _ => {
-                walk(child, src, path, impl_type, out);
+            "use_declaration" => {
+                extract_imports(child, src, path, &mut acc.imports);
             }
+            "call_expression" => {
+                if let Some(c) = extract_call(child, src, path, ctx.caller.as_deref()) {
+                    acc.calls.push(c);
+                }
+                walk(child, src, path, ctx, acc);
+            }
+            _ => walk(child, src, path, ctx, acc),
         }
     }
 }
 
 fn impl_type_name(impl_node: Node<'_>, src: &[u8]) -> Option<String> {
     // `impl <Type>` or `impl Trait for <Type>` — the `type` field is the Self type.
-    impl_node
-        .child_by_field_name("type")
-        .and_then(|n| node_text(n, src))
+    impl_node.child_by_field_name("type").and_then(|n| node_text(n, src))
 }
+
+// ──────────────────────────── functions ────────────────────────────
 
 fn extract_function(node: Node<'_>, src: &[u8], path: &str, impl_type: Option<&str>) -> Option<FunctionDef> {
     let name = node.child_by_field_name("name").and_then(|n| node_text(n, src))?;
@@ -90,13 +142,8 @@ fn extract_function(node: Node<'_>, src: &[u8], path: &str, impl_type: Option<&s
         .and_then(|n| node_text(n, src))
         .unwrap_or_else(|| "()".to_string());
 
-    let return_type = node
-        .child_by_field_name("return_type")
-        .and_then(|n| node_text(n, src));
-
-    // `async fn` → the `function_modifiers` child contains the `async` keyword.
+    let return_type = node.child_by_field_name("return_type").and_then(|n| node_text(n, src));
     let is_async = has_async_modifier(node, src);
-
     let body = node_text(node, src).unwrap_or_default();
 
     // tree-sitter rows are 0-based; the contract wants 1-based inclusive lines.
@@ -132,6 +179,204 @@ fn has_async_modifier(node: Node<'_>, src: &[u8]) -> bool {
         }
     }
     false
+}
+
+// ──────────────────────────── classes ────────────────────────────
+
+/// struct/enum/trait/union → `ClassDef`. `bases` carries trait supertraits
+/// (`trait T: A + B`) when present; struct/enum/union have an empty `bases`.
+fn extract_class(node: Node<'_>, src: &[u8], path: &str) -> Option<ClassDef> {
+    let name = node.child_by_field_name("name").and_then(|n| node_text(n, src))?;
+    let bases = match node.kind() {
+        "trait_item" => trait_bases(node, src),
+        _ => Vec::new(),
+    };
+    let body = node_text(node, src).unwrap_or_default();
+    let line_start = node.start_position().row as u32 + 1;
+    let line_end = node.end_position().row as u32 + 1;
+
+    Some(ClassDef {
+        name: name.clone(),
+        qualified_name: name,
+        path: path.to_string(),
+        language: Language::Rust,
+        line_start,
+        line_end,
+        bases,
+        docstring: None,
+        body,
+    })
+}
+
+/// Supertraits from a `trait_bounds` node (`: A + B + ...`), as type names.
+fn trait_bases(trait_node: Node<'_>, src: &[u8]) -> Vec<String> {
+    let bounds = match trait_node.child_by_field_name("bounds") {
+        Some(b) => b,
+        None => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    let mut cursor = bounds.walk();
+    for child in bounds.children(&mut cursor) {
+        if child.kind() == "type_identifier" || child.kind() == "scoped_type_identifier" {
+            if let Some(t) = node_text(child, src) {
+                out.push(t);
+            }
+        }
+    }
+    out
+}
+
+// ──────────────────────────── imports ────────────────────────────
+
+/// `use_declaration` → one `Import` per leaf brought into scope. `module` is the
+/// full use path; `name` the imported identifier; `alias` the `as` rename; the
+/// `kind` is always `"use"` for Rust.
+fn extract_imports(node: Node<'_>, src: &[u8], path: &str, out: &mut Vec<Import>) {
+    let line = node.start_position().row as u32 + 1;
+    // The argument is the single significant child after the `use` keyword.
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "scoped_identifier" | "identifier" | "scoped_use_list" | "use_as_clause" | "use_wildcard"
+            | "use_list" => {
+                collect_use(child, src, path, line, "", out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Walk a `use` tree, flattening lists into individual imports. `prefix` is the
+/// scope accumulated from parent `scoped_use_list` segments.
+fn collect_use(node: Node<'_>, src: &[u8], path: &str, line: u32, prefix: &str, out: &mut Vec<Import>) {
+    match node.kind() {
+        "use_wildcard" => {
+            // `path::*` — record the glob with the leading path as module.
+            let text = node_text(node, src).unwrap_or_default();
+            let module = join(prefix, text.trim_end_matches("::*"));
+            push_import(out, path, &module, None, None, line);
+        }
+        "use_as_clause" => {
+            let inner = node.child_by_field_name("path").and_then(|n| node_text(n, src)).unwrap_or_default();
+            let alias = node.child_by_field_name("alias").and_then(|n| node_text(n, src));
+            let module = join(prefix, &inner);
+            let name = last_segment(&inner);
+            push_import(out, path, &module, name, alias, line);
+        }
+        "scoped_use_list" => {
+            // `a::b::{X, Y as Z}` — the path field is the prefix, list the leaves.
+            let scope = node.child_by_field_name("path").and_then(|n| node_text(n, src)).unwrap_or_default();
+            let new_prefix = join(prefix, &scope);
+            if let Some(list) = find_child(node, "use_list") {
+                let mut c = list.walk();
+                for item in list.children(&mut c) {
+                    match item.kind() {
+                        "identifier" | "scoped_identifier" | "use_as_clause" | "scoped_use_list" | "use_wildcard" => {
+                            collect_use(item, src, path, line, &new_prefix, out);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        "use_list" => {
+            let mut c = node.walk();
+            for item in node.children(&mut c) {
+                match item.kind() {
+                    "identifier" | "scoped_identifier" | "use_as_clause" | "scoped_use_list" | "use_wildcard" => {
+                        collect_use(item, src, path, line, prefix, out);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        "scoped_identifier" | "identifier" => {
+            let text = node_text(node, src).unwrap_or_default();
+            let module = join(prefix, &text);
+            let name = last_segment(&text);
+            push_import(out, path, &module, name, None, line);
+        }
+        _ => {}
+    }
+}
+
+fn push_import(out: &mut Vec<Import>, path: &str, module: &str, name: Option<String>, alias: Option<String>, line: u32) {
+    out.push(Import {
+        path: path.to_string(),
+        module: module.to_string(),
+        name,
+        alias,
+        line,
+        kind: "use".to_string(),
+    });
+}
+
+fn join(prefix: &str, seg: &str) -> String {
+    if prefix.is_empty() {
+        seg.to_string()
+    } else if seg.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}::{seg}")
+    }
+}
+
+fn last_segment(s: &str) -> Option<String> {
+    s.rsplit("::").next().map(|x| x.trim().to_string()).filter(|x| !x.is_empty())
+}
+
+// ──────────────────────────── calls ────────────────────────────
+
+/// `call_expression` → `Call`. The function child decides the shape:
+///
+/// - `identifier`        → free fn call (callee = name).
+/// - `scoped_identifier` → associated call (callee = last segment, receiver =
+///   the leading path, e.g. `Service`).
+/// - `field_expression`  → method call (callee = field, receiver = object text).
+///
+/// `caller` is the qualified name of the enclosing fn (skipped if unknown).
+fn extract_call(node: Node<'_>, src: &[u8], path: &str, caller: Option<&str>) -> Option<Call> {
+    let caller = caller?; // top-level calls (outside any fn) are dropped
+    let func = node.child_by_field_name("function")?;
+    let line = node.start_position().row as u32 + 1;
+
+    let (callee, receiver) = match func.kind() {
+        "identifier" => (node_text(func, src)?, None),
+        "scoped_identifier" => {
+            let receiver = func.child_by_field_name("path").and_then(|n| node_text(n, src));
+            let callee = func.child_by_field_name("name").and_then(|n| node_text(n, src))?;
+            (callee, receiver)
+        }
+        "field_expression" => {
+            let receiver = func.child_by_field_name("value").and_then(|n| node_text(n, src));
+            let callee = func.child_by_field_name("field").and_then(|n| node_text(n, src))?;
+            (callee, receiver)
+        }
+        // generic_function (turbofish) etc.: fall back to the raw function text.
+        _ => (node_text(func, src)?, None),
+    };
+
+    Some(Call {
+        path: path.to_string(),
+        caller: caller.to_string(),
+        callee,
+        receiver,
+        line,
+    })
+}
+
+// ──────────────────────────── helpers ────────────────────────────
+
+fn find_child<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    let count = node.child_count();
+    for i in 0..count {
+        if let Some(ch) = node.child(i) {
+            if ch.kind() == kind {
+                return Some(ch);
+            }
+        }
+    }
+    None
 }
 
 fn node_text(node: Node<'_>, src: &[u8]) -> Option<String> {

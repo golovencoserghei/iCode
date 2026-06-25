@@ -44,8 +44,14 @@ fn run_index(path: &std::path::Path) -> anyhow::Result<()> {
     let store = SqliteCodeStore::open(path).map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let stats = icode_engine::index_path(path, &store).map_err(|e| anyhow::anyhow!(e.to_string()))?;
     println!(
-        "indexed {} files, {} functions ({} errors)",
-        stats.files_indexed, stats.functions, stats.errors
+        "indexed {} files: {} functions, {} classes, {} imports, {} calls, {} routes ({} errors)",
+        stats.files_indexed,
+        stats.functions,
+        stats.classes,
+        stats.imports,
+        stats.calls,
+        stats.routes,
+        stats.errors
     );
     Ok(())
 }
