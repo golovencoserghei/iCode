@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::chunk::chunks_for_file;
-use crate::parse::{parse_php, parse_python, parse_rust, ParseResult};
+use crate::parse::{parse_javascript, parse_php, parse_python, parse_rust, parse_tsx, parse_typescript, ParseResult};
 use crate::store::SqliteCodeStore;
 
 /// Counters returned by an indexing run.
@@ -120,7 +120,7 @@ fn index_file(path: &Path, store: &SqliteCodeStore) -> Result<FileCounts> {
     let source = std::fs::read_to_string(path).map_err(|e| Error::Io(e.to_string()))?;
     let path_str = path.to_string_lossy().to_string();
 
-    let parsed = parse_for(language, &source, &path_str);
+    let parsed = parse_for(language, &source, &path_str, path);
 
     let meta = std::fs::metadata(path).map_err(|e| Error::Io(e.to_string()))?;
     let mtime = meta
@@ -172,18 +172,30 @@ fn language_for(path: &Path) -> Option<Language> {
         Some("rs") => Some(Language::Rust),
         Some("py") => Some(Language::Python),
         Some("php") | Some("phtml") => Some(Language::Php),
+        // JavaScript family (incl. JSX, ESM/CJS module variants).
+        Some("js") | Some("jsx") | Some("mjs") | Some("cjs") => Some(Language::JavaScript),
+        // TypeScript family (`.tsx` uses the JSX-aware grammar — see parse_for).
+        Some("ts") | Some("tsx") => Some(Language::TypeScript),
         _ => None,
     }
 }
 
-/// Dispatch to the per-language parser. Only Rust is wired in M1; the match arm
-/// is the single extension point other parsers slot into.
-fn parse_for(language: Language, source: &str, path: &str) -> ParseResult {
+/// Dispatch to the per-language parser. `os_path` carries the extension so the
+/// TypeScript arm can pick the TSX grammar for `.tsx` files.
+fn parse_for(language: Language, source: &str, path: &str, os_path: &Path) -> ParseResult {
     match language {
         Language::Rust => parse_rust(source, path),
         Language::Python => parse_python(source, path),
         Language::Php => parse_php(source, path),
-        // Other languages land with their parsers (M3); until then, no nodes.
+        Language::JavaScript => parse_javascript(source, path),
+        Language::TypeScript => {
+            if os_path.extension().and_then(|e| e.to_str()) == Some("tsx") {
+                parse_tsx(source, path)
+            } else {
+                parse_typescript(source, path)
+            }
+        }
+        // Other languages land with their parsers later; until then, no nodes.
         _ => ParseResult {
             lines_total: source.lines().count().max(1) as u32,
             ast_hash: content_hash(source),
