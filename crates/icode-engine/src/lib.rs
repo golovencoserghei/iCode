@@ -10,6 +10,7 @@ pub mod embed;
 pub mod index;
 pub mod memory;
 pub mod parse;
+pub mod recall;
 pub mod search;
 pub mod store;
 
@@ -21,5 +22,6 @@ pub use memory::{
     SessionEnd, SessionStart, SqliteMemoryStore, WalStore, DEFAULT_PROFILE_NOTES,
     DEFAULT_PROJECT_MEMORIES,
 };
+pub use recall::{code_to_memory, recall, why_this_exists};
 pub use search::{find_similar, hybrid_search, rrf_fuse, semantic_search, RRF_K};
 pub use store::{SqliteCodeStore, Vec0Index};

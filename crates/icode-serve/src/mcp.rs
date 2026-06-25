@@ -363,6 +363,37 @@ pub struct GetDeveloperProfileArgs {
     pub n_results: Option<usize>,
 }
 
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct RecallArgs {
+    /// Project whose cross-session memory to consult (the code section is the
+    /// served project regardless).
+    pub project: String,
+    /// Task / natural-language query to recall code AND memory for.
+    pub query: String,
+    /// Max hits per section (default 8).
+    pub limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct CodeToMemoryArgs {
+    /// Project whose memory to search.
+    pub project: String,
+    /// Symbol name (function/class) to find related memory for.
+    pub symbol: String,
+    /// Max hits to return (default 8).
+    pub limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct WhyThisExistsArgs {
+    /// Project whose decision memory to search.
+    pub project: String,
+    /// Symbol name (function/class) to find the rationale for.
+    pub symbol: String,
+    /// Max hits to return (default 8).
+    pub limit: Option<usize>,
+}
+
 // ──────────────────────────── tools ────────────────────────────
 
 #[tool_router]
@@ -1083,6 +1114,77 @@ impl CodeMcpServer {
             Err(e) => err_json(&e.to_string()),
         }
     }
+
+    // ──────────────────────────── recall (code + memory synergy) ────────────────────────────
+
+    #[tool(description = "Flagship recall: one query → relevant CODE and relevant MEMORY in SEPARATE, independently-ranked sections (plus a facts section, empty until the knowledge graph lands). JSON {relevant_code, relevant_memory, facts}. Degrades gracefully: with no embedder the code section is lexical-only; with no memory store relevant_memory is empty (the code section still answers).")]
+    async fn recall(&self, Parameters(args): Parameters<RecallArgs>) -> String {
+        let store = self.store.clone();
+        // Clone the Arcs BEFORE spawn_blocking; `.as_deref()` inside the closure
+        // turns each `Option<Arc<dyn ..>>` into the `Option<&dyn ..>` the engine
+        // wants, without lifetime trouble (the Arcs outlive the borrow).
+        let embedder = self.embedder.clone();
+        let memory = self.memory.clone();
+        let limit = args.limit.unwrap_or(8);
+        let project = args.project;
+        let query = args.query;
+        let result = tokio::task::spawn_blocking(move || {
+            icode_engine::recall(
+                &store,
+                embedder.as_deref(),
+                memory.as_deref(),
+                &project,
+                &query,
+                limit,
+            )
+        })
+        .await;
+        match result {
+            Ok(Ok(recall)) => to_json(&recall),
+            Ok(Err(e)) => err_json(&e.to_string()),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }
+
+    #[tool(description = "Memory semantically related to a code symbol ('what do we remember about this symbol?'). JSON array of MemoryHit, or an error if the memory store is unavailable.")]
+    async fn code_to_memory(&self, Parameters(args): Parameters<CodeToMemoryArgs>) -> String {
+        let mem = match self.memory.clone() {
+            Some(m) => m,
+            None => return err_json(NO_MEMORY_ERR),
+        };
+        let limit = args.limit.unwrap_or(8);
+        let project = args.project;
+        let symbol = args.symbol;
+        let result = tokio::task::spawn_blocking(move || {
+            icode_engine::code_to_memory(mem.as_ref(), &project, &symbol, limit)
+        })
+        .await;
+        match result {
+            Ok(Ok(hits)) => to_json(&hits),
+            Ok(Err(e)) => err_json(&e.to_string()),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }
+
+    #[tool(description = "Why a symbol exists: DECISION-category memory recording the rationale behind it. JSON array of MemoryHit, or an error if the memory store is unavailable.")]
+    async fn why_this_exists(&self, Parameters(args): Parameters<WhyThisExistsArgs>) -> String {
+        let mem = match self.memory.clone() {
+            Some(m) => m,
+            None => return err_json(NO_MEMORY_ERR),
+        };
+        let limit = args.limit.unwrap_or(8);
+        let project = args.project;
+        let symbol = args.symbol;
+        let result = tokio::task::spawn_blocking(move || {
+            icode_engine::why_this_exists(mem.as_ref(), &project, &symbol, limit)
+        })
+        .await;
+        match result {
+            Ok(Ok(hits)) => to_json(&hits),
+            Ok(Err(e)) => err_json(&e.to_string()),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }
 }
 
 #[tool_handler]
@@ -1267,6 +1369,50 @@ mod tests {
             }))
             .await;
         assert_eq!(gp, want, "get_developer_profile unavailable");
+
+        // The two memory-only recall helpers also report unavailable.
+        let c2m = server
+            .code_to_memory(Parameters(CodeToMemoryArgs {
+                project: "demo".into(),
+                symbol: "read_file".into(),
+                limit: None,
+            }))
+            .await;
+        assert_eq!(c2m, want, "code_to_memory unavailable");
+
+        let why = server
+            .why_this_exists(Parameters(WhyThisExistsArgs {
+                project: "demo".into(),
+                symbol: "read_file".into(),
+                limit: None,
+            }))
+            .await;
+        assert_eq!(why, want, "why_this_exists unavailable");
+    }
+
+    /// `recall` degrades but still answers when neither embedder nor memory is
+    /// wired: the code section is lexical (empty db → []), the memory section is
+    /// empty, and `facts` is empty — all three KEYS are present. Deterministic.
+    #[tokio::test]
+    async fn recall_degrades_without_embedder_or_memory() {
+        let store = Arc::new(SqliteCodeStore::open_in_memory().expect("store"));
+        let server = CodeMcpServer::new(store, None, None);
+
+        let out = server
+            .recall(Parameters(RecallArgs {
+                project: "demo".into(),
+                query: "read a file from disk".into(),
+                limit: Some(5),
+            }))
+            .await;
+        let v: serde_json::Value = serde_json::from_str(&out).expect("recall json");
+        for key in ["relevant_code", "relevant_memory", "facts"] {
+            let arr = v.get(key).and_then(|x| x.as_array());
+            assert!(
+                arr.map(|a| a.is_empty()).unwrap_or(false),
+                "recall section '{key}' is present and empty in fully-degraded mode, got {out}"
+            );
+        }
     }
 
     /// `parse_category_arg` maps the wire strings and falls back to General.
