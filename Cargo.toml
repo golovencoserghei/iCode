@@ -1,0 +1,57 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/icode",
+    "crates/icode-core",
+    "crates/icode-engine",
+    "crates/icode-embed",
+    "crates/icode-serve",
+    "spikes",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.96"
+
+# Pinned to versions validated by M0 spikes (sqlite-vec gate + rmcp handshake).
+[workspace.dependencies]
+# storage / vectors
+rusqlite = { version = "0.32", features = ["bundled"] }
+sqlite-vec = "0.1"
+zstd = "0.13"
+# serde / schema
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+# errors
+anyhow = "1"
+thiserror = "2"
+# async / http
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+# mcp
+rmcp = { version = "1.8", features = ["server", "transport-io", "macros"] }
+# parsing
+tree-sitter = "0.25"
+# parallelism / fs
+rayon = "1"
+walkdir = "2"
+globset = "0.4"
+# hashing / ids / time
+sha2 = "0.10"
+ulid = "1"
+chrono = { version = "0.4", features = ["clock"] }
+# logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# internal crates
+icode-core = { path = "crates/icode-core" }
+icode-engine = { path = "crates/icode-engine" }
+icode-embed = { path = "crates/icode-embed" }
+icode-serve = { path = "crates/icode-serve" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"

@@ -1,0 +1,17 @@
+[package]
+name = "icode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "iCode v2 — local RAG: code-graph understanding + cross-session project memory"
+
+[[bin]]
+name = "icode"
+path = "src/main.rs"
+
+[dependencies]
+icode-core = { workspace = true }
+icode-engine = { workspace = true }
+icode-embed = { workspace = true }
+icode-serve = { workspace = true }
+anyhow = { workspace = true }

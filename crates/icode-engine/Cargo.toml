@@ -1,0 +1,10 @@
+[package]
+name = "icode-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "iCode v2 engine: parse / index / store / memory / search (impl from M1)"
+
+[dependencies]
+icode-core = { workspace = true }
+anyhow = { workspace = true }

@@ -1,0 +1,13 @@
+[package]
+name = "icode-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "iCode v2 domain types + frozen trait contracts (framework-free acyclic center)"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+ulid = { workspace = true }
+chrono = { workspace = true }

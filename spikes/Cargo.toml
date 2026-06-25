@@ -1,0 +1,22 @@
+[package]
+name = "spikes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vec_spike"
+path = "src/vec_spike.rs"
+
+[[bin]]
+name = "rmcp_spike"
+path = "src/rmcp_spike.rs"
+
+[dependencies]
+rusqlite = { workspace = true }
+sqlite-vec = { workspace = true }
+anyhow = { workspace = true }
+rmcp = { version = "1.8", features = ["server", "transport-io", "macros"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
+serde = { version = "1", features = ["derive"] }
+schemars = "1"

@@ -1,0 +1,10 @@
+[package]
+name = "icode-serve"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "iCode v2 serving: rmcp MCP server (stdio/HTTP) + axum web dashboard (impl from M1/M7)"
+
+[dependencies]
+icode-core = { workspace = true }
+anyhow = { workspace = true }

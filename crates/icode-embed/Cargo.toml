@@ -1,0 +1,10 @@
+[package]
+name = "icode-embed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "iCode v2 embedders: Ollama (default) + fastembed ONNX fallback (impl from M2)"
+
+[dependencies]
+icode-core = { workspace = true }
+anyhow = { workspace = true }
