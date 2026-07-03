@@ -11,6 +11,7 @@ pub mod ranking;
 pub mod sanitizer;
 mod schema;
 pub mod session;
+pub mod stop_hook;
 mod store;
 mod wal;
 
@@ -19,6 +20,10 @@ pub use sanitizer::{sanitize_fts5, sanitize_nl};
 pub use session::{
     session_end, session_start, SessionEnd, SessionStart, DEFAULT_PROFILE_NOTES,
     DEFAULT_PROJECT_MEMORIES,
+};
+pub use stop_hook::{
+    auto_summary_content, digest_transcript, parse_stop_input, remove_auto_summary,
+    upsert_auto_summary, StopHookInput, TranscriptDigest,
 };
 pub use store::SqliteMemoryStore;
 pub use wal::WalStore;

@@ -196,7 +196,139 @@ fn hook_config_prints_valid_json_snippet() {
     assert!(s.contains("\"hooks\""), "config must contain a hooks block: {s}");
     assert!(s.contains("SessionStart"), "config must wire SessionStart: {s}");
     assert!(s.contains("PreCompact"), "config must wire PreCompact: {s}");
+    assert!(s.contains("\"Stop\""), "config must wire Stop: {s}");
     let opens = s.matches('{').count();
     let closes = s.matches('}').count();
     assert_eq!(opens, closes, "config JSON braces must balance: {s}");
+}
+
+// ──────────────────────────── hook stop (session_end safety net) ────────────────────────────
+
+/// Run `icode hook stop <args…>` feeding `stdin`; returns (stdout, exit_code).
+fn run_hook_stop(home: &Path, args: &[&str], stdin: &str) -> (String, i32) {
+    use std::io::Write;
+    let mut child = Command::new(icode_bin())
+        .args(["hook", "stop"])
+        .args(args)
+        .env("HOME", home)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn icode hook stop");
+    child
+        .stdin
+        .take()
+        .expect("stdin piped")
+        .write_all(stdin.as_bytes())
+        .expect("write hook stdin");
+    let out = child.wait_with_output().expect("wait icode hook stop");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
+/// Count `demo`-project rows tagged with this session's auto-summary marker.
+fn count_auto_rows(db: &Path, sid_tag: &str) -> i64 {
+    let conn = rusqlite::Connection::open(db).expect("open central db");
+    conn.query_row(
+        "SELECT COUNT(*) FROM memories WHERE project='demo' AND tags LIKE ?1",
+        params![format!("%{sid_tag}%")],
+        |r| r.get(0),
+    )
+    .expect("count auto rows")
+}
+
+#[test]
+fn stop_hook_is_silent_noop_on_garbage_stdin() {
+    let home = tempfile::tempdir().expect("tempdir");
+    for bad in ["", "not json", r#"{"session_id":"x"}"#] {
+        let (stdout, code) = run_hook_stop(home.path(), &["--project", "demo"], bad);
+        assert_eq!(code, 0, "stop must exit 0 on bad stdin {bad:?}");
+        assert!(stdout.is_empty(), "stop must print nothing, got: {stdout}");
+    }
+}
+
+#[test]
+fn stop_hook_session_end_deletes_the_draft_without_ollama() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let db = ensure_db(home.path());
+
+    // A draft auto-summary left by an earlier Stop firing of session abc12345-….
+    seed_memory(
+        &db,
+        "demo",
+        "Авто-сводка сессии: черновик, должен быть удалён",
+        1.0,
+        &["auto-session", "sid:abc12345"],
+    );
+    assert_eq!(count_auto_rows(&db, "sid:abc12345"), 1);
+
+    // The transcript shows the agent DID call session_end this time.
+    let transcript = home.path().join("t.jsonl");
+    std::fs::write(
+        &transcript,
+        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__icode__session_end","input":{}}]}}"#,
+    )
+    .unwrap();
+
+    let stdin = format!(
+        r#"{{"session_id":"abc12345-0000","transcript_path":"{}","cwd":"/tmp/demo"}}"#,
+        transcript.display()
+    );
+    let (stdout, code) = run_hook_stop(home.path(), &["--project", "demo"], &stdin);
+    assert_eq!(code, 0);
+    assert!(stdout.is_empty(), "stop must print nothing, got: {stdout}");
+    // The delete path needs NO embedder — the draft is gone even without Ollama.
+    assert_eq!(count_auto_rows(&db, "sid:abc12345"), 0, "draft must be deleted");
+}
+
+#[test]
+fn stop_hook_upserts_one_auto_summary_per_session() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let db = ensure_db(home.path());
+
+    let transcript = home.path().join("t.jsonl");
+    let long = "Починил парсер конфига: пустой файл теперь трактуется как пустой словарь настроек вместо падения с TypeError; добавлен регрессионный тест на пустой ввод и обновлена документация.";
+    let user_line = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"почини баг с пустым конфигом"}]}}"#;
+    let assistant_line = format!(
+        r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{long}"}}]}}}}"#
+    );
+    std::fs::write(&transcript, format!("{user_line}\n{assistant_line}\n")).unwrap();
+
+    let stdin = format!(
+        r#"{{"session_id":"feed1234-0000","transcript_path":"{}","cwd":"/tmp/demo"}}"#,
+        transcript.display()
+    );
+
+    // Exit 0 in EVERY environment. With a live embedder (Ollama up) the summary
+    // must exist and stay a SINGLE row across repeated Stop firings; with Ollama
+    // down the hook degrades to a silent no-op (0 rows) — both are correct.
+    let (stdout, code) = run_hook_stop(home.path(), &["--project", "demo"], &stdin);
+    assert_eq!(code, 0);
+    assert!(stdout.is_empty(), "stop must print nothing, got: {stdout}");
+    let after_first = count_auto_rows(&db, "sid:feed1234");
+    assert!(after_first <= 1, "at most one auto-summary, got {after_first}");
+
+    let (_, code) = run_hook_stop(home.path(), &["--project", "demo"], &stdin);
+    assert_eq!(code, 0);
+    let after_second = count_auto_rows(&db, "sid:feed1234");
+    assert_eq!(
+        after_first, after_second,
+        "repeated Stop firings must upsert, not multiply rows"
+    );
+
+    if after_first == 1 {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let content: String = conn
+            .query_row(
+                "SELECT content FROM memories WHERE project='demo' AND tags LIKE '%sid:feed1234%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(content.contains("Задача: «почини баг"), "summary must cite the task: {content}");
+        assert!(content.contains("Итог:"), "summary must carry the outcome: {content}");
+    }
 }

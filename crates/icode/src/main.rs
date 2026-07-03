@@ -119,8 +119,22 @@ enum HookAction {
         #[arg(long)]
         cwd: Option<PathBuf>,
     },
+    /// Stop hook: safety net for sessions the agent never closes with
+    /// `session_end`. Reads the Stop payload from stdin, digests the transcript
+    /// and UPSERTS one auto-summary memory per session (tag `sid:<8>`); an
+    /// explicit `session_end` in the transcript deletes the draft instead.
+    /// Prints nothing; always exits 0.
+    Stop {
+        /// Project name (else the basename of `--cwd`, else the stdin `cwd`).
+        #[arg(long)]
+        project: Option<String>,
+        /// Working directory whose basename is the project (when `--project` is absent).
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+    },
     /// Print a ready-to-paste `~/.claude/settings.json` hooks snippet wiring the
-    /// SessionStart / PreCompact events to `icode hook …`, plus where to put it.
+    /// SessionStart / PreCompact / Stop events to `icode hook …`, plus where to
+    /// put it.
     Config,
 }
 
@@ -156,6 +170,10 @@ fn main() -> anyhow::Result<()> {
             }
             HookAction::Precompact { project, cwd } => {
                 run_hook_precompact(project.as_deref(), cwd.as_deref());
+                Ok(())
+            }
+            HookAction::Stop { project, cwd } => {
+                run_hook_stop(project.as_deref(), cwd.as_deref());
                 Ok(())
             }
             HookAction::Config => {
@@ -527,6 +545,13 @@ fn run_daemon_cmd(path: &std::path::Path) -> anyhow::Result<()> {
 /// belt-and-braces fallback). Falls back to the literal `~/...` if `$HOME` is
 /// unset (the store will then try to expand it, or fail cleanly).
 fn central_db_path() -> String {
+    // Test/ops escape hatch: point every memory consumer (serve, hooks) at an
+    // alternate central db without touching the real one.
+    if let Ok(p) = std::env::var("ICODE_DB_PATH") {
+        if !p.trim().is_empty() {
+            return p;
+        }
+    }
     match std::env::var("HOME") {
         Ok(home) => format!("{home}/.icode/icode.db"),
         Err(_) => "~/.icode/icode.db".to_string(),
@@ -831,6 +856,66 @@ fn build_precompact_context(project: &str) -> String {
     lines.join("\n")
 }
 
+/// `icode hook stop` — the `session_end` safety net. Claude Code fires Stop at
+/// the end of EVERY assistant turn, piping `{session_id, transcript_path, cwd}`
+/// on stdin. The hook digests the transcript and keeps ONE auto-summary memory
+/// per session (upsert by the `sid:<8>` tag), so a crashed or abandoned session
+/// still leaves its knowledge behind; when the transcript shows an explicit
+/// `session_end` call, the draft is deleted instead. Prints nothing and always
+/// exits 0 — any failure (no stdin, unreadable transcript, Ollama down, …) is a
+/// silent no-op, never a stall.
+fn run_hook_stop(project: Option<&str>, cwd: Option<&std::path::Path>) {
+    let _ = try_hook_stop(project, cwd);
+}
+
+/// The fallible body of `hook stop`; `None` short-circuits to the silent no-op.
+fn try_hook_stop(project: Option<&str>, cwd: Option<&std::path::Path>) -> Option<()> {
+    use icode_core::traits::Embedder;
+    use std::io::Read;
+
+    // Bounded stdin read: the Stop payload is a small JSON object.
+    let mut raw = String::new();
+    std::io::stdin()
+        .take(1 << 20)
+        .read_to_string(&mut raw)
+        .ok()?;
+    let input = icode_engine::parse_stop_input(&raw)?;
+
+    // Project: explicit --project / --cwd win; else the stdin `cwd` basename.
+    let cwd = cwd
+        .map(std::path::Path::to_path_buf)
+        .or_else(|| input.cwd.as_ref().map(PathBuf::from));
+    let project = hook_project(project, cwd.as_deref());
+
+    let transcript = std::fs::read_to_string(&input.transcript_path).ok()?;
+    let digest = icode_engine::digest_transcript(&transcript);
+
+    if digest.session_end_called {
+        // The agent closed the session properly — drop the draft. `delete`
+        // never embeds, so the readonly (NoEmbedder) store suffices.
+        let store = icode_engine::SqliteMemoryStore::open_readonly(&central_db_path()).ok()?;
+        icode_engine::remove_auto_summary(&store, &project, &input.session_id).ok()?;
+        return Some(());
+    }
+
+    let content = icode_engine::auto_summary_content(&digest)?;
+
+    // add/update embed the content, so this path needs a live embedder — built
+    // quietly (no stderr chatter on every turn), degrading to a no-op when down.
+    let embedder = icode_embed::build_embedder(&EmbedConfig::default()).ok()?;
+    embedder.health().ok()?;
+    let embedder: Arc<dyn Embedder> = Arc::from(embedder);
+    let base = icode_engine::SqliteMemoryStore::open(&central_db_path(), embedder).ok()?;
+
+    // Same WAL audit decorator as `serve`, so auto-summaries are journaled too.
+    let wal_path = match std::env::var("HOME") {
+        Ok(home) => format!("{home}/.icode/wal.jsonl"),
+        Err(_) => "~/.icode/wal.jsonl".to_string(),
+    };
+    let store = icode_engine::WalStore::new(Arc::new(base), wal_path);
+    icode_engine::upsert_auto_summary(&store, &project, &input.session_id, &content).ok()
+}
+
 /// `icode hook config` — print a ready-to-paste `~/.claude/settings.json` hooks
 /// snippet wiring SessionStart / PreCompact to `icode hook …`, plus where to put
 /// it. The JSON is valid on its own (pipe-friendly); the guidance goes to stderr
@@ -838,8 +923,9 @@ fn build_precompact_context(project: &str) -> String {
 fn run_hook_config() {
     eprintln!("# Add the `hooks` block below to ~/.claude/settings.json (merge into an");
     eprintln!("# existing \"hooks\" object if you already have one). Claude Code will then");
-    eprintln!("# run `icode hook …` on SessionStart and PreCompact to inject memory and");
-    eprintln!("# re-assert L0 rules across compaction. (stdout below is the JSON snippet.)");
+    eprintln!("# run `icode hook …` on SessionStart / PreCompact / Stop to inject memory,");
+    eprintln!("# re-assert L0 rules across compaction, and auto-save a session summary");
+    eprintln!("# when the agent forgets `session_end`. (stdout below is the JSON snippet.)");
     eprintln!();
     println!("{}", hook_settings_json());
 }
@@ -854,7 +940,8 @@ fn hook_settings_json() -> String {
     // hook, so the project is the live working directory's basename.
     let cmd_session = format!("{exe} hook session-start --cwd \\\"$CLAUDE_PROJECT_DIR\\\"");
     let cmd_precompact = format!("{exe} hook precompact --cwd \\\"$CLAUDE_PROJECT_DIR\\\"");
+    let cmd_stop = format!("{exe} hook stop --cwd \\\"$CLAUDE_PROJECT_DIR\\\"");
     format!(
-        "{{\n  \"hooks\": {{\n    \"SessionStart\": [\n      {{\n        \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \"{cmd_session}\" }}\n        ]\n      }}\n    ],\n    \"PreCompact\": [\n      {{\n        \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \"{cmd_precompact}\" }}\n        ]\n      }}\n    ]\n  }}\n}}"
+        "{{\n  \"hooks\": {{\n    \"SessionStart\": [\n      {{\n        \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \"{cmd_session}\" }}\n        ]\n      }}\n    ],\n    \"PreCompact\": [\n      {{\n        \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \"{cmd_precompact}\" }}\n        ]\n      }}\n    ],\n    \"Stop\": [\n      {{\n        \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \"{cmd_stop}\" }}\n        ]\n      }}\n    ]\n  }}\n}}"
     )
 }

@@ -25,9 +25,10 @@ pub use index::{
     IndexStats,
 };
 pub use memory::{
-    effective_score, is_l0, rank, sanitize_fts5, sanitize_nl, session_end, session_start,
-    SessionEnd, SessionStart, SqliteMemoryStore, WalStore, DEFAULT_PROFILE_NOTES,
-    DEFAULT_PROJECT_MEMORIES,
+    auto_summary_content, digest_transcript, effective_score, is_l0, parse_stop_input, rank,
+    remove_auto_summary, sanitize_fts5, sanitize_nl, session_end, session_start,
+    upsert_auto_summary, SessionEnd, SessionStart, SqliteMemoryStore, StopHookInput,
+    TranscriptDigest, WalStore, DEFAULT_PROFILE_NOTES, DEFAULT_PROJECT_MEMORIES,
 };
 pub use recall::{code_to_memory, recall, why_this_exists};
 pub use search::{find_similar, hybrid_search, rrf_fuse, semantic_search, RRF_K};
