@@ -30,6 +30,8 @@ const NO_MEMORY_ERR: &str = "memory unavailable: no embedder (is ollama running?
 const DEFAULT_N_PROJECT_MEMORIES: usize = 8;
 /// Default profile notes `session_start` returns when the caller omits the arg.
 const DEFAULT_N_PROFILE_NOTES: usize = 5;
+/// Batch size for the on-demand embed pass run before a semantic query.
+const JIT_EMBED_BATCH: usize = 32;
 
 #[derive(Clone)]
 pub struct CodeMcpServer {
@@ -473,6 +475,7 @@ impl CodeMcpServer {
                         icode_core::model::FunctionOrClass::Function(f) => f.qualified_name.clone(),
                         icode_core::model::FunctionOrClass::Class(c) => c.qualified_name.clone(),
                     };
+                    jit_embed(&store, emb);
                     if let Ok(similar) = icode_engine::find_similar(&store, emb, &qn, 5) {
                         ctx.similar_symbols = similar;
                     }
@@ -550,6 +553,7 @@ impl CodeMcpServer {
             // documented limitation — pass kind only when you need lexical-only.)
             match embedder.as_deref() {
                 Some(emb) if kind.is_none() => {
+                    jit_embed(&store, emb);
                     icode_engine::hybrid_search(&store, emb, &query, limit)
                 }
                 _ => store.search_code(&CodeQuery {
@@ -580,6 +584,7 @@ impl CodeMcpServer {
         let limit = args.limit.unwrap_or(10);
         let query = args.query;
         let result = tokio::task::spawn_blocking(move || {
+            jit_embed(&store, emb.as_ref());
             icode_engine::semantic_search(&store, emb.as_ref(), &query, limit)
         })
         .await;
@@ -600,6 +605,7 @@ impl CodeMcpServer {
         let limit = args.limit.unwrap_or(10);
         let qn = args.qualified_name;
         let result = tokio::task::spawn_blocking(move || {
+            jit_embed(&store, emb.as_ref());
             icode_engine::find_similar(&store, emb.as_ref(), &qn, limit)
         })
         .await;
@@ -1148,6 +1154,11 @@ impl CodeMcpServer {
         let project = args.project;
         let query = args.query;
         let result = tokio::task::spawn_blocking(move || {
+            // Refresh vectors on demand so the code section reflects current source
+            // (no-op/cheap when nothing changed; cache-accelerated after a checkout).
+            if let Some(emb) = embedder.as_deref() {
+                jit_embed(&store, emb);
+            }
             icode_engine::recall(
                 &store,
                 embedder.as_deref(),
@@ -1271,6 +1282,25 @@ fn parse_lang_arg(s: Option<&str>) -> std::result::Result<Option<Language>, Stri
                 "unknown language '{other}' (expected php|python|javascript|typescript|go|java|rust|html|text)"
             )),
         },
+    }
+}
+
+/// Bring the vector index up to date ON DEMAND, just before a semantic query.
+///
+/// This is the "smart embedding" seam: the daemon keeps the graph live but never
+/// embeds, so vectors are filled here — only when semantic search is actually used.
+/// `embed_pending` is cache-accelerated (`content_hash → vector`), so a query after
+/// a `git checkout` (or a switch back) re-embeds only genuinely-new code and
+/// rehydrates everything else for free. In steady state the pending queue is empty
+/// and this is a couple of cheap SQL counts.
+///
+/// Best-effort: an embedder hiccup (Ollama momentarily down) must NOT sink the
+/// search — it is logged to stderr and the query proceeds against whatever vectors
+/// already exist. Runs inside the tool's `spawn_blocking` closure (sync, off the
+/// async reactor).
+fn jit_embed(store: &SqliteCodeStore, embedder: &dyn Embedder) {
+    if let Err(e) = icode_engine::embed_pending(store, embedder, JIT_EMBED_BATCH) {
+        eprintln!("icode: on-demand embed skipped ({e})");
     }
 }
 

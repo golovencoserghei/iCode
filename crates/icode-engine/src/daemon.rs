@@ -5,11 +5,20 @@
 //!   1. acquire a single-writer PID-lock (`<root>/.icode/daemon.lock`) so two
 //!      daemons never race on the same db;
 //!   2. initial sync — run a full [`index_path`] to catch any edits made while the
-//!      daemon was down, then drain the embed queue;
+//!      daemon was down;
 //!   3. watch `root` recursively via `notify` + `notify-debouncer-full` (≈1 s
 //!      debounce, so a save-storm / rename pair collapses into one batch);
 //!   4. per batch: delete vanished files, re-index changed/created ones through
-//!      [`index_one_file`], then re-embed only the freshly-changed chunks.
+//!      [`index_one_file`].
+//!
+//! Embedding is DELIBERATELY NOT done here. The graph (parse → symbols → SQLite)
+//! is cheap and always-correct, so keeping it live on every change is free; but
+//! embedding is the slow part, and running it in the watch loop means a `git
+//! checkout` that rewrites files — and every switch back — would churn the
+//! embedder continuously (and keep the machine from idling). Instead vectors are
+//! refreshed ON DEMAND when a semantic tool is actually used (the MCP/web server
+//! drains the pending queue, cache-accelerated), or explicitly via `icode embed`.
+//! The daemon just leaves freshly-changed chunks in the pending queue.
 //!
 //! Path form is load-bearing: see [`index_one_file`] — the watcher reconstructs
 //! each changed path under the *canonicalised* `root` so the row keys match what
@@ -25,7 +34,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use icode_core::error::{Error, Result};
-use icode_core::traits::{CodeWriteStore, Embedder};
+use icode_core::traits::CodeWriteStore;
 use notify::RecursiveMode;
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 
@@ -36,21 +45,15 @@ use crate::store::SqliteCodeStore;
 /// checkout, rename pairs) into one batch before we touch the store.
 const DEBOUNCE: Duration = Duration::from_millis(1000);
 
-/// Embed-pass batch size (chunks per `Embedder::embed` call) after a re-index.
-const EMBED_BATCH: usize = 32;
-
 /// Run the live indexing daemon for `root` (foreground; blocks until SIGINT).
 ///
-/// `store` is the already-opened per-project code store; `embedder` is optional —
-/// when `None` (e.g. Ollama down) the graph is still kept live, vectors are simply
-/// not refreshed (a note is logged and a later `icode embed` catches up).
+/// `store` is the already-opened per-project code store. The daemon keeps the
+/// GRAPH in lock-step with the source tree but does NOT embed — vectors are
+/// refreshed on demand by the semantic tools (or `icode embed`). See the module
+/// docs for why embedding stays out of the watch loop.
 ///
 /// Errors out early if another daemon already holds this project's lock.
-pub fn run_daemon(
-    root: &Path,
-    store: SqliteCodeStore,
-    embedder: Option<Box<dyn Embedder>>,
-) -> Result<()> {
+pub fn run_daemon(root: &Path, store: SqliteCodeStore) -> Result<()> {
     // Canonicalise once: every watched path is rebuilt under this so the stored
     // keys match `index_path`'s (which walks from this same root).
     let root = std::fs::canonicalize(root).map_err(|e| Error::Io(e.to_string()))?;
@@ -60,20 +63,14 @@ pub fn run_daemon(
     let _lock = DaemonLock::acquire(&root)?;
     log(&format!("daemon: lock acquired (pid {})", std::process::id()));
 
-    // 2) Initial sync: catch edits made while we were down, then drain embeds.
+    // 2) Initial sync: catch graph edits made while we were down. No embedding —
+    //    freshly-changed chunks wait in the pending queue for an on-demand pass.
     let stats = index_path(&root, &store)?;
     log(&format!(
         "daemon: initial sync — {} files, {} functions, {} classes, {} chunks ({} errors)",
         stats.files_indexed, stats.functions, stats.classes, stats.code_chunks, stats.errors
     ));
-    if let Some(emb) = embedder.as_deref() {
-        match crate::embed::embed_pending(&store, emb, EMBED_BATCH) {
-            Ok(es) => log(&format!("daemon: initial embed — {} chunks", es.embedded)),
-            Err(e) => log(&format!("daemon: initial embed skipped ({e})")),
-        }
-    } else {
-        log("daemon: no embedder — graph kept live, vectors not refreshed");
-    }
+    log("daemon: graph live; embedding is on-demand (semantic tools / `icode embed`)");
 
     // 3) SIGINT → stop flag. The watch loop polls it between batches.
     let running = Arc::new(AtomicBool::new(true));
@@ -103,7 +100,7 @@ pub fn run_daemon(
     // Ctrl-C is responsive even with no FS activity.
     while running.load(Ordering::Relaxed) {
         match rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(paths) => process_batch(&root, &store, embedder.as_deref(), paths),
+            Ok(paths) => process_batch(&root, &store, paths),
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
         }
@@ -114,15 +111,10 @@ pub fn run_daemon(
 }
 
 /// Handle one debounced batch: dedup paths, drop excluded/unsupported ones, then
-/// delete vanished files and re-index the rest. Re-embeds only the changed chunks.
-/// Never returns an error — a single bad file is recorded and skipped so the daemon
-/// keeps running.
-fn process_batch(
-    root: &Path,
-    store: &SqliteCodeStore,
-    embedder: Option<&dyn Embedder>,
-    mut paths: Vec<PathBuf>,
-) {
+/// delete vanished files and re-index the rest (GRAPH only — embedding is on-demand,
+/// so changed chunks are simply left in the pending queue). Never returns an error —
+/// a single bad file is recorded and skipped so the daemon keeps running.
+fn process_batch(root: &Path, store: &SqliteCodeStore, mut paths: Vec<PathBuf>) {
     paths.sort();
     paths.dedup();
 
@@ -164,18 +156,11 @@ fn process_batch(
         return; // batch was all noise (excluded/unsupported paths)
     }
 
-    // Re-embed only what changed: `pending_chunks` returns exactly the rows whose
-    // vector is missing or stale (the re-index nulled out the replaced chunks).
-    let mut embedded = 0usize;
-    if let Some(emb) = embedder {
-        match crate::embed::embed_pending(store, emb, EMBED_BATCH) {
-            Ok(es) => embedded = es.embedded,
-            Err(e) => log(&format!("daemon: embed pass skipped ({e})")),
-        }
-    }
-
+    // Graph only. The re-index nulled out the replaced chunks' vectors; they now
+    // sit in the pending queue and are embedded on demand (cache-accelerated, so a
+    // revert/branch-switch costs nothing) — never in this hot path.
     log(&format!(
-        "daemon: reindexed {reindexed} files, deleted {deleted}, embedded {embedded} chunks"
+        "daemon: reindexed {reindexed} files, deleted {deleted} (vectors refresh on demand)"
     ));
 }
 

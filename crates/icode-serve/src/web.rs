@@ -56,6 +56,22 @@ impl WebState {
     }
 }
 
+/// Batch size for the on-demand embed pass run before a semantic dashboard query.
+const JIT_EMBED_BATCH: usize = 32;
+
+/// Bring the vector index up to date ON DEMAND before a semantic dashboard query —
+/// the same seam as `mcp::jit_embed`. The daemon keeps the graph live but never
+/// embeds; vectors are filled here, only when semantic search/recall is used.
+/// Cache-accelerated (`content_hash → vector`), so a query after a `git checkout`
+/// re-embeds only genuinely-new code. Best-effort: an embedder hiccup is logged and
+/// the query proceeds against whatever vectors already exist. Runs inside the
+/// handler's `spawn_blocking` closure.
+fn jit_embed(store: &SqliteCodeStore, embedder: &dyn Embedder) {
+    if let Err(e) = icode_engine::embed_pending(store, embedder, JIT_EMBED_BATCH) {
+        eprintln!("icode web: on-demand embed skipped ({e})");
+    }
+}
+
 /// Build the axum router (state-injected). Exposed separately from [`serve`] so
 /// tests can exercise the routes via `tower::ServiceExt::oneshot` without binding
 /// a socket.
@@ -194,7 +210,10 @@ async fn api_search_code(
     let q = p.q;
     let limit = p.limit.unwrap_or(20);
     blocking_json(move || match embedder.as_deref() {
-        Some(emb) => search::hybrid_search(&store, emb, &q, limit),
+        Some(emb) => {
+            jit_embed(&store, emb);
+            search::hybrid_search(&store, emb, &q, limit)
+        }
         None => store.search_code(&CodeQuery {
             text: q,
             kind: None,
@@ -222,6 +241,7 @@ async fn api_symbol(State(st): State<WebState>, Query(p): Query<SymbolParams>) -
                 icode_core::model::FunctionOrClass::Function(f) => f.qualified_name.clone(),
                 icode_core::model::FunctionOrClass::Class(c) => c.qualified_name.clone(),
             };
+            jit_embed(&store, emb);
             if let Ok(similar) = search::find_similar(&store, emb, &qn, 8) {
                 ctx.similar_symbols = similar;
             }
@@ -279,6 +299,9 @@ async fn api_recall(State(st): State<WebState>, Query(p): Query<RecallParams>) -
     let q = p.q;
     let limit = p.limit.unwrap_or(8);
     blocking_json(move || {
+        if let Some(emb) = embedder.as_deref() {
+            jit_embed(&store, emb);
+        }
         recall(
             &store,
             embedder.as_deref(),

@@ -234,4 +234,26 @@ CREATE VIRTUAL TABLE IF NOT EXISTS vec_code USING vec0(embedding float[1024] dis
 CREATE TRIGGER IF NOT EXISTS code_chunks_ad AFTER DELETE ON code_chunks BEGIN
     DELETE FROM vec_code WHERE rowid = old.id;
 END;
+
+-- ──────────────────────────── embed cache (content-addressed) ────────────────────────────
+
+-- Persistent (content_hash, model) → vector cache, decoupled from `code_chunks`
+-- rowids. Re-indexing a file DELETEs its chunks (and their `vec_code` rows) and
+-- re-inserts fresh rows with NULL `embed_model`, so without this cache every
+-- re-index — crucially every `git checkout` that rewrites a file, then every
+-- switch back — would re-embed byte-identical text through the (slow) embedder.
+--
+-- The embed pass consults this table FIRST: a hit rehydrates the vector with zero
+-- model calls; only genuine cache misses hit the embedder, and their result is
+-- written back here. Keyed by content (not rowid), so a chunk that reverts to a
+-- previously-seen state is free. The table is additive and survives re-indexing
+-- (only a schema-version bump wipes the db); it grows with the set of distinct
+-- chunk texts ever embedded for a model.
+CREATE TABLE IF NOT EXISTS embed_cache (
+    content_hash TEXT NOT NULL,
+    embed_model  TEXT NOT NULL,
+    embed_dim    INTEGER NOT NULL,
+    vec          BLOB NOT NULL,
+    PRIMARY KEY (content_hash, embed_model)
+) WITHOUT ROWID;
 "#;

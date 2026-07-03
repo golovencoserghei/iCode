@@ -3,33 +3,47 @@
 //! This is the back half of the chunk+embed phase (symbols → chunks → embeddings
 //! → vec0). [`chunks_for_file`] writes `code_chunks` rows with NO vectors (the
 //! graph hot path must never block on the network); this pass walks the pending
-//! queue, embeds each batch through the `Embedder` trait, writes the vectors into
-//! the `vec0` index, and stamps each chunk's `embed_model`/`embed_dim` so it
-//! drains from the queue.
+//! queue, brings each chunk's vector up to date, and stamps each chunk's
+//! `embed_model`/`embed_dim` so it drains from the queue.
+//!
+//! Content-addressed cache (the expensive-work saver): re-indexing a file DELETEs
+//! its chunks (and their `vec_code` rows) and re-inserts fresh rows with NULL
+//! `embed_model` — so a `git checkout` that rewrites files, and crucially the
+//! switch back, would otherwise re-embed byte-identical text every time. This pass
+//! consults `embed_cache` (`content_hash → vector`) FIRST: a hit rehydrates the
+//! vector with ZERO embedder calls; only genuine misses hit the (slow) embedder,
+//! and their vectors are written back to the cache. A chunk that reverts to a
+//! previously-seen state is therefore free.
 //!
 //! Decoupling: the embedder is a `&dyn Embedder` (the frozen `icode-core` trait),
 //! so `icode-engine` depends only on the contract — never on `icode-embed`. The
-//! caller (the `icode` binary, or a test) supplies the concrete embedder.
+//! caller (the `icode` binary, the MCP/web server's on-demand path, or a test)
+//! supplies the concrete embedder.
 //!
 //! [`chunks_for_file`]: crate::chunk::chunks_for_file
 
 use icode_core::error::Result;
-use icode_core::traits::{CodeWriteStore, Embedder, VectorIndex};
+use icode_core::traits::{Embedder, VectorIndex};
 
 use crate::store::SqliteCodeStore;
 
 /// Counters from one [`embed_pending`] run.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EmbedStats {
-    /// Chunks embedded and written to the vector index this run.
+    /// Chunks embedded via the embedder (true cache misses) this run.
     pub embedded: usize,
-    /// Number of embed batches issued (one `Embedder::embed` call each).
+    /// Chunks whose vector was rehydrated from `embed_cache` with NO embedder call
+    /// (e.g. a branch switch back to already-seen content).
+    pub rehydrated: usize,
+    /// Number of embed batches issued (one `Embedder::embed` call each). A run that
+    /// is fully served from the cache issues zero.
     pub batches: usize,
 }
 
 /// Drain the pending-embedding queue: repeatedly pull up to `batch` chunks whose
-/// embedding is missing or stamped with a different model, embed them, write the
-/// vectors, and stamp each chunk as embedded (which removes it from the queue).
+/// embedding is missing or stamped with a different model, fill their vectors
+/// (cache hit → rehydrate; miss → embed + cache), write the vectors, and stamp
+/// each chunk as embedded (which removes it from the queue).
 ///
 /// Loops until the queue is empty. A `batch` of 0 is treated as 1 so the loop
 /// always makes progress. An embedder failure (e.g. Ollama down) propagates as
@@ -47,27 +61,52 @@ pub fn embed_pending(
     let mut stats = EmbedStats::default();
 
     loop {
-        let pend = store.pending_chunks(&model, batch)?;
+        let pend = store.pending_chunks_with_hash(&model, batch)?;
         if pend.is_empty() {
             break;
         }
 
-        // Cheap pointer slice over the owned chunk texts for the batch embed call.
-        let texts: Vec<&str> = pend.iter().map(|(_, t)| t.as_str()).collect();
-        let vecs = embedder.embed(&texts)?;
-        stats.batches += 1;
+        // 1) Try the content-addressed cache for the whole batch in one query.
+        let hashes: Vec<&str> = pend.iter().map(|(_, h, _)| h.as_str()).collect();
+        let cached = store.embed_cache_lookup(&hashes, &model)?;
 
-        // Pair each chunk's rowid with its fresh vector for a single bulk upsert.
-        let items: Vec<(i64, Vec<f32>)> = pend.iter().map(|(rowid, _)| *rowid).zip(vecs).collect();
-        index.upsert_batch(&items)?;
+        // 2) Partition into cache hits (rehydrate, no embedder call) and misses
+        //    (must embed). `to_upsert` accumulates BOTH so vec0 is written once.
+        let mut to_upsert: Vec<(i64, Vec<f32>)> = Vec::with_capacity(pend.len());
+        let mut miss_idx: Vec<usize> = Vec::new();
+        for (i, (rowid, hash, _text)) in pend.iter().enumerate() {
+            match cached.get(hash) {
+                Some(v) => to_upsert.push((*rowid, v.clone())),
+                None => miss_idx.push(i),
+            }
+        }
 
-        // Stamp each chunk as embedded so it leaves the pending queue; without
-        // this the same rows would be returned forever (an infinite loop).
-        for (rowid, _) in &pend {
+        // 3) Embed only the misses, then write their vectors back to the cache so a
+        //    future re-index of identical text is free.
+        if !miss_idx.is_empty() {
+            let texts: Vec<&str> = miss_idx.iter().map(|&i| pend[i].2.as_str()).collect();
+            let vecs = embedder.embed(&texts)?;
+            stats.batches += 1;
+
+            let mut cache_puts: Vec<(String, Vec<f32>)> = Vec::with_capacity(miss_idx.len());
+            for (j, &i) in miss_idx.iter().enumerate() {
+                let (rowid, hash, _text) = &pend[i];
+                let v = vecs[j].clone();
+                cache_puts.push((hash.clone(), v.clone()));
+                to_upsert.push((*rowid, v));
+            }
+            store.embed_cache_store(&model, dim, &cache_puts)?;
+        }
+
+        // 4) One bulk vec0 upsert for the whole batch (hits + freshly embedded),
+        //    then stamp every chunk embedded so it leaves the pending queue.
+        index.upsert_batch(&to_upsert)?;
+        for (rowid, _hash, _text) in &pend {
             store.mark_chunk_embedded(*rowid, &model, dim)?;
         }
 
-        stats.embedded += pend.len();
+        stats.embedded += miss_idx.len();
+        stats.rehydrated += pend.len() - miss_idx.len();
     }
 
     Ok(stats)

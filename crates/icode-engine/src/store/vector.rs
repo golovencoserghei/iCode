@@ -23,12 +23,24 @@ fn vec_err<E: std::fmt::Display>(e: E) -> Error {
 }
 
 /// Encode an f32 slice as a little-endian byte blob (vec0's expected format).
-fn f32_blob(v: &[f32]) -> Vec<u8> {
+/// `pub(crate)` so the embed-cache (in `store::mod`) stores vectors in the EXACT
+/// same wire format vec0 uses — one encoding, no drift between the cache and the
+/// live index.
+pub(crate) fn f32_blob(v: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() * 4);
     for f in v {
         out.extend_from_slice(&f.to_le_bytes());
     }
     out
+}
+
+/// Decode a little-endian f32 byte blob back into a vector (inverse of
+/// [`f32_blob`]). Trailing bytes that don't form a full f32 are ignored — a
+/// well-formed blob is always a multiple of 4 bytes.
+pub(crate) fn blob_to_f32(blob: &[u8]) -> Vec<f32> {
+    blob.chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect()
 }
 
 /// sqlite-vec (vec0) vector index over the per-project `vec_code` table.

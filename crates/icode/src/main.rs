@@ -17,7 +17,6 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use icode_core::config::EmbedConfig;
 use icode_core::traits::CodeReadStore;
-use icode_core::traits::Embedder;
 use icode_engine::SqliteCodeStore;
 
 #[derive(Parser)]
@@ -512,35 +511,15 @@ fn run_web(path: PathBuf, port: u16) -> anyhow::Result<()> {
     })
 }
 
-/// `icode daemon run <path>` — foreground live-indexing daemon. Opens the store,
-/// builds the embedder best-effort (a down Ollama is non-fatal: the graph stays
-/// live and vectors just aren't refreshed — a note goes to stderr, mirroring
-/// `serve`), then watches the tree until Ctrl-C. The single-writer PID-lock inside
-/// `run_daemon` rejects a second daemon on the same project with a clear error.
+/// `icode daemon run <path>` — foreground live-indexing daemon. Opens the store and
+/// watches the tree until Ctrl-C, keeping the GRAPH in lock-step with the source.
+/// It does NOT embed: vectors are refreshed on demand by the semantic tools (or
+/// `icode embed`), so a `git checkout` storm never churns the embedder. The
+/// single-writer PID-lock inside `run_daemon` rejects a second daemon on the same
+/// project with a clear error.
 fn run_daemon_cmd(path: &std::path::Path) -> anyhow::Result<()> {
     let store = SqliteCodeStore::open(path).map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    let embedder = build_daemon_embedder();
-    icode_engine::run_daemon(path, store, embedder).map_err(|e| anyhow::anyhow!(e.to_string()))
-}
-
-/// Build the embedder for the daemon, probing health and reporting the mode on
-/// stderr. Returns `Some(Box<dyn Embedder>)` when ready, else `None` (graph-only,
-/// no vector refresh). Never fails — same best-effort contract as `serve`.
-fn build_daemon_embedder() -> Option<Box<dyn Embedder>> {
-    let cfg = EmbedConfig::default();
-    let embedder = match icode_embed::build_embedder(&cfg) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("daemon: semantic refresh disabled: {e} (graph kept live)");
-            return None;
-        }
-    };
-    if let Err(e) = embedder.health() {
-        eprintln!("daemon: semantic refresh disabled: {e} (graph kept live)");
-        return None;
-    }
-    eprintln!("daemon: semantic refresh enabled (model {})", embedder.model_id());
-    Some(embedder)
+    icode_engine::run_daemon(path, store).map_err(|e| anyhow::anyhow!(e.to_string()))
 }
 
 /// Central memory db path (`~/.icode/icode.db`). `~` is expanded against `$HOME`

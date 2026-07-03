@@ -134,6 +134,113 @@ impl SqliteCodeStore {
         Ok(())
     }
 
+    /// Chunks whose embedding is missing/stale, WITH each chunk's `content_hash` so
+    /// the embed pass can consult the content-addressed `embed_cache` before calling
+    /// the embedder. Same predicate as the frozen `CodeWriteStore::pending_chunks`;
+    /// returns `(rowid, content_hash, chunk_text)`. Inherent (the embed loop owns the
+    /// concrete store), so the frozen contract stays unchanged.
+    pub fn pending_chunks_with_hash(
+        &self,
+        embed_model: &str,
+        limit: usize,
+    ) -> Result<Vec<(i64, String, String)>> {
+        let conn = self.conn.lock().map_err(store_err)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT c.id, c.content_hash, c.chunk_text FROM code_chunks c \
+                 WHERE NOT EXISTS (SELECT 1 FROM vec_code v WHERE v.rowid = c.id) \
+                    OR c.embed_model IS NULL \
+                    OR c.embed_model != ?1 \
+                 ORDER BY c.id LIMIT ?2",
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![embed_model, limit as i64], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(store_err)?;
+        collect(rows)
+    }
+
+    /// Look up cached vectors for `hashes` under `model` from the content-addressed
+    /// `embed_cache`. Returns a `content_hash → vector` map holding only the hashes
+    /// that hit; absent keys are cache misses for the caller to embed. Decodes the
+    /// stored LE-f32 blob via [`vector::blob_to_f32`] (inverse of vec0's encoder).
+    pub fn embed_cache_lookup(
+        &self,
+        hashes: &[&str],
+        model: &str,
+    ) -> Result<HashMap<String, Vec<f32>>> {
+        if hashes.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let conn = self.conn.lock().map_err(store_err)?;
+        // ?1 = model; ?2.. = the hashes. The batch is ≤ the embed batch size, far
+        // under SQLite's bound-variable limit, so one IN-list query is fine.
+        let placeholders: String = (0..hashes.len())
+            .map(|i| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT content_hash, vec FROM embed_cache \
+             WHERE embed_model = ?1 AND content_hash IN ({placeholders})"
+        );
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(hashes.len() + 1);
+        params.push(&model);
+        for h in hashes {
+            params.push(h);
+        }
+        let mut stmt = conn.prepare(&sql).map_err(store_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params), |row| {
+                let hash: String = row.get(0)?;
+                let blob: Vec<u8> = row.get(1)?;
+                Ok((hash, blob))
+            })
+            .map_err(store_err)?;
+        let mut out = HashMap::new();
+        for r in rows {
+            let (hash, blob) = r.map_err(store_err)?;
+            out.insert(hash, vector::blob_to_f32(&blob));
+        }
+        Ok(out)
+    }
+
+    /// Insert/replace `(content_hash, model) → vector` rows in the content-addressed
+    /// `embed_cache` after a fresh embed, so a later re-index of identical text (a
+    /// branch switch back, an edit-then-undo) rehydrates with no embedder call.
+    /// Encodes with the SAME LE-f32 layout vec0 stores. One transaction.
+    pub fn embed_cache_store(
+        &self,
+        model: &str,
+        dim: usize,
+        items: &[(String, Vec<f32>)],
+    ) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().map_err(store_err)?;
+        let tx = conn.transaction().map_err(store_err)?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT OR REPLACE INTO embed_cache \
+                     (content_hash, embed_model, embed_dim, vec) VALUES (?1,?2,?3,?4)",
+                )
+                .map_err(store_err)?;
+            for (hash, v) in items {
+                stmt.execute(rusqlite::params![hash, model, dim as i64, vector::f32_blob(v)])
+                    .map_err(store_err)?;
+            }
+        }
+        tx.commit().map_err(store_err)?;
+        Ok(())
+    }
+
     /// Lean listing of all classes (no `body`) ordered by `path, name`, capped at
     /// `limit`. Inherent (not part of the frozen `CodeReadStore` contract) — the
     /// web dashboard's "Map" tab builds an inheritance overview from `bases`, for
@@ -184,6 +291,12 @@ impl SqliteCodeStore {
     fn from_conn(conn: Connection) -> Result<Self> {
         conn.pragma_update(None, "journal_mode", "WAL").map_err(store_err)?;
         conn.pragma_update(None, "foreign_keys", "ON").map_err(store_err)?;
+        // Multiple processes share one `.icode/index.db` (daemon writes the graph;
+        // `serve`/`web` now write vectors on-demand). WAL allows one writer at a
+        // time; without a busy timeout a concurrent writer fails fast with
+        // SQLITE_BUSY. Wait briefly instead so cross-process writes serialise
+        // cleanly rather than erroring.
+        conn.busy_timeout(std::time::Duration::from_millis(5_000)).map_err(store_err)?;
         conn.execute_batch(schema::SCHEMA).map_err(store_err)?;
         // Stamp the schema generation so a future incompatible version is detected.
         conn.pragma_update(None, "user_version", SCHEMA_VERSION).map_err(store_err)?;
