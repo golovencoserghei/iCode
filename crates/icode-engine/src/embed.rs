@@ -60,11 +60,20 @@ pub fn embed_pending(
 
     let mut stats = EmbedStats::default();
 
+    // Keyset cursor: the max chunk id embedded so far. Each batch resumes at
+    // `c.id > after_id` (see `pending_chunks_with_hash`), so the drain is a single
+    // forward pass over the primary key — O(N) — not the old scan-from-zero O(N²).
+    let mut after_id: i64 = 0;
+
     loop {
-        let pend = store.pending_chunks_with_hash(&model, batch)?;
+        let pend = store.pending_chunks_with_hash(&model, after_id, batch)?;
         if pend.is_empty() {
             break;
         }
+        // Advance the cursor past this batch (rows come back ORDER BY id ASC, so the
+        // last one is the max). We stamp every row below, so nothing pending is left
+        // behind the cursor.
+        after_id = pend.last().map(|(id, _, _)| *id).unwrap_or(after_id);
 
         // 1) Try the content-addressed cache for the whole batch in one query.
         let hashes: Vec<&str> = pend.iter().map(|(_, h, _)| h.as_str()).collect();
@@ -99,11 +108,11 @@ pub fn embed_pending(
         }
 
         // 4) One bulk vec0 upsert for the whole batch (hits + freshly embedded),
-        //    then stamp every chunk embedded so it leaves the pending queue.
+        //    then stamp the whole batch embedded in ONE transaction so it leaves the
+        //    pending queue (was one autocommit/fsync per row — now one per batch).
         index.upsert_batch(&to_upsert)?;
-        for (rowid, _hash, _text) in &pend {
-            store.mark_chunk_embedded(*rowid, &model, dim)?;
-        }
+        let rowids: Vec<i64> = pend.iter().map(|(rowid, _, _)| *rowid).collect();
+        store.mark_chunks_embedded(&rowids, &model, dim)?;
 
         stats.embedded += miss_idx.len();
         stats.rehydrated += pend.len() - miss_idx.len();

@@ -72,6 +72,15 @@ fn store_err<E: std::fmt::Display>(e: E) -> Error {
     Error::Store(e.to_string())
 }
 
+/// Read an `i64` tuning knob from the environment, falling back to `default` when
+/// unset or unparseable. Used for the optional PRAGMA overrides.
+fn env_i64(key: &str, default: i64) -> i64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(default)
+}
+
 /// Per-project code store backed by a single SQLite file at `<root>/.icode/index.db`.
 ///
 /// The connection is an `Arc<Mutex<…>>` so the vector index ([`Vec0Index`]) can
@@ -138,28 +147,79 @@ impl SqliteCodeStore {
         Ok(())
     }
 
+    /// Batch variant of [`mark_chunk_embedded`]: stamp a whole embed batch in ONE
+    /// transaction (Wave 2). The old per-row stamp meant one autocommit — one WAL
+    /// fsync — per chunk; wrapping the batch collapses that to a single commit, so
+    /// the embed drain does O(batches) fsyncs instead of O(chunks).
+    pub fn mark_chunks_embedded(&self, rowids: &[i64], model: &str, dim: usize) -> Result<()> {
+        if rowids.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().map_err(store_err)?;
+        let tx = conn.transaction().map_err(store_err)?;
+        {
+            let mut stmt = tx
+                .prepare("UPDATE code_chunks SET embed_model = ?1, embed_dim = ?2 WHERE id = ?3")
+                .map_err(store_err)?;
+            for rowid in rowids {
+                stmt.execute(rusqlite::params![model, dim as i64, rowid])
+                    .map_err(store_err)?;
+            }
+        }
+        tx.commit().map_err(store_err)?;
+        Ok(())
+    }
+
+    /// Refresh ONLY the `files`-row metadata (`mtime`/`file_size`) for a path whose
+    /// content is unchanged (Wave 2 incremental index). Used when a file's bytes
+    /// hash identically to the index but its on-disk mtime/size drifted (a `touch`,
+    /// a branch checkout that rewrote-then-restored it): a clean reindex would carry
+    /// the fresh mtime, so we mirror that WITHOUT re-parsing, re-chunking, or nulling
+    /// any vector — keeping `doctor`'s mtime/size drift signal consistent with a full
+    /// reindex while leaving the embed queue untouched.
+    pub fn touch_file_meta(&self, path: &str, mtime: i64, file_size: u64) -> Result<()> {
+        let conn = self.conn.lock().map_err(store_err)?;
+        conn.execute(
+            "UPDATE files SET mtime = ?1, file_size = ?2 WHERE path = ?3",
+            rusqlite::params![mtime, file_size as i64, path],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
     /// Chunks whose embedding is missing/stale, WITH each chunk's `content_hash` so
     /// the embed pass can consult the content-addressed `embed_cache` before calling
-    /// the embedder. Same predicate as the frozen `CodeWriteStore::pending_chunks`;
-    /// returns `(rowid, content_hash, chunk_text)`. Inherent (the embed loop owns the
-    /// concrete store), so the frozen contract stays unchanged.
+    /// the embedder. Returns `(rowid, content_hash, chunk_text)` ordered by id.
+    ///
+    /// KEYSET CURSOR (Wave 2): `after_id` is a strictly-increasing high-water mark —
+    /// the caller passes the max id of the previous batch, so each call resumes with
+    /// `c.id > after_id` and rides the `code_chunks` primary-key index forward
+    /// instead of re-scanning from row 0. The embed loop stamps every returned row
+    /// (hit or miss) before the next call, so no still-pending row is ever left
+    /// behind the cursor: the whole drain is O(N), not the old O(N²) full-scan.
+    ///
+    /// The pending predicate (no `vec_code` row / NULL / stale `embed_model`) is kept
+    /// so a resume after a partial run still skips already-embedded rows. Inherent
+    /// (the embed loop owns the concrete store), so the frozen contract is unchanged.
     pub fn pending_chunks_with_hash(
         &self,
         embed_model: &str,
+        after_id: i64,
         limit: usize,
     ) -> Result<Vec<(i64, String, String)>> {
         let conn = self.conn.lock().map_err(store_err)?;
         let mut stmt = conn
             .prepare(
                 "SELECT c.id, c.content_hash, c.chunk_text FROM code_chunks c \
-                 WHERE NOT EXISTS (SELECT 1 FROM vec_code v WHERE v.rowid = c.id) \
-                    OR c.embed_model IS NULL \
-                    OR c.embed_model != ?1 \
-                 ORDER BY c.id LIMIT ?2",
+                 WHERE c.id > ?1 \
+                   AND (NOT EXISTS (SELECT 1 FROM vec_code v WHERE v.rowid = c.id) \
+                        OR c.embed_model IS NULL \
+                        OR c.embed_model != ?2) \
+                 ORDER BY c.id LIMIT ?3",
             )
             .map_err(store_err)?;
         let rows = stmt
-            .query_map(rusqlite::params![embed_model, limit as i64], |row| {
+            .query_map(rusqlite::params![after_id, embed_model, limit as i64], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
@@ -301,6 +361,28 @@ impl SqliteCodeStore {
         // SQLITE_BUSY. Wait briefly instead so cross-process writes serialise
         // cleanly rather than erroring.
         conn.busy_timeout(std::time::Duration::from_millis(5_000)).map_err(store_err)?;
+
+        // ── Performance PRAGMAs (Wave 2) ──────────────────────────────────────
+        // Under WAL the journal default is `synchronous=FULL`, which fsyncs on
+        // EVERY commit — the bulk indexer / embed drain does thousands of small
+        // commits, so that fsync dominates. `NORMAL` is the documented-safe WAL
+        // setting: it fsyncs only at checkpoint, and a crash can lose at most the
+        // last (uncheckpointed) transactions — never corrupt the db. The per-project
+        // index is regenerable from source anyway, so this trade is free here.
+        conn.pragma_update(None, "synchronous", "NORMAL").map_err(store_err)?;
+        // Page cache (negative = KiB, not pages). 64 MiB keeps the graph + FTS hot
+        // during a bulk index without an unbounded footprint. Env-overridable.
+        let cache_kib = env_i64("ICODE_CACHE_KIB", 65_536);
+        conn.pragma_update(None, "cache_size", -cache_kib).map_err(store_err)?;
+        // Memory-map the db for the read-heavy graph queries (256 MiB default; 0
+        // disables). mmap avoids a userspace copy on every page read.
+        let mmap = env_i64("ICODE_MMAP_BYTES", 268_435_456);
+        conn.pragma_update(None, "mmap_size", mmap).map_err(store_err)?;
+        // Checkpoint the WAL roughly every 1000 pages (~4 MiB) so it can't grow
+        // unbounded under the bulk-write indexer, while keeping commit-time fsync
+        // off (synchronous=NORMAL only fsyncs at these checkpoints).
+        conn.pragma_update(None, "wal_autocheckpoint", 1000).map_err(store_err)?;
+
         conn.execute_batch(schema::SCHEMA).map_err(store_err)?;
         // Stamp the schema generation so a future incompatible version is detected.
         conn.pragma_update(None, "user_version", SCHEMA_VERSION).map_err(store_err)?;

@@ -20,6 +20,7 @@ tree-sitter-go = { workspace = true }
 tree-sitter-java = { workspace = true }
 tree-sitter-html = { workspace = true }
 walkdir = { workspace = true }
+rayon = { workspace = true }
 notify = { workspace = true }
 notify-debouncer-full = { workspace = true }
 libc = { workspace = true }

@@ -67,8 +67,14 @@ pub fn run_daemon(root: &Path, store: SqliteCodeStore) -> Result<()> {
     //    freshly-changed chunks wait in the pending queue for an on-demand pass.
     let stats = index_path(&root, &store)?;
     log(&format!(
-        "daemon: initial sync — {} files, {} functions, {} classes, {} chunks ({} errors)",
-        stats.files_indexed, stats.functions, stats.classes, stats.code_chunks, stats.errors
+        "daemon: initial sync — {} reindexed, {} unchanged, {} deleted, {} functions, {} classes, {} chunks ({} errors)",
+        stats.files_indexed,
+        stats.files_skipped,
+        stats.files_deleted,
+        stats.functions,
+        stats.classes,
+        stats.code_chunks,
+        stats.errors
     ));
     log("daemon: graph live; embedding is on-demand (semantic tools / `icode embed`)");
 
