@@ -95,19 +95,27 @@ CREATE INDEX IF NOT EXISTS idx_imports_module ON imports(module);
 
 -- ──────────────────────────── calls ────────────────────────────
 
+-- `receiver` is the raw call receiver captured by the parser ($this/self/static/
+-- parent/ClassName/$var). `resolved_callee` is the receiver-aware qualified target
+-- (`EnclosingType::method`) once it validated against a real definition (NULL =
+-- edge stays bare-name). `confidence` grades HOW the edge resolved (0.3..0.9).
+-- Both are filled by the resolve pass (store::resolve_call_edges), not the parser.
 CREATE TABLE IF NOT EXISTS calls (
-    id       INTEGER PRIMARY KEY,
-    file_id  INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-    path     TEXT NOT NULL,
-    caller   TEXT NOT NULL,
-    callee   TEXT NOT NULL,
-    receiver TEXT,
-    line     INTEGER NOT NULL
+    id              INTEGER PRIMARY KEY,
+    file_id         INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    path            TEXT NOT NULL,
+    caller          TEXT NOT NULL,
+    callee          TEXT NOT NULL,
+    receiver        TEXT,
+    resolved_callee TEXT,
+    confidence      REAL NOT NULL DEFAULT 0.3,
+    line            INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_calls_file ON calls(file_id);
 CREATE INDEX IF NOT EXISTS idx_calls_callee ON calls(callee);
 CREATE INDEX IF NOT EXISTS idx_calls_caller ON calls(caller);
+CREATE INDEX IF NOT EXISTS idx_calls_resolved ON calls(resolved_callee);
 
 -- ──────────────────────────── routes ────────────────────────────
 

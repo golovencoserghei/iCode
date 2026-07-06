@@ -54,13 +54,30 @@ fn oversample(k: usize) -> usize {
 /// `.score` overwritten by the final RRF total. Output is sorted by fused score
 /// descending (ties broken by `qualified_name` then `path` for determinism),
 /// truncated to `top`.
+///
+/// Canonical RRF counts each document **once per list**, at its BEST (lowest) rank.
+/// A single symbol can appear several times in one list — an oversized body is
+/// split across N chunk rows that all share the same `(qualified_name, path)` key,
+/// so the raw dense list carries it N times. Summing every occurrence would let
+/// such a split symbol accumulate N reciprocal ranks and unfairly dominate; we
+/// therefore fold each list to one contribution per key before summing across
+/// lists. Because every list is already sorted best-first, the first occurrence of
+/// a key within a list IS its minimum rank.
 pub fn rrf_fuse(lists: &[Vec<CodeHit>], k_const: f64, top: usize) -> Vec<CodeHit> {
     // key -> (accumulated rrf score, representative hit)
     let mut acc: HashMap<(String, String), (f64, CodeHit)> = HashMap::new();
     // Preserve first-seen order so a deterministic representative is chosen.
     for list in lists {
+        // Count each key at most once PER LIST, at its best (first == lowest) rank.
+        // Later, worse-ranked repeats of the same key inside this list are skipped
+        // so a multi-chunk symbol can't sum its way to the top.
+        let mut seen_in_list: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
         for (rank, hit) in list.iter().enumerate() {
             let key = (hit.qualified_name.clone(), hit.path.clone());
+            if !seen_in_list.insert(key.clone()) {
+                continue; // already counted this key (at a better rank) for this list
+            }
             let contrib = 1.0 / (k_const + rank as f64);
             acc.entry(key)
                 .and_modify(|(s, _)| *s += contrib)
@@ -300,16 +317,67 @@ mod tests {
 
     #[test]
     fn rrf_dedups_by_qualified_name_and_path() {
-        // Same (qn, path) in one list twice must collapse to a single entry whose
-        // score sums both ranks.
+        // Same (qn, path) repeated inside ONE list (e.g. a symbol split across chunk
+        // rows) collapses to a single entry counted ONCE at its BEST (lowest) rank —
+        // canonical RRF, NOT a sum of every occurrence.
         let a = vec![hit("dup", "p"), hit("other", "p"), hit("dup", "p")];
         let fused = rrf_fuse(&[a], RRF_K, 10);
         let dup_count = fused.iter().filter(|h| h.qualified_name == "dup").count();
         assert_eq!(dup_count, 1, "duplicate key collapses to one hit");
+
+        let dup = fused.iter().find(|h| h.qualified_name == "dup").expect("dup present");
+        // Best (only-counted) rank is 0; the rank-2 repeat is ignored → score 1/60.
+        let best_only = 1.0f32 / 60.0;
+        assert!(
+            (dup.score - best_only).abs() < 1e-6,
+            "dup counted once at best rank: score {} ≈ {}",
+            dup.score,
+            best_only
+        );
+        // Guard against a regression back to summing: rank-0 + rank-2 would be
+        // 1/60 + 1/62. We must NOT be doing that.
+        let summed = 1.0f32 / 60.0 + 1.0f32 / 62.0;
+        assert!(
+            (dup.score - summed).abs() > 1e-6,
+            "must not sum repeated occurrences within a list (got {})",
+            dup.score
+        );
+
         // Same qn but DIFFERENT path is a distinct key.
         let b = vec![hit("dup", "p1"), hit("dup", "p2")];
         let fused_b = rrf_fuse(&[b], RRF_K, 10);
         assert_eq!(fused_b.len(), 2, "qn+path keying keeps distinct paths separate");
+    }
+
+    #[test]
+    fn rrf_multichunk_symbol_does_not_dominate() {
+        // A large symbol split into 4 chunk rows shows up 4× in the DENSE list under
+        // one key (ranks 0..=3). A rival symbol appears once in dense (rank 4) and
+        // once in the lexical list (rank 0) — genuine cross-retriever agreement.
+        // Old (buggy) summing gave the split symbol 1/60+1/61+1/62+1/63 ≈ 0.0651 and
+        // it dominated; correct RRF counts it once at rank 0 (1/60 ≈ 0.0167), so the
+        // cross-list symbol (1/64 + 1/60 ≈ 0.0323) rightly wins.
+        let dense = vec![
+            hit("big", "b"), // rank 0 ┐ same key, one oversized symbol split
+            hit("big", "b"), // rank 1 │ across four chunk rows
+            hit("big", "b"), // rank 2 │
+            hit("big", "b"), // rank 3 ┘
+            hit("shared", "s"), // rank 4
+        ];
+        let lexical = vec![hit("shared", "s")]; // rank 0 in the lexical list
+
+        let fused = rrf_fuse(&[dense, lexical], RRF_K, 10);
+
+        assert_eq!(
+            fused[0].qualified_name, "shared",
+            "cross-list agreement must beat a single split symbol"
+        );
+        let big = fused.iter().find(|h| h.qualified_name == "big").expect("big present");
+        assert!(
+            (big.score - 1.0f32 / 60.0).abs() < 1e-6,
+            "split symbol counted once at best rank, not summed (got {})",
+            big.score
+        );
     }
 
     #[test]

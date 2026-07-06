@@ -109,6 +109,12 @@ pub fn index_path(root: &Path, store: &SqliteCodeStore) -> Result<IndexStats> {
         }
     }
 
+    // Receiver-aware call resolution: now that EVERY file's definitions are in the
+    // functions table, validate each edge's qualified guess and grade confidence.
+    // Must run once, after the whole walk (a callee may be defined in a file
+    // indexed later than its caller).
+    store.resolve_call_edges(None)?;
+
     Ok(stats)
 }
 
@@ -131,6 +137,11 @@ pub fn index_path(root: &Path, store: &SqliteCodeStore) -> Result<IndexStats> {
 /// daemon turns that into a `record_parse_error` and keeps running.
 pub fn index_one_file(path: &Path, store: &SqliteCodeStore) -> Result<IndexStats> {
     let counts = index_file(path, store)?;
+    // Re-grade this file's outgoing edges against the (already-complete) functions
+    // table. Scoped to the one path for speed — the rest of the project is already
+    // resolved; only edges whose target def CHANGED in this file could drift, which
+    // a subsequent touch of that file heals.
+    store.resolve_call_edges(Some(&path.to_string_lossy()))?;
     Ok(IndexStats {
         files_indexed: 1,
         functions: counts.functions,

@@ -123,3 +123,34 @@ fn pid_lock_single_writer() {
     let third = DaemonLock::acquire(&root).expect("re-acquire after drop");
     drop(third);
 }
+
+/// Drop must NOT unlink the lock file. Removing it is an unlink race (a fresh
+/// inode could let two daemons both think they hold the single-writer lock), so
+/// the file has to survive a drop while the lock still becomes re-acquirable and
+/// keeps enforcing single-writer on the SAME inode.
+#[test]
+fn pid_lock_file_survives_drop_and_reacquires() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = std::fs::canonicalize(dir.path()).expect("canon root");
+    let lock_path = root.join(".icode").join("daemon.lock");
+
+    {
+        let _guard = DaemonLock::acquire(&root).expect("acquire");
+        assert!(lock_path.exists(), "lock file exists while held");
+    } // guard dropped here → flock released, but the file must remain
+
+    assert!(
+        lock_path.exists(),
+        "lock file must survive drop (Drop must not unlink — unlink race)"
+    );
+
+    // Re-acquire on the SAME surviving inode; single-writer is still enforced.
+    let again = DaemonLock::acquire(&root).expect("re-acquire on surviving file");
+    let contended = DaemonLock::acquire(&root);
+    assert!(
+        contended.is_err(),
+        "single-writer must still hold on the reused lock file"
+    );
+    drop(again);
+    assert!(lock_path.exists(), "lock file still present after the second drop");
+}

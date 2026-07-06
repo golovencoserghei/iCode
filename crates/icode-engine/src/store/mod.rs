@@ -30,7 +30,11 @@ pub use vector::Vec0Index;
 ///
 /// v2 (M2): adds the semantic layer — `meta`, `code_chunks`, the `vec_code` vec0
 /// virtual table, and the delete-mirror trigger. A v1 db is wiped and rebuilt.
-const SCHEMA_VERSION: i64 = 2;
+///
+/// v3 (Wave 1): receiver-aware call resolution — `calls.resolved_callee`
+/// (qualified target) + `calls.confidence` (how the edge resolved). Discard-and-
+/// rebuild handles the added columns; no in-place migration.
+const SCHEMA_VERSION: i64 = 3;
 
 /// Gate the one-time sqlite-vec auto-extension registration.
 static VEC_INIT: Once = Once::new();
@@ -637,23 +641,32 @@ impl CodeReadStore for SqliteCodeStore {
             similar_symbols: Vec::new(),
         })
     }
-    /// Direct callers of `name`: rows in `calls` whose `callee` equals the name
-    /// (or its qualified form). APPROXIMATE — matching is purely by name, so a
-    /// homonym in another scope can over-match (typed resolution is M3b).
+    /// Direct callers of `name`: rows in `calls` targeting the symbol. RECEIVER-
+    /// AWARE, with query shape deciding precision vs recall:
+    ///  * a QUALIFIED `name` (`ServiceA::handle`) matches only edges whose receiver
+    ///    resolved to exactly that target (`resolved_callee = name`) — so it no
+    ///    longer collects every `->handle()` in the repo; homonyms in other classes
+    ///    resolved to their own type are excluded, and an unattributable dynamic
+    ///    `$x->handle()` (resolved_callee NULL) is NOT falsely credited to it.
+    ///  * a BARE `name` (`handle`) matches every bare callee (resolved or not),
+    ///    preserving the old approximate recall.
     fn get_callers(&self, name: &str, limit: usize) -> Result<Vec<Call>> {
         let conn = self.conn.lock().map_err(store_err)?;
-        // Also match the bare last segment of a qualified callee, since the parser
-        // stamps `callee` as the bare method name for most call shapes.
-        let bare = last_name_segment(name);
-        let mut stmt = conn
-            .prepare(
-                "SELECT path, caller, callee, receiver, line FROM calls \
-                 WHERE callee = ?1 OR callee = ?2 \
-                 ORDER BY path, line LIMIT ?3",
-            )
-            .map_err(store_err)?;
+        let qualified_query = name != last_name_segment(name);
+        let sql = if qualified_query {
+            // Precise: only edges receiver-resolved to this exact qualified target.
+            "SELECT path, caller, callee, receiver, line, resolved_callee, confidence FROM calls \
+             WHERE resolved_callee = ?1 OR callee = ?1 \
+             ORDER BY path, line LIMIT ?2"
+        } else {
+            // Bare name: every edge with this bare callee (approximate recall).
+            "SELECT path, caller, callee, receiver, line, resolved_callee, confidence FROM calls \
+             WHERE callee = ?1 OR resolved_callee = ?1 \
+             ORDER BY path, line LIMIT ?2"
+        };
+        let mut stmt = conn.prepare(sql).map_err(store_err)?;
         let rows = stmt
-            .query_map(rusqlite::params![name, bare, limit as i64], map_call)
+            .query_map(rusqlite::params![name, limit as i64], map_call)
             .map_err(store_err)?;
         collect(rows)
     }
@@ -668,9 +681,12 @@ impl CodeReadStore for SqliteCodeStore {
         };
         let conn = self.conn.lock().map_err(store_err)?;
         let q = qualified.unwrap_or_else(|| name.to_string());
+        // Callees are keyed by the CALLER (already qualified), so they are
+        // naturally class-scoped; each row now also carries `resolved_callee`
+        // (the receiver-aware target) and `confidence` for the edge.
         let mut stmt = conn
             .prepare(
-                "SELECT path, caller, callee, receiver, line FROM calls \
+                "SELECT path, caller, callee, receiver, line, resolved_callee, confidence FROM calls \
                  WHERE caller = ?1 OR caller = ?2 \
                  ORDER BY path, line LIMIT ?3",
             )
@@ -1314,17 +1330,26 @@ impl CodeWriteStore for SqliteCodeStore {
         {
             let mut stmt = tx
                 .prepare(
-                    "INSERT INTO calls (file_id, path, caller, callee, receiver, line) \
-                     VALUES (?1,?2,?3,?4,?5,?6)",
+                    "INSERT INTO calls \
+                     (file_id, path, caller, callee, receiver, resolved_callee, confidence, line) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                 )
                 .map_err(store_err)?;
             for c in calls {
+                // Receiver-aware qualification guess (file-local, deterministic):
+                // `EnclosingType::method` when the receiver names a class, else NULL.
+                // Validated + confidence-graded later by `resolve_call_edges` (which
+                // needs the *complete* functions table — unavailable mid-index).
+                let guess =
+                    resolve_callee_guess(&c.caller, &c.callee, c.receiver.as_deref(), file.language, classes);
                 stmt.execute(rusqlite::params![
                     file_id,
                     c.path,
                     c.caller,
                     c.callee,
                     c.receiver,
+                    guess,
+                    CONF_UNRESOLVED as f64, // placeholder until resolve_call_edges runs
                     c.line as i64,
                 ])
                 .map_err(store_err)?;
@@ -1457,7 +1482,8 @@ fn collect<T>(rows: impl Iterator<Item = rusqlite::Result<T>>) -> Result<Vec<T>>
     Ok(out)
 }
 
-/// Map a `calls` row (path, caller, callee, receiver, line) into a `Call`.
+/// Map a `calls` row (path, caller, callee, receiver, line, resolved_callee,
+/// confidence) into a `Call`.
 fn map_call(row: &rusqlite::Row<'_>) -> rusqlite::Result<Call> {
     Ok(Call {
         path: row.get(0)?,
@@ -1465,6 +1491,8 @@ fn map_call(row: &rusqlite::Row<'_>) -> rusqlite::Result<Call> {
         callee: row.get(2)?,
         receiver: row.get(3)?,
         line: row.get::<_, i64>(4)? as u32,
+        resolved_callee: row.get(5)?,
+        confidence: row.get::<_, f64>(6)? as f32,
     })
 }
 
@@ -1487,14 +1515,143 @@ fn map_symbol_hit_fn(row: &rusqlite::Row<'_>) -> rusqlite::Result<CodeHit> {
 /// The bare last segment of a possibly-qualified name (`Service::run` → `run`,
 /// `Class.method` → `method`). Used to bridge qualified callers to bare callees.
 fn last_name_segment(name: &str) -> String {
-    // Handle both `::` (Rust/PHP) and `.` (Python/JS) qualifiers.
+    // Handle `::` (Rust/PHP), `.` (Python/JS) and `\` (PHP namespaces) qualifiers.
     let after_colons = name.rsplit("::").next().unwrap_or(name);
-    after_colons.rsplit('.').next().unwrap_or(after_colons).to_string()
+    let after_dot = after_colons.rsplit('.').next().unwrap_or(after_colons);
+    after_dot.rsplit('\\').next().unwrap_or(after_dot).to_string()
+}
+
+// ──────────────────────────── receiver-aware call resolution (Wave 1) ─────────
+//
+// Confidence scale, graded by HOW a call edge resolved (deterministic):
+//   0.9  qualified target matched exactly ONE definition   (best)
+//   0.7  qualified target matched several defs (homonym)    (still class-scoped)
+//   0.6  bare-name matched exactly one definition in-project
+//   0.4  bare-name collided with several definitions        (ambiguous)
+//   0.3  unresolved / dynamic receiver / external target    (worst)
+const CONF_QUALIFIED_UNIQUE: f32 = 0.9;
+const CONF_QUALIFIED_MULTI: f32 = 0.7;
+const CONF_BARE_UNIQUE: f32 = 0.6;
+const CONF_BARE_COLLISION: f32 = 0.4;
+const CONF_UNRESOLVED: f32 = 0.3;
+
+/// The qualifier separator a language uses in its `qualified_name` shape
+/// (`Type::method` for Rust/PHP, `Type.method` everywhere else). Building the
+/// receiver guess with the SAME separator lets it match `functions.qualified_name`.
+fn qualifier_sep(lang: Language) -> &'static str {
+    match lang {
+        Language::Rust | Language::Php => "::",
+        _ => ".",
+    }
+}
+
+/// The enclosing type of a caller's qualified name (`Service::run` → `Service`,
+/// `A.B.method` → `A.B`). `None` for a free function (no type prefix).
+fn enclosing_type<'a>(caller_qual: &'a str, sep: &str) -> Option<&'a str> {
+    caller_qual.rsplit_once(sep).map(|(ty, _)| ty).filter(|t| !t.is_empty())
+}
+
+/// True when a receiver is a dynamic value / expression we cannot cheaply pin to a
+/// class: a `$var`, a chain (`a.b`), a call (`f()`), a path (`std::mem`), etc. Only
+/// a single bare identifier (`Model`, `User`, `T`) is treated as an explicit class.
+fn is_dynamic_receiver(r: &str) -> bool {
+    r.is_empty()
+        || r.starts_with('$')
+        || r.chars().any(|c| {
+            matches!(
+                c,
+                '.' | ':' | '\\' | '(' | ')' | '[' | ']' | '{' | '}'
+                    | ' ' | '\t' | '\n' | '"' | '\'' | '<' | '>' | '-' | '&' | '*'
+            )
+        })
+}
+
+/// Receiver-aware qualified-callee guess: the callee's fully-qualified name in the
+/// language's `qualified_name` shape, when the receiver lets us name a class.
+/// Returns `None` to leave the edge bare (dynamic/unqualifiable receiver, a free
+/// call, or a `parent::` with no known base). Purely file-local and deterministic;
+/// [`SqliteCodeStore::resolve_call_edges`] later validates the guess against real
+/// definitions (nulling it on a miss) and grades `confidence`.
+fn resolve_callee_guess(
+    caller_qual: &str,
+    callee: &str,
+    receiver: Option<&str>,
+    lang: Language,
+    classes: &[ClassDef],
+) -> Option<String> {
+    let recv = receiver.map(str::trim).filter(|r| !r.is_empty())?;
+    let sep = qualifier_sep(lang);
+    match recv {
+        // Self-referential receivers → the caller's own enclosing type.
+        "self" | "$this" | "this" | "cls" | "static" => {
+            enclosing_type(caller_qual, sep).map(|ty| format!("{ty}{sep}{callee}"))
+        }
+        // `parent::` → the enclosing class's first declared base (when known here).
+        "parent" => {
+            let ty = enclosing_type(caller_qual, sep)?;
+            let leaf = last_name_segment(ty);
+            classes
+                .iter()
+                .find(|c| c.name == leaf || c.qualified_name == ty)
+                .and_then(|c| c.bases.first())
+                .map(|base| format!("{}{sep}{callee}", last_name_segment(base)))
+        }
+        // An explicit single-identifier class name (`Model::find`, `T.method`).
+        _ if !is_dynamic_receiver(recv) => Some(format!("{recv}{sep}{callee}")),
+        // Dynamic / expression receiver → bare-name resolution.
+        _ => None,
+    }
 }
 
 /// Resolve a function (then class) by `name`, optionally preferring `file_hint`.
 /// Returns the wrapped definition, the symbol's path, and its qualified name.
 impl SqliteCodeStore {
+    /// Finalize receiver-aware call resolution against the COMPLETE `functions`
+    /// table: validate each `resolved_callee` guess (null it out on a miss so the
+    /// edge falls back to bare-name) and grade `confidence` by the way it resolved.
+    /// Must run AFTER the target definitions are indexed — the indexer calls it
+    /// once at the end of a full run; the daemon passes `Some(path)` to re-grade
+    /// just one file's outgoing edges (its own defs are already in place).
+    ///
+    /// Idempotent. Deterministic: the confidence CASE reads the pre-null
+    /// `resolved_callee`, so grading a qualified guess that matched no definition
+    /// still correctly demotes it to the bare-name band.
+    pub fn resolve_call_edges(&self, path: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().map_err(store_err)?;
+        let filter = if path.is_some() { " AND calls.path = ?1" } else { "" };
+        let args: Vec<&dyn rusqlite::types::ToSql> = match &path {
+            Some(p) => vec![p],
+            None => vec![],
+        };
+        // 1) Grade confidence by resolution method (uses the pre-null guess).
+        let conf_sql = format!(
+            "UPDATE calls SET confidence = CASE \
+               WHEN resolved_callee IS NOT NULL \
+                    AND (SELECT COUNT(*) FROM functions f WHERE f.qualified_name = calls.resolved_callee) = 1 THEN {q1} \
+               WHEN resolved_callee IS NOT NULL \
+                    AND (SELECT COUNT(*) FROM functions f WHERE f.qualified_name = calls.resolved_callee) > 1 THEN {q2} \
+               WHEN (SELECT COUNT(*) FROM functions f WHERE f.name = calls.callee) = 1 THEN {b1} \
+               WHEN (SELECT COUNT(*) FROM functions f WHERE f.name = calls.callee) > 1 THEN {b2} \
+               ELSE {u} END \
+             WHERE 1=1{filter}",
+            q1 = CONF_QUALIFIED_UNIQUE,
+            q2 = CONF_QUALIFIED_MULTI,
+            b1 = CONF_BARE_UNIQUE,
+            b2 = CONF_BARE_COLLISION,
+            u = CONF_UNRESOLVED,
+        );
+        conn.execute(&conf_sql, args.as_slice()).map_err(store_err)?;
+        // 2) Drop qualified guesses that matched no real definition → the edge
+        //    reverts to bare-name (resolved_callee IS NULL) for the read queries.
+        let null_sql = format!(
+            "UPDATE calls SET resolved_callee = NULL \
+             WHERE resolved_callee IS NOT NULL \
+               AND NOT EXISTS (SELECT 1 FROM functions f WHERE f.qualified_name = calls.resolved_callee){filter}"
+        );
+        conn.execute(&null_sql, args.as_slice()).map_err(store_err)?;
+        Ok(())
+    }
+
     fn resolve_symbol(
         &self,
         name: &str,

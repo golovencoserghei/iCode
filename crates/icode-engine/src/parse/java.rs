@@ -319,6 +319,7 @@ fn extract_call(node: Node<'_>, src: &[u8], path: &str, caller: Option<&str>) ->
         callee,
         receiver,
         line: node.start_position().row as u32 + 1,
+        ..Default::default()
     })
 }
 

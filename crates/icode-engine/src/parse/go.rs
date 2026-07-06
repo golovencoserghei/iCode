@@ -391,6 +391,7 @@ fn extract_call(node: Node<'_>, src: &[u8], path: &str, caller: Option<&str>) ->
         callee,
         receiver,
         line,
+        ..Default::default()
     })
 }
 

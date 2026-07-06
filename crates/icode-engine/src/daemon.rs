@@ -198,7 +198,6 @@ fn normalise_under_root(root: &Path, raw: &Path) -> PathBuf {
 /// (blocking) watch loop: acquire → second `acquire` is `Err` → drop → re-acquire.
 pub struct DaemonLock {
     fd: libc::c_int,
-    path: PathBuf,
 }
 
 impl DaemonLock {
@@ -251,20 +250,25 @@ impl DaemonLock {
         }
         let _ = std::fs::write(&path, format!("{}\n", std::process::id()));
 
-        Ok(Self { fd, path })
+        Ok(Self { fd })
     }
 }
 
 impl Drop for DaemonLock {
     fn drop(&mut self) {
-        // Releasing the flock is implicit on close; do it explicitly and best-effort
-        // remove the file so a stale PID isn't left lying around.
+        // Release the advisory lock and close the fd. We deliberately DO NOT unlink
+        // the lock file. Removing it is an unlink race: once we release the flock,
+        // another process can open+flock the SAME inode, and a `remove_file` here
+        // would then delete the file that process holds — so the next daemon creates
+        // a FRESH inode whose flock no longer conflicts, yielding two "single"
+        // writers. The kernel drops our flock on close/exit regardless, and the
+        // lingering file is harmless: its PID line is best-effort only and is
+        // re-truncated + rewritten on the next `acquire`.
         // SAFETY: `self.fd` is the descriptor we opened and still own.
         unsafe {
             libc::flock(self.fd, libc::LOCK_UN);
             libc::close(self.fd);
         }
-        let _ = std::fs::remove_file(&self.path);
     }
 }
 

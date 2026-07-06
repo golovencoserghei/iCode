@@ -352,10 +352,19 @@ fn short_name(s: &str) -> String {
 // ──────────────────────────── calls ────────────────────────────
 
 /// `function_call_expression` → free `Call` (no receiver). `callee` is the
-/// called function's text. `caller` is the enclosing fn (top-level dropped).
+/// called function's short name (last `\`-segment of a namespaced call), so it
+/// matches the stored definition. `caller` is the enclosing fn (top-level dropped).
 fn extract_function_call(node: Node<'_>, src: &[u8], path: &str, caller: Option<&str>) -> Option<Call> {
     let caller = caller?;
-    let callee = node.child_by_field_name("function").and_then(|n| node_text(n, src))?;
+    let raw = node.child_by_field_name("function").and_then(|n| node_text(n, src))?;
+    if raw.is_empty() {
+        return None;
+    }
+    // A free call may be namespace-qualified (`\App\helper()`, `App\helper()`),
+    // but `function_definition` records only the short name (`helper`). Normalise
+    // the callee to the last `\`-segment so the call edge resolves to the def.
+    // Dynamic callees (`$fn`) have no `\` and pass through unchanged.
+    let callee = short_name(&raw);
     if callee.is_empty() {
         return None;
     }
@@ -365,6 +374,7 @@ fn extract_function_call(node: Node<'_>, src: &[u8], path: &str, caller: Option<
         callee,
         receiver: None,
         line: node.start_position().row as u32 + 1,
+        ..Default::default()
     })
 }
 
@@ -386,6 +396,7 @@ fn extract_member_call(node: Node<'_>, src: &[u8], path: &str, caller: Option<&s
         callee,
         receiver,
         line: node.start_position().row as u32 + 1,
+        ..Default::default()
     })
 }
 
@@ -408,6 +419,7 @@ fn extract_scoped_call(node: Node<'_>, src: &[u8], path: &str, caller: Option<&s
         callee,
         receiver,
         line: node.start_position().row as u32 + 1,
+        ..Default::default()
     })
 }
 
@@ -680,4 +692,35 @@ fn find_child<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
 
 fn node_text(node: Node<'_>, src: &[u8]) -> Option<String> {
     node.utf8_text(src).ok().map(|s| s.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn namespaced_free_call_callee_is_short_name() {
+        // `\App\helper()` must resolve to the def stored under the short `helper`.
+        let src = "<?php\nfunction caller() { \\App\\helper(); }\n";
+        let res = parse_php(src, "a.php");
+        let call = res
+            .calls
+            .iter()
+            .find(|c| c.caller == "caller")
+            .expect("call recorded");
+        assert_eq!(call.callee, "helper");
+        assert!(call.receiver.is_none());
+    }
+
+    #[test]
+    fn plain_free_call_callee_unchanged() {
+        let src = "<?php\nfunction caller() { helper(); }\n";
+        let res = parse_php(src, "b.php");
+        let call = res
+            .calls
+            .iter()
+            .find(|c| c.caller == "caller")
+            .expect("call recorded");
+        assert_eq!(call.callee, "helper");
+    }
 }

@@ -19,7 +19,8 @@
 //!   extended interfaces) and `enum_declaration` → `ClassDef`.
 //! - imports:   `import_statement` → one `Import` per imported binding — named
 //!   (`{a, b as c}`), default, and namespace (`* as ns`) — with the source
-//!   string as `module` (kind `"import"`). `require(...)` is best-effort.
+//!   string as `module` (kind `"import"`). Only ESM `import_statement` is
+//!   extracted; CommonJS `require(...)` is NOT handled.
 //! - calls:     `call_expression` → free (`f()`) or member (`obj.m()`, receiver =
 //!   the object text, e.g. `this` / `obj` / `a.b`), attributed to the enclosing
 //!   function/method (top-level calls dropped).
@@ -517,6 +518,7 @@ fn extract_call(node: Node<'_>, src: &[u8], path: &str, caller: Option<&str>) ->
         callee,
         receiver,
         line,
+        ..Default::default()
     })
 }
 

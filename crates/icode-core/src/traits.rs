@@ -32,10 +32,12 @@ pub trait Embedder: Send + Sync {
 
 // ──────────────────────────── vector index ────────────────────────────
 
-/// Nearest-neighbour over a fixed-dim space. Default impl = sqlite-vec (vec0);
-/// fallback for >ann_threshold chunks/project = usearch. The rowid maps to the
-/// owning row (code_chunks.id, or memory via the mem_rowid bridge owned by the
-/// store — the bridge is deliberately NOT part of this contract).
+/// Nearest-neighbour over a fixed-dim space. The only implementation today is
+/// sqlite-vec (vec0), a brute-force KNN scan. A usearch/ANN fallback above some
+/// per-project chunk count is PLANNED but NOT implemented — there is currently no
+/// ANN path, regardless of chunk count. The rowid maps to the owning row
+/// (code_chunks.id, or memory via the mem_rowid bridge owned by the store — the
+/// bridge is deliberately NOT part of this contract).
 pub trait VectorIndex: Send + Sync {
     fn dim(&self) -> usize;
     fn upsert(&self, rowid: i64, embedding: &[f32]) -> Result<()>;

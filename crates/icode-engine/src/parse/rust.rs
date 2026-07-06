@@ -32,6 +32,7 @@ pub fn parse_rust(source: &str, path: &str) -> ParseResult {
     let bytes = source.as_bytes();
     let mut acc = Acc::default();
     walk(tree.root_node(), bytes, path, &Ctx::default(), &mut acc);
+    apply_impl_heritage(&mut acc, path);
 
     ParseResult {
         lines_total,
@@ -51,6 +52,9 @@ struct Acc {
     classes: Vec<ClassDef>,
     imports: Vec<Import>,
     calls: Vec<Call>,
+    /// `impl Trait for Type` heritage links `(type, trait, line_start, line_end)`,
+    /// reconciled into `classes` after the walk (see `apply_impl_heritage`).
+    impls: Vec<(String, String, u32, u32)>,
 }
 
 /// Lexical context carried down the walk. Owned (cloned at the few nesting
@@ -95,6 +99,23 @@ fn walk(node: Node<'_>, src: &[u8], path: &str, ctx: &Ctx, acc: &mut Acc) {
             }
             "impl_item" => {
                 let ty = impl_type_name(child, src);
+                // `impl Trait for Type` — record the trait as a base of the
+                // implementing type so struct→trait heritage becomes queryable
+                // (`find_implementations`). Inherent `impl Type` has no `trait`
+                // field and is skipped. Method qualification below is unchanged.
+                if let (Some(self_ty), Some(trait_node)) =
+                    (ty.as_deref(), child.child_by_field_name("trait"))
+                {
+                    if let Some(tr) = node_text(trait_node, src) {
+                        let ty_base = base_type_name(self_ty);
+                        let tr_base = base_type_name(&tr);
+                        if !ty_base.is_empty() && !tr_base.is_empty() {
+                            let ls = child.start_position().row as u32 + 1;
+                            let le = child.end_position().row as u32 + 1;
+                            acc.impls.push((ty_base, tr_base, ls, le));
+                        }
+                    }
+                }
                 if let Some(body) = child.child_by_field_name("body") {
                     let inner = Ctx { impl_type: ty, caller: ctx.caller.clone() };
                     walk(body, src, path, &inner, acc);
@@ -125,6 +146,43 @@ fn walk(node: Node<'_>, src: &[u8], path: &str, ctx: &Ctx, acc: &mut Acc) {
 fn impl_type_name(impl_node: Node<'_>, src: &[u8]) -> Option<String> {
     // `impl <Type>` or `impl Trait for <Type>` — the `type` field is the Self type.
     impl_node.child_by_field_name("type").and_then(|n| node_text(n, src))
+}
+
+/// The bare identifier of a type reference: generic args and path qualifiers are
+/// stripped so it matches a stored struct/enum/trait `name`. `Foo<T>` → `Foo`,
+/// `crate::Bar` → `Bar`, `fmt::Display` → `Display`.
+fn base_type_name(text: &str) -> String {
+    let no_generics = text.split('<').next().unwrap_or(text).trim();
+    no_generics.rsplit("::").next().unwrap_or(no_generics).trim().to_string()
+}
+
+/// Fold `impl Trait for Type` links into `classes`: append the trait to the
+/// implementing type's `bases` (creating a lightweight class row when the type
+/// itself is not defined in this file), so `find_implementations` resolves it.
+fn apply_impl_heritage(acc: &mut Acc, path: &str) {
+    let impls = std::mem::take(&mut acc.impls);
+    for (ty, tr, line_start, line_end) in impls {
+        if let Some(class) = acc.classes.iter_mut().find(|c| c.name == ty) {
+            if !class.bases.contains(&tr) {
+                class.bases.push(tr);
+            }
+        } else {
+            // Type defined elsewhere (or not parsed as a class here): emit a
+            // minimal class row that carries only the heritage edge. A later
+            // impl of the same type appends to this row's `bases`.
+            acc.classes.push(ClassDef {
+                name: ty.clone(),
+                qualified_name: ty,
+                path: path.to_string(),
+                language: Language::Rust,
+                line_start,
+                line_end,
+                bases: vec![tr],
+                docstring: None,
+                body: String::new(),
+            });
+        }
+    }
 }
 
 // ──────────────────────────── functions ────────────────────────────
@@ -362,6 +420,7 @@ fn extract_call(node: Node<'_>, src: &[u8], path: &str, caller: Option<&str>) ->
         callee,
         receiver,
         line,
+        ..Default::default()
     })
 }
 
@@ -381,4 +440,52 @@ fn find_child<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
 
 fn node_text(node: Node<'_>, src: &[u8]) -> Option<String> {
     node.utf8_text(src).ok().map(|s| s.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn class_named<'a>(res: &'a ParseResult, name: &str) -> Option<&'a ClassDef> {
+        res.classes.iter().find(|c| c.name == name)
+    }
+
+    #[test]
+    fn base_type_name_strips_generics_and_path() {
+        assert_eq!(base_type_name("Foo"), "Foo");
+        assert_eq!(base_type_name("Foo<T>"), "Foo");
+        assert_eq!(base_type_name("crate::Bar"), "Bar");
+        assert_eq!(base_type_name("fmt::Display"), "Display");
+    }
+
+    #[test]
+    fn impl_trait_for_local_type_records_base() {
+        let src = "struct Foo;\ntrait Greet { fn hi(&self); }\nimpl Greet for Foo { fn hi(&self) {} }\n";
+        let res = parse_rust(src, "a.rs");
+        let foo = class_named(&res, "Foo").expect("Foo class present");
+        assert!(
+            foo.bases.iter().any(|b| b == "Greet"),
+            "Foo should list Greet as a base: {:?}",
+            foo.bases
+        );
+        // Method qualification inside the impl block is unchanged (`Foo::hi`).
+        assert!(res.functions.iter().any(|f| f.qualified_name == "Foo::hi"));
+    }
+
+    #[test]
+    fn impl_trait_for_external_type_emits_stub_class() {
+        // `Vec` is not defined here; a stub class row carries the heritage edge.
+        let src = "trait Greet {}\nimpl Greet for Vec<u8> {}\n";
+        let res = parse_rust(src, "b.rs");
+        let v = class_named(&res, "Vec").expect("stub Vec class present");
+        assert_eq!(v.bases, vec!["Greet".to_string()]);
+    }
+
+    #[test]
+    fn inherent_impl_adds_no_base() {
+        let src = "struct Foo;\nimpl Foo { fn go(&self) {} }\n";
+        let res = parse_rust(src, "c.rs");
+        let foo = class_named(&res, "Foo").expect("Foo class present");
+        assert!(foo.bases.is_empty(), "inherent impl must not add a base");
+    }
 }

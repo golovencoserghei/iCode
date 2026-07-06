@@ -170,9 +170,10 @@ embeddings. No telemetry, no cloud, no code or memory leaving the machine.
 What works today, and what's deliberately still ahead:
 
 - **Call-graph resolution is by name.** Method/call edges resolve on symbol
-  names (with receiver capture for `self`/`cls`/`this` and explicit classes in
-  Python/JS/TS, strongest in PHP via typed properties). Full type-based OOP
-  resolution (M3b) is planned.
+  names, with the call receiver captured alongside each edge (`self`/`cls`/
+  `this`/`$this` and explicit class names). There is no type inference — typed
+  properties are not resolved to their class — so full type-based OOP resolution
+  (M3b) is planned.
 - **`find_existing` is a hybrid** (semantic + lexical RRF). Without an embedder
   it falls back to lexical-only, which misses semantic duplicates that share no
   vocabulary (`fetchUser` vs `getUserById`).

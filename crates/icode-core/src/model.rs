@@ -73,7 +73,9 @@ pub struct FunctionDef {
     /// Empty in lean projections; populated only when a body was requested.
     pub body: String,
     pub is_async: bool,
-    /// "own" | "inherited" | "override" resolution metadata (set by OOP model).
+    /// Reserved: "own" | "inherited" | "override" resolution metadata. NOT yet
+    /// populated — the OOP resolution model is unimplemented, so no parser sets
+    /// these; both fields are always None today.
     pub override_type: Option<String>,
     pub override_target: Option<String>,
 }
@@ -101,7 +103,7 @@ pub struct Import {
     pub kind: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Call {
     pub path: String,
     pub caller: String,
@@ -109,6 +111,17 @@ pub struct Call {
     /// Receiver of a method call ($this/self/ClassName/$var) for OOP resolution.
     pub receiver: Option<String>,
     pub line: u32,
+    /// Receiver-aware resolved target: the callee's fully-qualified name
+    /// (`EnclosingType::method`) when the receiver let us qualify it against a real
+    /// definition; `None` means the edge stays bare-name (dynamic/unresolvable
+    /// receiver). Populated at index time; see `store::resolve_call_edges`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_callee: Option<String>,
+    /// Deterministic confidence of this call edge, by the WAY it resolved:
+    /// 0.9 exact qualified (1 def) · 0.7 qualified (>1 defs) · 0.6 bare unique ·
+    /// 0.4 bare collision · 0.3 unresolved/dynamic. 0.0 before the resolve pass.
+    #[serde(default)]
+    pub confidence: f32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

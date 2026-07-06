@@ -32,13 +32,15 @@ pub const AUTO_RESOLVE_MAX_DISTANCE: f32 = 0.6;
 
 /// Minimum fused memory-search score for a completed item to auto-resolve a
 /// bug/todo. `search` returns RRF-fused scores (`Σ 1/(60+rank)` plus a small
-/// ranking nudge); a single-list head sits at ~1/60 ≈ 0.0167 and an item that
-/// tops BOTH the dense and lexical arms reaches ~2/60 ≈ 0.0333. We require the
-/// hit to be a real top match, not incidental: only the FIRST (best) bug/todo hit
-/// of each completed item is considered, and only if its score clears this floor.
-/// Set conservatively low because RRF scores are small in absolute terms; the
-/// real selectivity comes from "first hit only + must be bug/todo".
-pub const AUTO_RESOLVE_MIN_SCORE: f32 = 0.016;
+/// ranking nudge): a single-arm head sits at ~1/60 ≈ 0.0167, while an item that
+/// tops BOTH the dense and lexical arms reaches ~2/60 ≈ 0.0333. The old 0.016
+/// floor was right at the single-arm head, so a completed item could close an
+/// UNRELATED bug/todo that merely shared ONE common word (a lexical-only hit
+/// clears 1/60). We now require the hit to be near the top of BOTH arms — a
+/// genuine match, not incidental vocabulary overlap — so the floor sits just
+/// under 2/60. Only the FIRST (best) bug/todo hit of each completed item is
+/// considered, and only if its score clears this threshold.
+pub const AUTO_RESOLVE_MIN_SCORE: f32 = 0.03;
 
 /// How many candidates each completed item pulls when hunting bug/todo to resolve.
 const AUTO_RESOLVE_SEARCH_N: usize = 5;
@@ -122,10 +124,12 @@ pub fn session_start(
 ///   * `completed` → one `Progress` memory each.
 ///   * `todos`     → one `Todo` memory each.
 ///
-/// Then AUTO-RESOLVES: for every completed item, searches the project for the
-/// nearest open memory; if the best hit is a `Bug` or `Todo` that clears
-/// [`AUTO_RESOLVE_MIN_SCORE`], it is `resolve`d (the completed work closed it).
-/// `session_id`, when given, records a session touch (`touch_session`).
+/// Then AUTO-RESOLVES: for every completed item, searches the project's
+/// PRE-EXISTING open bug/todo memories; if the best hit is a `Bug` or `Todo` that
+/// clears [`AUTO_RESOLVE_MIN_SCORE`], it is `resolve`d (the completed work closed
+/// it). The wrap-up's OWN new `todos` are persisted AFTER this pass — they are
+/// still-open work and must never be self-resolved by a completed item of the same
+/// session. `session_id`, when given, records a session touch (`touch_session`).
 ///
 /// Returns `{ saved, auto_resolved }`. Individual `add`/`resolve`/`search`
 /// failures are NOT swallowed — a wrap-up that silently lost data would be worse
@@ -157,11 +161,11 @@ pub fn session_end(
             saved += add_one(store, project, c, Category::Progress)?;
         }
     }
-    for t in todos {
-        if !t.trim().is_empty() {
-            saved += add_one(store, project, t, Category::Todo)?;
-        }
-    }
+    // NB: `todos` are persisted AFTER the auto-resolve pass below, NOT here. They
+    // are the session's still-OPEN work; saving them first would make them
+    // resolve candidates, and a fresh todo (importance-seeded by category) could
+    // even outscore the real bug and get closed by a completed item of this very
+    // wrap-up.
 
     // Auto-resolve: each completed item closes the open bug/todo it is about.
     //
@@ -199,6 +203,14 @@ pub fn session_end(
         }
     }
 
+    // Persist the still-open todos now that auto-resolve has run against the
+    // PRE-EXISTING task set (see the note above the auto-resolve pass).
+    for t in todos {
+        if !t.trim().is_empty() {
+            saved += add_one(store, project, t, Category::Todo)?;
+        }
+    }
+
     if let Some(sid) = session_id {
         // Best-effort bookkeeping: a session touch must not sink the wrap-up.
         let _ = store.touch_session(project, sid);
@@ -210,8 +222,27 @@ pub fn session_end(
     })
 }
 
+/// Importance seed for a wrap-up memory, keyed by category. `session_end` items
+/// arrive with no explicit importance; seeding by category (rather than saving
+/// everything at 0.0, which left every wrap-up record decay-equal and ranked
+/// purely by recency) mirrors the CLAUDE.md guidance: decisions & bugs are weighty
+/// (3), context/progress/code mid (2), todos and loose general notes low (1). The
+/// `summary` is stored as `Progress`, so it inherits the Progress seed (2).
+fn category_importance(category: Category) -> f32 {
+    match category {
+        Category::Decision => 3.0,
+        Category::Bug => 3.0,
+        Category::Context => 2.0,
+        Category::Progress => 2.0,
+        Category::Code => 2.0,
+        Category::Todo => 1.0,
+        Category::General => 1.0,
+    }
+}
+
 /// Add one memory, returning 1 if a NEW row was written, 0 if the store deduped
 /// it (a `Duplicate` is the normal "already known" outcome, not an error).
+/// Importance is seeded from the category (see [`category_importance`]).
 fn add_one(store: &dyn MemoryStore, project: &str, content: &str, category: Category) -> Result<usize> {
     use icode_core::model::AddOutcome;
     let outcome = store.add(NewMemory {
@@ -219,7 +250,7 @@ fn add_one(store: &dyn MemoryStore, project: &str, content: &str, category: Cate
         content: content.to_string(),
         category,
         tags: Vec::new(),
-        importance: 0.0,
+        importance: category_importance(category),
         session_id: None,
     })?;
     Ok(match outcome {

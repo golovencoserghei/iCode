@@ -9,8 +9,13 @@
 //! ```text
 //!   effective_score = importance_weight * (importance / 5)
 //!                   + min(access_boost * access_count, access_boost_cap)
-//!                   - decay_per_hour * hours_since(last_accessed_at)
+//!                   - min(decay_per_hour * hours_since(last_accessed_at), MAX_DECAY)
 //! ```
+//!
+//! The decay term is **capped** (see [`MAX_DECAY`]): without a ceiling it grows
+//! without bound and, past ~a week, dwarfs the importance contribution — so recall
+//! would sort by recency and an old-but-important record would sink below fresh,
+//! low-value noise.
 //!
 //! **L0 immunity.** An always-on rule (e.g. "respond in Russian") must NEVER sink
 //! via decay, even if never explicitly accessed. For an L0 record the decay term
@@ -22,6 +27,17 @@ use icode_core::model::MemoryRecord;
 
 /// Max importance on the 0..=5 scale (the normalisation denominator).
 const MAX_IMPORTANCE: f32 = 5.0;
+
+/// Ceiling on the decay penalty (the `decay_per_hour * hours` term). Un-capped,
+/// decay runs to `+inf` with age and buries the importance signal (at most
+/// `importance_weight` ≈ 1.0), so ranking collapses to pure recency — an old but
+/// important record then sinks below fresh, low-relevance noise. Capped at 0.5
+/// (half the default importance scale) a stale record still loses to a fresh one
+/// of EQUAL importance, but a mid/high-importance record (≥3/5) is never buried by
+/// age alone. In the fused search score the ranking blend is `RANK_BLEND (0.1) *
+/// effective_score`, so this bounds decay's pull on fusion to ~0.05 — on the scale
+/// of the RRF spread, a nudge rather than a takeover.
+const MAX_DECAY: f32 = 0.5;
 
 /// L0 tags marking an always-on rule. A record with `importance >= l0_min` AND any
 /// of these tags is decay-immune (mirrors meMCP's `_L0_TAGS`).
@@ -64,8 +80,10 @@ fn hours_since(ts: &str, now: DateTime<Utc>) -> f32 {
 /// Dynamic relevance score blending importance, access frequency, and recency.
 ///
 /// Resilient to legacy rows: `access_count` defaults to 0, an unparseable
-/// `last_accessed_at` yields no decay. L0 records (see [`is_l0`]) have the decay
-/// term forced to 0 so they can never sink below freshly-touched noise.
+/// `last_accessed_at` yields no decay. The decay term is capped at [`MAX_DECAY`]
+/// so age alone can never fully bury a record's importance. L0 records (see
+/// [`is_l0`]) have the decay term forced to 0 so they can never sink below
+/// freshly-touched noise.
 pub fn effective_score(rec: &MemoryRecord, cfg: &RankingConfig, now: DateTime<Utc>) -> f32 {
     let importance = rec.importance.clamp(0.0, MAX_IMPORTANCE);
     let importance_norm = importance / MAX_IMPORTANCE;
@@ -73,11 +91,13 @@ pub fn effective_score(rec: &MemoryRecord, cfg: &RankingConfig, now: DateTime<Ut
     let access_boost = (cfg.access_boost * rec.access_count as f32).min(cfg.access_boost_cap);
 
     // L0 rules are decay-immune: they must stay on top regardless of how long ago
-    // they were last touched (otherwise "respond in Russian" could sink).
+    // they were last touched (otherwise "respond in Russian" could sink). Every
+    // other record decays, but the penalty is capped at MAX_DECAY so an important
+    // record is never buried by recency alone.
     let decay = if is_l0(rec, cfg) {
         0.0
     } else {
-        cfg.decay_per_hour * hours_since(&rec.last_accessed_at, now)
+        (cfg.decay_per_hour * hours_since(&rec.last_accessed_at, now)).min(MAX_DECAY)
     };
 
     cfg.importance_weight * importance_norm + access_boost - decay
@@ -159,10 +179,16 @@ mod tests {
         let s = effective_score(&l0, &cfg, now);
         assert!((s - 1.0).abs() < 1e-5, "L0 decay must be zero, got {s}");
 
-        // A non-L0 record with the SAME age sinks far below zero.
+        // A non-L0 record of the SAME age is eroded by decay but, thanks to the
+        // MAX_DECAY cap, does NOT plummet to -inf — it stays well BELOW the L0
+        // record (whose decay is zero), which is all L0 immunity needs to prove.
         let normal = rec(4.0, 0, iso(now, 24 * 365), vec![]);
         assert!(!is_l0(&normal, &cfg), "importance 4.0 without an L0 tag is not L0");
-        assert!(effective_score(&normal, &cfg, now) < 0.0);
+        let normal_score = effective_score(&normal, &cfg, now);
+        assert!(
+            normal_score < s,
+            "non-L0 (score {normal_score}) must sink below the L0 record (score {s})"
+        );
     }
 
     #[test]
@@ -197,5 +223,38 @@ mod tests {
         let r = rec(0.0, 0, iso(now, -100), vec![]);
         let s = effective_score(&r, &cfg, now);
         assert!((s - 0.0).abs() < 1e-5, "future ts must not add positive decay, got {s}");
+    }
+
+    #[test]
+    fn decay_term_is_capped() {
+        // A zero-importance record decayed far past saturation bottoms out at
+        // exactly -MAX_DECAY instead of running to -inf: the cap is what keeps
+        // recency from dominating the fused search score.
+        let cfg = RankingConfig::default();
+        let now = Utc::now();
+        let ancient = rec(0.0, 0, iso(now, 24 * 3650), vec![]); // ~10 years old
+        let s = effective_score(&ancient, &cfg, now);
+        assert!((s + MAX_DECAY).abs() < 1e-5, "decay must cap at -MAX_DECAY, got {s}");
+    }
+
+    #[test]
+    fn old_important_outranks_fresh_low_relevance_noise() {
+        // The regression this fixes: un-capped, a year of decay
+        // (0.005 * 8760 ≈ 43.8) swamps the importance signal so recall sorts by
+        // recency. With the cap, a stale-but-important record stays above fresh,
+        // low-value noise.
+        let cfg = RankingConfig::default();
+        let now = Utc::now();
+        // Importance 3/5 (the Decision/Bug tier), last touched a year ago, NOT L0.
+        let old_important = rec(3.0, 0, iso(now, 24 * 365), vec![]);
+        assert!(!is_l0(&old_important, &cfg), "importance 3 is below l0_min → decay applies");
+        // Fresh but worthless: zero importance, touched just now.
+        let fresh_noise = rec(0.0, 0, iso(now, 0), vec![]);
+        assert!(
+            effective_score(&old_important, &cfg, now) > effective_score(&fresh_noise, &cfg, now),
+            "capped decay must let importance win over pure freshness"
+        );
+        let ranked = rank(&[fresh_noise, old_important], &cfg, now);
+        assert_eq!(ranked[0].importance, 3.0, "old important must rank above fresh noise");
     }
 }

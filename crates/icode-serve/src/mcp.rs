@@ -529,7 +529,7 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Find existing functions/classes that already do what you describe (avoid duplicate work). Semantic+lexical RRF fusion when an embedder is available, else lexical-only. JSON array of CodeHit.")]
+    #[tool(description = "Find existing functions/classes that already do what you describe (avoid duplicate work). Semantic+lexical RRF fusion when an embedder is available, else lexical-only. NOTE: passing a `kind` filter (function|class) forces the lexical-only path EVEN with a live embedder — semantic similarity is NOT applied in that case; omit `kind` (or pass 'all') to get semantic matching. JSON array of CodeHit.")]
     async fn find_existing(&self, Parameters(args): Parameters<FindExistingArgs>) -> String {
         let kind = match args.kind.as_deref() {
             None | Some("") | Some("all") => Ok(None),
@@ -661,7 +661,7 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Direct callers of a symbol (by-name call graph). JSON array of Call.")]
+    #[tool(description = "Direct callers of a symbol. Receiver-aware: pass a QUALIFIED name (e.g. `ServiceA::handle`) for a precise, class-scoped answer; a bare name (`handle`) keeps broad recall. JSON array of Call — each edge carries `resolved_callee` (the disambiguated target) and `confidence` (0.3..0.9, higher = surer).")]
     async fn get_callers(&self, Parameters(args): Parameters<CallersArgs>) -> String {
         let store = self.store.clone();
         let limit = args.limit.unwrap_or(50);
@@ -673,7 +673,7 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Direct callees of a symbol (by-name call graph). JSON array of Call.")]
+    #[tool(description = "Direct callees of a symbol (by-name call graph). JSON array of Call — each edge carries `resolved_callee` (receiver-aware target, e.g. `ServiceA::handle`) and `confidence` (0.3..0.9).")]
     async fn get_callees(&self, Parameters(args): Parameters<CalleesArgs>) -> String {
         let store = self.store.clone();
         let limit = args.limit.unwrap_or(50);
@@ -733,7 +733,7 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Functions never called anywhere (candidate dead code; entry points excluded). JSON array of CodeHit.")]
+    #[tool(description = "APPROXIMATE candidate dead-code — functions whose NAME never appears as a call CALLEE (by-name in-degree = 0). This is NOT proof they are never called: dynamic/reflective calls, callers outside the indexed project, trait/virtual dispatch, and same-name collisions are all invisible. Entry points (main + route handlers) are excluded. Treat hits as candidates to review, not confirmed dead code; do not delete on this basis alone. JSON array of CodeHit.")]
     async fn find_dead_code(&self, Parameters(args): Parameters<AnalysisArgs>) -> String {
         let lang = match parse_lang_arg(args.language.as_deref()) {
             Ok(l) => l,
@@ -749,7 +749,7 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Functions unreachable from any entry point (catches dead clusters, not just zero-in-degree). JSON array of CodeHit.")]
+    #[tool(description = "APPROXIMATE candidate dead-code detector — NOT proof. Walks the call graph by BFS from entry points (main + route handlers) over BARE call-NAME edges, catching dead clusters (a->b->c where a is itself dead), not just zero-in-degree functions. Caveats: same-named functions collide; trait/virtual/dynamic/reflective dispatch is invisible; a LIBRARY crate with no main and no routes has no entry points, so almost everything is reported unreachable (mass false positives). Treat every hit as a candidate to review; never delete code on this basis alone. JSON array of CodeHit.")]
     async fn find_unreachable(&self, Parameters(args): Parameters<AnalysisArgs>) -> String {
         let lang = match parse_lang_arg(args.language.as_deref()) {
             Ok(l) => l,
