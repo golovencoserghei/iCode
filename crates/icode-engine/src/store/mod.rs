@@ -14,6 +14,7 @@ mod vector;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once};
 
 use icode_core::error::{Error, Result};
@@ -86,8 +87,29 @@ fn env_i64(key: &str, default: i64) -> i64 {
 /// The connection is an `Arc<Mutex<…>>` so the vector index ([`Vec0Index`]) can
 /// share it: one connection, one writer, one serialization point for both the
 /// code graph and its vectors.
+/// The call-graph adjacency as returned by [`load_call_edges`]: bare `caller`
+/// name → deduped list of bare `callee` names. Cached behind an [`Arc`] so graph
+/// queries share ONE materialization instead of rebuilding it from the entire
+/// `calls` table (full in-RAM adjacency + dedup `HashSet`) on every request.
+type CachedAdjacency = HashMap<String, Vec<String>>;
+
 pub struct SqliteCodeStore {
     conn: Arc<Mutex<Connection>>,
+    /// Monotonic write-epoch of the call graph. Every mutation that can change the
+    /// `calls` table (`upsert_file`, `delete_file`, `resolve_call_edges`) bumps
+    /// this INSIDE its `conn`-lock critical section; the adjacency cache below is
+    /// valid only while its stored epoch equals the current one. The graph is
+    /// otherwise immutable between index runs, so a stable epoch means a stable
+    /// adjacency — the invariant the cache rides on.
+    graph_epoch: AtomicU64,
+    /// Cached call-graph adjacency tagged with the epoch it was built at. Guarded
+    /// by its OWN mutex — never held together with `conn` — so reading the cache
+    /// never blocks a db write and vice-versa. `None` until first materialized.
+    adjacency_cache: Mutex<Option<(u64, Arc<CachedAdjacency>)>>,
+    /// Test-only tally of how many times the adjacency was rebuilt from SQL (a
+    /// cache HIT does not increment it), so tests can prove the cache is used.
+    #[cfg(test)]
+    rebuild_count: AtomicU64,
 }
 
 impl SqliteCodeStore {
@@ -386,7 +408,70 @@ impl SqliteCodeStore {
         conn.execute_batch(schema::SCHEMA).map_err(store_err)?;
         // Stamp the schema generation so a future incompatible version is detected.
         conn.pragma_update(None, "user_version", SCHEMA_VERSION).map_err(store_err)?;
-        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            graph_epoch: AtomicU64::new(0),
+            adjacency_cache: Mutex::new(None),
+            #[cfg(test)]
+            rebuild_count: AtomicU64::new(0),
+        })
+    }
+
+    /// Bump the call-graph write-epoch, invalidating the cached adjacency. MUST be
+    /// called by every mutation that can change the `calls` table, WHILE the caller
+    /// still holds the `conn` lock, so a concurrent reader that samples the epoch
+    /// under the same lock always sees a consistent (epoch, calls) snapshot.
+    fn bump_graph_epoch(&self) {
+        self.graph_epoch.fetch_add(1, Ordering::Release);
+    }
+
+    /// The call-graph adjacency (bare caller → bare callees), served from an in-RAM
+    /// cache keyed by the write-epoch. On a HIT (cached epoch == current) it clones
+    /// a cheap [`Arc`]; on a MISS it rebuilds from the `calls` table exactly once
+    /// and caches the result. Correctness: every graph mutation bumps the epoch, so
+    /// the first graph query after an index run always rebuilds against the fresh
+    /// graph — the cache can never serve a stale adjacency.
+    ///
+    /// Locking: the fast path takes ONLY the cache lock; the rebuild path takes the
+    /// `conn` lock (and releases it) BEFORE taking the cache lock — the two locks
+    /// are never held simultaneously, so no lock-order deadlock is possible. The
+    /// cache lock is separate from `conn`, so serving a cached graph never blocks a
+    /// db writer.
+    fn call_edges(&self) -> Result<Arc<CachedAdjacency>> {
+        // Fast path: cache hit under the current epoch.
+        {
+            let cache = self.adjacency_cache.lock().map_err(store_err)?;
+            if let Some((cached_epoch, arc)) = cache.as_ref() {
+                if *cached_epoch == self.graph_epoch.load(Ordering::Acquire) {
+                    return Ok(Arc::clone(arc));
+                }
+            }
+        }
+        // Miss: rebuild. Sample the epoch AND the `calls` rows under the SAME conn
+        // lock; writers bump the epoch inside their own conn-lock section, so the
+        // (epoch, adjacency) pair read here is always an internally consistent
+        // snapshot — never a new epoch paired with pre-write rows or vice-versa.
+        let (epoch, built) = {
+            let conn = self.conn.lock().map_err(store_err)?;
+            let epoch = self.graph_epoch.load(Ordering::Acquire);
+            (epoch, load_call_edges(&conn)?)
+        };
+        #[cfg(test)]
+        self.rebuild_count.fetch_add(1, Ordering::Relaxed);
+        let arc = Arc::new(built);
+        // Install, unless another thread already cached an equal-or-newer epoch
+        // (don't clobber a fresher snapshot with our older one).
+        {
+            let mut cache = self.adjacency_cache.lock().map_err(store_err)?;
+            let should_install = match cache.as_ref() {
+                Some((cached_epoch, _)) => *cached_epoch < epoch,
+                None => true,
+            };
+            if should_install {
+                *cache = Some((epoch, Arc::clone(&arc)));
+            }
+        }
+        Ok(arc)
     }
 
     fn count_table(conn: &Connection, table: &str) -> Result<u64> {
@@ -792,10 +877,8 @@ impl CodeReadStore for SqliteCodeStore {
             return Ok(vec![from_bare]);
         }
 
-        let edges = {
-            let conn = self.conn.lock().map_err(store_err)?;
-            load_call_edges(&conn)?
-        };
+        // Cached adjacency (rebuilt only when the graph's write-epoch changed).
+        let edges = self.call_edges()?;
 
         // BFS by bare name; record predecessors to reconstruct the path.
         let mut visited: HashSet<String> = HashSet::new();
@@ -966,8 +1049,11 @@ impl CodeReadStore for SqliteCodeStore {
     /// will be falsely reported. Distinct from `find_dead_code` in that it catches
     /// dead *clusters* (a→b→c where a is itself dead), not just zero-in-degree fns.
     fn find_unreachable(&self, lang: Option<Language>, limit: usize) -> Result<Vec<CodeHit>> {
+        // Materialize the adjacency FIRST (it does its own locking internally),
+        // THEN take the conn lock for the rest — never nest the two, since
+        // `call_edges` may itself acquire `conn` and std `Mutex` is not reentrant.
+        let edges = self.call_edges()?;
         let conn = self.conn.lock().map_err(store_err)?;
-        let edges = load_call_edges(&conn)?;
         let seeds = entry_point_names(&conn)?;
 
         // Mark everything reachable from the seeds (BFS over bare-name edges).
@@ -1461,13 +1547,19 @@ impl CodeWriteStore for SqliteCodeStore {
             }
         }
 
-        tx.commit().map_err(store_err)
+        tx.commit().map_err(store_err)?;
+        // The file's `calls` (and functions) rows just changed → invalidate the
+        // cached adjacency. Bump while still inside the conn-lock critical section.
+        self.bump_graph_epoch();
+        Ok(())
     }
 
     fn delete_file(&self, path: &str) -> Result<()> {
         let conn = self.conn.lock().map_err(store_err)?;
         conn.execute("DELETE FROM files WHERE path = ?1", rusqlite::params![path])
             .map_err(store_err)?;
+        // ON DELETE CASCADE dropped the file's `calls` rows → invalidate the cache.
+        self.bump_graph_epoch();
         Ok(())
     }
 
@@ -1731,6 +1823,11 @@ impl SqliteCodeStore {
                AND NOT EXISTS (SELECT 1 FROM functions f WHERE f.qualified_name = calls.resolved_callee){filter}"
         );
         conn.execute(&null_sql, args.as_slice()).map_err(store_err)?;
+        // `calls` was re-graded. This pass only touches `confidence`/`resolved_callee`
+        // — not `caller`/`callee`, the only columns the adjacency reads — so the
+        // adjacency is unchanged in practice, but we invalidate CONSERVATIVELY (an
+        // extra rebuild is cheaper than risking a stale graph).
+        self.bump_graph_epoch();
         Ok(())
     }
 
@@ -2190,5 +2287,167 @@ fn fts_match_expr(text: &str) -> String {
         "\"\"".to_string()
     } else {
         terms.join(" OR ")
+    }
+}
+
+// ──────────────────────────── tests ────────────────────────────
+
+#[cfg(test)]
+mod adjacency_cache_tests {
+    use super::*;
+    use icode_core::traits::{CodeReadStore, CodeWriteStore};
+
+    fn mk_file(path: &str) -> FileRecord {
+        FileRecord {
+            path: path.to_string(),
+            language: Language::Rust,
+            content_hash: format!("hash-{path}"),
+            ast_hash: format!("ast-{path}"),
+            lines_total: 10,
+            mtime: 0,
+            file_size: 100,
+        }
+    }
+
+    fn mk_fn(path: &str, name: &str) -> FunctionDef {
+        FunctionDef {
+            name: name.to_string(),
+            qualified_name: name.to_string(),
+            path: path.to_string(),
+            language: Language::Rust,
+            line_start: 1,
+            line_end: 2,
+            args: String::new(),
+            return_type: None,
+            docstring: None,
+            body: String::new(),
+            is_async: false,
+            override_type: None,
+            override_target: None,
+        }
+    }
+
+    fn mk_call(path: &str, caller: &str, callee: &str) -> Call {
+        Call {
+            path: path.to_string(),
+            caller: caller.to_string(),
+            callee: callee.to_string(),
+            receiver: None,
+            line: 1,
+            resolved_callee: None,
+            confidence: 0.0,
+        }
+    }
+
+    /// Upsert one file with the given function names and `(caller, callee)` edges.
+    fn upsert(store: &SqliteCodeStore, path: &str, fns: &[&str], edges: &[(&str, &str)]) {
+        let file = mk_file(path);
+        let functions: Vec<FunctionDef> = fns.iter().map(|n| mk_fn(path, n)).collect();
+        let calls: Vec<Call> = edges.iter().map(|(a, b)| mk_call(path, a, b)).collect();
+        store.upsert_file(&file, &functions, &[], &[], &calls, &[]).unwrap();
+    }
+
+    fn rebuilds(store: &SqliteCodeStore) -> u64 {
+        store.rebuild_count.load(Ordering::Relaxed)
+    }
+
+    // (а) Two back-to-back graph queries with no mutation return the SAME
+    // materialization, and the second one is a cache HIT (no extra rebuild).
+    #[test]
+    fn second_query_hits_cache_without_rebuild() {
+        let store = SqliteCodeStore::open_in_memory().unwrap();
+        upsert(&store, "a.rs", &["main", "foo", "bar"], &[("main", "foo"), ("foo", "bar")]);
+
+        assert_eq!(rebuilds(&store), 0, "no query yet → nothing built");
+        let first = store.call_edges().unwrap();
+        assert_eq!(rebuilds(&store), 1, "first query materializes the adjacency once");
+        let second = store.call_edges().unwrap();
+        assert_eq!(rebuilds(&store), 1, "second query is served from cache");
+
+        // Same backing allocation and identical content.
+        assert!(Arc::ptr_eq(&first, &second), "cache returns the same Arc");
+        assert_eq!(*first, *second);
+        // Sanity: the edge really is there.
+        assert!(first.get("main").is_some_and(|v| v.contains(&"foo".to_string())));
+    }
+
+    // (б) After upsert_file AND delete_file the next query sees the change
+    // (write-epoch invalidation forces a rebuild against the fresh graph).
+    #[test]
+    fn upsert_and_delete_invalidate_cache() {
+        let store = SqliteCodeStore::open_in_memory().unwrap();
+        upsert(&store, "a.rs", &["main", "foo", "bar"], &[("main", "foo"), ("foo", "bar")]);
+
+        let _ = store.call_edges().unwrap();
+        assert_eq!(rebuilds(&store), 1);
+        let _ = store.call_edges().unwrap();
+        assert_eq!(rebuilds(&store), 1, "still cached");
+
+        // upsert a new file adding edge bar→baz.
+        upsert(&store, "b.rs", &["baz"], &[("bar", "baz")]);
+        let edges = store.call_edges().unwrap();
+        assert_eq!(rebuilds(&store), 2, "upsert_file bumped the epoch → rebuild");
+        assert!(
+            edges.get("bar").is_some_and(|v| v.contains(&"baz".to_string())),
+            "new edge visible after upsert"
+        );
+
+        // delete_file must invalidate too (CASCADE drops b.rs's calls).
+        store.delete_file("b.rs").unwrap();
+        let edges2 = store.call_edges().unwrap();
+        assert_eq!(rebuilds(&store), 3, "delete_file bumped the epoch → rebuild");
+        assert!(
+            !edges2.get("bar").is_some_and(|v| v.contains(&"baz".to_string())),
+            "deleted edge gone after delete"
+        );
+    }
+
+    // resolve_call_edges is a graph mutator too — prove it bumps the epoch and
+    // invalidates the cache (conservative: it only re-grades confidence).
+    #[test]
+    fn resolve_call_edges_invalidates_cache() {
+        let store = SqliteCodeStore::open_in_memory().unwrap();
+        upsert(&store, "a.rs", &["main", "foo"], &[("main", "foo")]);
+
+        let epoch_before = store.graph_epoch.load(Ordering::Acquire);
+        let _ = store.call_edges().unwrap();
+        let builds_before = rebuilds(&store);
+
+        store.resolve_call_edges(None).unwrap();
+        assert!(
+            store.graph_epoch.load(Ordering::Acquire) > epoch_before,
+            "resolve_call_edges bumps the write-epoch"
+        );
+        let _ = store.call_edges().unwrap();
+        assert_eq!(rebuilds(&store), builds_before + 1, "resolve invalidated the cache");
+    }
+
+    // (в) No regression: call_chain / find_unreachable produce the expected
+    // results over the cached adjacency, and repeated calls are stable.
+    #[test]
+    fn call_chain_and_find_unreachable_regression() {
+        let store = SqliteCodeStore::open_in_memory().unwrap();
+        // main→foo→bar reachable; `orphan` is defined but never called.
+        upsert(
+            &store,
+            "a.rs",
+            &["main", "foo", "bar", "orphan"],
+            &[("main", "foo"), ("foo", "bar")],
+        );
+
+        let chain = store.call_chain("main", "bar", 5).unwrap();
+        assert_eq!(
+            chain,
+            vec!["main".to_string(), "foo".to_string(), "bar".to_string()],
+        );
+        // Second call rides the cache; identical path.
+        assert_eq!(store.call_chain("main", "bar", 5).unwrap(), chain);
+
+        let dead = store.find_unreachable(None, 100).unwrap();
+        let names: Vec<&str> = dead.iter().map(|h| h.name.as_str()).collect();
+        assert!(names.contains(&"orphan"), "orphan unreachable, got {names:?}");
+        assert!(!names.contains(&"main"));
+        assert!(!names.contains(&"foo"));
+        assert!(!names.contains(&"bar"));
     }
 }

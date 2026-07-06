@@ -80,6 +80,40 @@ fn f32_blob(v: &[f32]) -> Vec<u8> {
     out
 }
 
+/// Decode a little-endian f32 byte blob back into a vector (inverse of
+/// [`f32_blob`]). On a plain (non-`MATCH`) select, vec0 returns a stored vector as
+/// exactly this raw blob, which the project-scoped retrieval decodes to score
+/// cosine distance in Rust. Trailing bytes that don't form a full f32 are ignored.
+fn blob_to_f32(blob: &[u8]) -> Vec<f32> {
+    blob.chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect()
+}
+
+/// Cosine distance between two vectors, matching sqlite-vec's vec0
+/// `distance_metric=cosine` EXACTLY: `1 - dot/(|a|*|b|)`, accumulated in f32 so a
+/// distance computed here is directly comparable to a vec0 KNN distance — the
+/// `dedup_distance` gate was calibrated against vec0's own value. A zero-norm
+/// operand yields the maximal distance `1.0` rather than a NaN that would poison
+/// ordering. `a`/`b` are expected to be the same length (the store's fixed dim);
+/// any excess tail is ignored.
+fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    let mut dot = 0f32;
+    let mut a_mag = 0f32;
+    let mut b_mag = 0f32;
+    for i in 0..n {
+        dot += a[i] * b[i];
+        a_mag += a[i] * a[i];
+        b_mag += b[i] * b[i];
+    }
+    let denom = a_mag.sqrt() * b_mag.sqrt();
+    if denom == 0.0 {
+        return 1.0;
+    }
+    1.0 - dot / denom
+}
+
 /// Map any rusqlite error into the framework-free `Error::Store` variant.
 fn store_err<E: std::fmt::Display>(e: E) -> Error {
     Error::Store(e.to_string())
@@ -559,7 +593,16 @@ impl ReadableMemoryStore for SqliteMemoryStore {
         let over = oversample(n);
         let conn = self.conn.lock().map_err(store_err)?;
 
-        let semantic = knn_records(&conn, &qvec, over, Some(project), category, include_resolved)?;
+        // Per-project dense recall is a PROJECT-SCOPED brute force, NOT a global
+        // vec0 KNN + post-filter. vec0 cannot pre-filter by project, so in the
+        // shared central db the global top-`over` can be dominated by OTHER
+        // projects' vectors — starving this project's true-nearest rows even though
+        // they sit just past the cutoff. Scanning only this project's vectors makes
+        // recall independent of how large the cross-project db grows.
+        let semantic =
+            knn_records_in_project(&conn, &qvec, over, project, category, include_resolved)?;
+        // The lexical arm is project-scoped IN SQL (the project filter is pushed
+        // below the bm25 LIMIT), immune to the same starvation — see `fts_records`.
         let lexical = fts_records(&conn, &clean, over, Some(project), category, include_resolved)?;
         drop(conn);
 
@@ -660,44 +703,31 @@ impl ReadableMemoryStore for SqliteMemoryStore {
 
 // ──────────────────────────── dedup gate ────────────────────────────
 
-/// Number of vec0 neighbours to pull for the dedup gate before the project
-/// post-filter. vec0 has no pre-filter, so a cross-project nearest could mask the
-/// real same-project nearest; oversampling a few (k=3) makes that unlikely.
-const DEDUP_K: usize = 3;
-
 /// Nearest existing SAME-project memory to `vector`: `(id, distance)` of the
-/// closest survivor after the project post-filter, or `None` if the project has
-/// no neighbours yet. Used by the `add` dedup gate. Resolved memories still count
-/// as duplicates (re-adding a resolved fact is still a dup).
+/// closest record after a PROJECT-SCOPED brute-force scan, or `None` if the
+/// project has no vectors yet. Used by the `add` dedup gate.
+///
+/// Why brute force instead of a vec0 KNN + post-filter: vec0 cannot pre-filter by
+/// project, so a global k-NN over the shared central db could return only OTHER
+/// projects' vectors — arbitrarily many of them closer than this project's true
+/// near-duplicate — and never surface it. The gate would then miss the dup and let
+/// duplicates accumulate as the cross-project db grows. Scanning ONLY this
+/// project's vectors makes the gate independent of the rest of the db; rows-per-
+/// project are few, so the scan is cheap. Resolved memories still count as
+/// duplicates (re-adding a resolved fact is still a dup), so no status filter.
 fn nearest_same_project(
     conn: &Connection,
     vector: &[f32],
     project: &str,
 ) -> Result<Option<(MemoryId, f32)>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT m.id, m.project, v.distance \
-             FROM vec_memory v \
-             JOIN mem_rowid b ON b.rowid = v.rowid \
-             JOIN memories m ON m.id = b.mem_id \
-             WHERE v.embedding MATCH ?1 AND k = ?2 \
-             ORDER BY v.distance",
-        )
-        .map_err(store_err)?;
-    let rows = stmt
-        .query_map(params![f32_blob(vector), DEDUP_K as i64], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)? as f32))
-        })
-        .map_err(store_err)?;
-    // Neighbours are already ascending by distance; the first same-project row is
-    // the nearest one.
-    for row in rows {
-        let (id, p, dist) = row.map_err(store_err)?;
-        if p == project {
-            return Ok(Some((MemoryId(id), dist)));
+    let mut best: Option<(MemoryId, f32)> = None;
+    for (rec, v) in project_vectors(conn, project, None, true)? {
+        let dist = cosine_distance(vector, &v);
+        if best.as_ref().map_or(true, |(_, d)| dist < *d) {
+            best = Some((rec.id, dist));
         }
     }
-    Ok(None)
+    Ok(best)
 }
 
 // ──────────────────────────── retrieval helpers ────────────────────────────
@@ -745,10 +775,95 @@ fn knn_records(
     Ok(out)
 }
 
-/// Lexical (fts5 MATCH) retrieval over `fts_memory`, re-hydrated to records via
-/// the bridge and post-filtered the same way as the dense path. bm25() orders
-/// best-first (most-negative = most relevant). A malformed fts query yields no
-/// hits rather than an error (M4.2 adds an FTS sanitizer).
+/// Decode EVERY same-project memory vector into `(record, vector)` pairs, applying
+/// the optional category / active-only filters IN SQL so the candidate set is
+/// bounded by the PROJECT — never by the size of the shared central db. This is
+/// the shared primitive behind the project-scoped dense search
+/// (`knn_records_in_project`) and the dedup gate (`nearest_same_project`).
+///
+/// The vectors are read straight out of the vec0 `vec_memory` column: on a plain
+/// (non-`MATCH`) select vec0 returns each stored vector as its raw little-endian
+/// f32 blob, which `blob_to_f32` inverts. vec0 cannot pre-filter by project, but
+/// the join drives FROM `memories` (project-indexed) and looks the vector up by
+/// `rowid` — a vec0 POINT query — so ONLY this project's vectors are ever decoded.
+fn project_vectors(
+    conn: &Connection,
+    project: &str,
+    category: Option<Category>,
+    include_resolved: bool,
+) -> Result<Vec<(MemoryRecord, Vec<f32>)>> {
+    let mut sql = String::from(
+        "SELECT m.id, m.project, m.content, m.category, m.tags, m.importance, m.status, \
+                m.resolved_at, m.resolve_reason, m.session_id, m.access_count, \
+                m.created_at, m.last_accessed_at, m.updated_at, v.embedding \
+         FROM memories m \
+         JOIN mem_rowid b ON b.mem_id = m.id \
+         JOIN vec_memory v ON v.rowid = b.rowid \
+         WHERE m.project = ?1",
+    );
+    let mut binds: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(project.to_string())];
+    if let Some(c) = category {
+        sql.push_str(" AND m.category = ?");
+        binds.push(Box::new(category_str(c).to_string()));
+    }
+    if !include_resolved {
+        sql.push_str(" AND m.status = 'active'");
+    }
+    let mut stmt = conn.prepare(&sql).map_err(store_err)?;
+    let refs: Vec<&dyn rusqlite::types::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+    let rows = stmt
+        .query_map(refs.as_slice(), |row| {
+            let rec = map_record(row)?;
+            let blob: Vec<u8> = row.get(14)?;
+            Ok((rec, blob))
+        })
+        .map_err(store_err)?;
+    let mut out = Vec::new();
+    for r in rows {
+        let (rec, blob) = r.map_err(store_err)?;
+        out.push((rec, blob_to_f32(&blob)));
+    }
+    Ok(out)
+}
+
+/// Project-scoped dense KNN: rank THIS project's vectors by cosine distance to
+/// `qvec` in Rust and return the `k` nearest, best-first (ascending distance ==
+/// descending similarity), preserving rank for RRF. Unlike a global vec0 KNN with
+/// a project post-filter, the result cannot be starved by other projects' rows as
+/// the shared db grows — see `project_vectors`.
+fn knn_records_in_project(
+    conn: &Connection,
+    qvec: &[f32],
+    k: usize,
+    project: &str,
+    category: Option<Category>,
+    include_resolved: bool,
+) -> Result<Vec<MemoryRecord>> {
+    if k == 0 {
+        return Ok(vec![]);
+    }
+    let mut scored: Vec<(f32, MemoryRecord)> =
+        project_vectors(conn, project, category, include_resolved)?
+            .into_iter()
+            .map(|(rec, v)| (cosine_distance(qvec, &v), rec))
+            .collect();
+    // Ascending cosine distance == descending similarity → best-first for RRF.
+    scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(k);
+    Ok(scored.into_iter().map(|(_, rec)| rec).collect())
+}
+
+/// Lexical (fts5 MATCH) retrieval over `fts_memory`, re-hydrated to records via the
+/// bridge. bm25() orders best-first (most-negative = most relevant). A malformed
+/// fts query yields no hits rather than an error.
+///
+/// When `project`/`category`/status is scoped, the filter is pushed INTO the SQL
+/// (below the bm25 `LIMIT`), NOT applied after — otherwise the lexical arm would
+/// degrade exactly like a global dense KNN: the `k` best-bm25 rows could all belong
+/// to OTHER projects in a large shared db, leaving this project's lexical hits
+/// unreturned. Scoping in SQL keeps per-project lexical recall independent of the
+/// cross-project db size. `project = None` (cross-project `search_all`) is a plain
+/// global bm25 pull.
 fn fts_records(
     conn: &Connection,
     query: &str,
@@ -760,21 +875,33 @@ fn fts_records(
     if k == 0 {
         return Ok(vec![]);
     }
-    let mut stmt = conn
-        .prepare(
-            "SELECT m.id, m.project, m.content, m.category, m.tags, m.importance, m.status, \
-                    m.resolved_at, m.resolve_reason, m.session_id, m.access_count, \
-                    m.created_at, m.last_accessed_at, m.updated_at \
-             FROM fts_memory f \
-             JOIN mem_rowid b ON b.rowid = f.rowid \
-             JOIN memories m ON m.id = b.mem_id \
-             WHERE fts_memory MATCH ?1 \
-             ORDER BY bm25(fts_memory) LIMIT ?2",
-        )
-        .map_err(store_err)?;
+    let mut sql = String::from(
+        "SELECT m.id, m.project, m.content, m.category, m.tags, m.importance, m.status, \
+                m.resolved_at, m.resolve_reason, m.session_id, m.access_count, \
+                m.created_at, m.last_accessed_at, m.updated_at \
+         FROM fts_memory f \
+         JOIN mem_rowid b ON b.rowid = f.rowid \
+         JOIN memories m ON m.id = b.mem_id \
+         WHERE fts_memory MATCH ?",
+    );
+    let mut binds: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(sanitize_fts5(query))];
+    if let Some(p) = project {
+        sql.push_str(" AND m.project = ?");
+        binds.push(Box::new(p.to_string()));
+    }
+    if let Some(c) = category {
+        sql.push_str(" AND m.category = ?");
+        binds.push(Box::new(category_str(c).to_string()));
+    }
+    if !include_resolved {
+        sql.push_str(" AND m.status = 'active'");
+    }
+    sql.push_str(" ORDER BY bm25(fts_memory) LIMIT ?");
+    binds.push(Box::new(k as i64));
 
-    let match_expr = sanitize_fts5(query);
-    let rows = match stmt.query_map(params![match_expr, k as i64], map_record) {
+    let mut stmt = conn.prepare(&sql).map_err(store_err)?;
+    let refs: Vec<&dyn rusqlite::types::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+    let rows = match stmt.query_map(refs.as_slice(), map_record) {
         Ok(rows) => rows,
         // A query fts5 cannot parse is a soft miss (the dense list still answers).
         Err(_) => return Ok(vec![]),
@@ -783,8 +910,7 @@ fn fts_records(
     let mut out = Vec::new();
     for r in rows {
         match r {
-            Ok(rec) if passes_filters(&rec, project, category, include_resolved) => out.push(rec),
-            Ok(_) => {}
+            Ok(rec) => out.push(rec),
             Err(_) => return Ok(out), // tolerate a mid-stream fts error
         }
     }
@@ -1025,5 +1151,204 @@ mod tests {
         let b = vec![mk("l0", 5.0)];
         let fused = rrf_fuse_memory(&[a, b], 10, &icode_core::config::RankingConfig::default());
         assert_eq!(fused[0].record.id.0, "l0", "L0 record wins the RRF tie via the ranking blend");
+    }
+
+    // ─────────────── project-scoped retrieval / dedup (fake embedder) ───────────────
+    //
+    // These exercise the FULL store (open → add → embed → vec0/fts → search/dedup)
+    // WITHOUT Ollama, using a deterministic angle embedder so records sit at exact
+    // cosine distances. They prove the fix for the shared-db degradation: with the
+    // legacy GLOBAL vec0 KNN + post-filter, a project's true-nearest rows are lost
+    // once enough OTHER projects' vectors crowd the top-k; the project-scoped scans
+    // here are independent of that.
+
+    /// Ollama-free embedder for the retrieval tests. It reads an angle directive
+    /// `#a<radians>` from the text and returns the unit vector `(cos θ, sin θ, 0, …)`
+    /// in `VEC_DIM` space. Two texts then sit at vec0 cosine distance
+    /// `1 - cos(θ₁-θ₂)`, so a test can place records at EXACT distances from a query
+    /// and from each other — no embedding backend required. Absent directive → θ=0.
+    struct AngleEmbedder;
+
+    impl AngleEmbedder {
+        fn angle_of(text: &str) -> f32 {
+            if let Some(pos) = text.find("#a") {
+                let rest = &text[pos + 2..];
+                let end = rest.find(' ').unwrap_or(rest.len());
+                if let Ok(v) = rest[..end].parse::<f32>() {
+                    return v;
+                }
+            }
+            0.0
+        }
+    }
+
+    impl Embedder for AngleEmbedder {
+        fn model_id(&self) -> &str {
+            "angle-fake"
+        }
+        fn dim(&self) -> usize {
+            schema::VEC_DIM
+        }
+        fn backend(&self) -> &str {
+            "fake"
+        }
+        fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    let theta = Self::angle_of(t);
+                    let mut v = vec![0f32; schema::VEC_DIM];
+                    v[0] = theta.cos();
+                    v[1] = theta.sin();
+                    v
+                })
+                .collect())
+        }
+        fn health(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn open_fake_store() -> (SqliteMemoryStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("icode.db");
+        let store = SqliteMemoryStore::open(db.to_str().unwrap(), Arc::new(AngleEmbedder))
+            .expect("open fake store");
+        (store, dir)
+    }
+
+    fn add_mem(store: &SqliteMemoryStore, project: &str, content: &str) -> AddOutcome {
+        store
+            .add(NewMemory {
+                project: project.into(),
+                content: content.into(),
+                category: Category::General,
+                tags: vec![],
+                importance: 0.0,
+                session_id: None,
+            })
+            .expect("add")
+    }
+
+    #[test]
+    fn per_project_search_survives_a_large_foreign_db() {
+        let (store, _dir) = open_fake_store();
+
+        // Target project P: 3 DISTINCT relevant records (well-separated angles so
+        // the project-scoped dedup gate does not reject them as near-duplicates of
+        // each other). P's BEST match to the query sits at angle 0.12.
+        let mut target_ids = Vec::new();
+        for (w, a) in [("alpha", "0.12"), ("beta", "0.90"), ("gamma", "1.60")] {
+            match add_mem(&store, "P", &format!("topicword {w} #a{a}")) {
+                AddOutcome::Added { id } => target_ids.push(id),
+                other => panic!("expected Added for {w}, got {other:?}"),
+            }
+        }
+        assert_eq!(target_ids.len(), 3);
+
+        // 40 FOREIGN records, EACH IN ITS OWN project (iCode's premise: many
+        // projects share one vector space) and each STRICTLY closer to the query
+        // than P's best match (angles 0.001..0.040 → distance < P's 0.0072). Under
+        // the legacy global oversample (`over == 20`) these crowd P's true-nearest
+        // rows out of the KNN top-k. Distinct projects also keep the per-project
+        // dedup gate from rejecting them.
+        for i in 0..40 {
+            let theta = 0.001 * (i as f32 + 1.0);
+            match add_mem(&store, &format!("other{i}"), &format!("noise{i} #a{theta}")) {
+                AddOutcome::Added { .. } => {}
+                other => panic!("expected Added for noise{i}, got {other:?}"),
+            }
+        }
+
+        let query = "topicword #a0.0";
+        let over = oversample(5); // == 20, the legacy KNN pull width
+
+        // Prove the legacy failure mode: a GLOBAL vec0 KNN (project = None) — what
+        // the old per-project `search` post-filtered — returns ZERO rows of P; they
+        // are all past position `over`.
+        {
+            let qvec = store.embed_one(query).unwrap();
+            let conn = store.conn.lock().unwrap();
+            let global = knn_records(&conn, &qvec, over, None, None, false).unwrap();
+            assert_eq!(global.len(), over, "global KNN fills up entirely on foreign rows");
+            assert!(
+                !global.iter().any(|r| r.project == "P"),
+                "legacy global top-{over} is 100% foreign — P's hits would be lost"
+            );
+        }
+
+        // The fixed, project-scoped search still returns P's relevant records.
+        let hits = store.search("P", query, 5, None, false).expect("search");
+        assert!(!hits.is_empty(), "project-scoped recall is non-empty");
+        assert!(hits.iter().all(|h| h.record.project == "P"), "only P rows returned");
+        let got: std::collections::HashSet<_> =
+            hits.iter().map(|h| h.record.id.clone()).collect();
+        for id in &target_ids {
+            assert!(got.contains(id), "P's relevant record {id:?} must survive recall");
+        }
+    }
+
+    #[test]
+    fn dedup_is_project_scoped_against_foreign_neighbours() {
+        let (store, _dir) = open_fake_store();
+
+        // An existing canonical record in project P at angle 0.2010.
+        let existing = match add_mem(&store, "P", "canonical fact #a0.2010") {
+            AddOutcome::Added { id } => id,
+            other => panic!("expected Added, got {other:?}"),
+        };
+
+        // FOREIGN records (each in its OWN project, so the per-project dedup does
+        // not reject them) sitting even CLOSER to the incoming vector (angle 0.2000)
+        // than P's own record: angles 0.20001..0.20004 (Δ ≤ 0.00004) beat P's
+        // Δ = 0.001. The legacy dedup pulled DEDUP_K = 3 GLOBAL neighbours and
+        // post-filtered to P — these foreign rows would fill that top-3 and hide P's
+        // true near-duplicate, letting the dup slip in.
+        for (i, a) in ["0.20001", "0.20002", "0.20003", "0.20004"].iter().enumerate() {
+            match add_mem(&store, &format!("other{i}"), &format!("foreign{i} #a{a}")) {
+                AddOutcome::Added { .. } => {}
+                other => panic!("expected Added for foreign{i}, got {other:?}"),
+            }
+        }
+
+        // Prove the legacy failure mode: the 3 GLOBAL nearest to the incoming vector
+        // are all foreign, so a global-K dedup would see no P row → no duplicate.
+        {
+            let incoming = store.embed_one("near duplicate #a0.2000").unwrap();
+            let conn = store.conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT m.project FROM vec_memory v \
+                     JOIN mem_rowid b ON b.rowid = v.rowid \
+                     JOIN memories m ON m.id = b.mem_id \
+                     WHERE v.embedding MATCH ?1 AND k = ?2 ORDER BY v.distance",
+                )
+                .unwrap();
+            let projs: Vec<String> = stmt
+                .query_map(rusqlite::params![f32_blob(&incoming), 3_i64], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            assert_eq!(projs.len(), 3);
+            assert!(
+                projs.iter().all(|p| p != "P"),
+                "legacy global top-3 is all foreign (no P row): {projs:?}"
+            );
+        }
+
+        // The fixed, project-scoped dedup DOES catch the near-duplicate in P.
+        match add_mem(&store, "P", "near duplicate #a0.2000") {
+            AddOutcome::Duplicate { existing: hit, distance } => {
+                assert_eq!(hit, existing, "dup resolves to P's canonical record");
+                assert!(
+                    distance < store.dedup_distance,
+                    "distance {distance} must be under the gate {}",
+                    store.dedup_distance
+                );
+            }
+            other => panic!("expected Duplicate, got {other:?}"),
+        }
     }
 }
