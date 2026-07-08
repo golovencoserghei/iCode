@@ -174,7 +174,7 @@ pub fn index_path(root: &Path, store: &SqliteCodeStore) -> Result<IndexStats> {
         // ordered `collect` preserves the sorted order for the sequential write.
         let outcomes: Vec<Outcome> = batch
             .par_iter()
-            .map(|p| classify(p, prior.get(p.to_string_lossy().as_ref()), max_bytes, force))
+            .map(|p| classify(p, prior.get(p.to_string_lossy().as_ref()), max_bytes, force, root))
             .collect();
 
         // Sequential store writes behind the single Mutex, in sorted-path order.
@@ -286,7 +286,13 @@ enum Outcome {
 /// and parses ONLY when the content actually changed — pure and store-free, so it
 /// runs on a rayon worker. The heavy work (tree-sitter parse + chunk assembly)
 /// happens here, off the store's serialization point.
-fn classify(path: &Path, prior: Option<&FileMeta>, max_bytes: u64, force: bool) -> Outcome {
+fn classify(
+    path: &Path,
+    prior: Option<&FileMeta>,
+    max_bytes: u64,
+    force: bool,
+    root: &Path,
+) -> Outcome {
     let path_str = path.to_string_lossy().to_string();
     // Defensive: the walk already filtered to supported extensions.
     let language = match language_for(path) {
@@ -318,7 +324,7 @@ fn classify(path: &Path, prior: Option<&FileMeta>, max_bytes: u64, force: bool) 
             }
         }
     }
-    Outcome::Reindex(Box::new(build_parsed(path, language, &source, &meta, hash)))
+    Outcome::Reindex(Box::new(build_parsed(path, language, &source, &meta, hash, root)))
 }
 
 /// Write one already-parsed file into the store: replace its graph rows and its
@@ -352,6 +358,7 @@ fn build_parsed(
     source: &str,
     meta: &Metadata,
     content_hash: String,
+    root: &Path,
 ) -> ParsedFile {
     let path_str = path.to_string_lossy().to_string();
     let parsed = parse_for(language, source, &path_str, path);
@@ -364,7 +371,7 @@ fn build_parsed(
         mtime: mtime_secs(meta),
         file_size: meta.len(),
     };
-    let chunks = chunks_for_file(&parsed.functions, &parsed.classes);
+    let chunks = chunks_for_file(&parsed.functions, &parsed.classes, root);
     ParsedFile {
         file,
         functions: parsed.functions,
@@ -403,8 +410,8 @@ fn mtime_secs(meta: &Metadata) -> i64 {
 /// Returns the per-file [`IndexStats`] for one file (`files_indexed = 1` on
 /// success). An unsupported extension or a read/parse failure is an `Err` — the
 /// daemon turns that into a `record_parse_error` and keeps running.
-pub fn index_one_file(path: &Path, store: &SqliteCodeStore) -> Result<IndexStats> {
-    let counts = index_file(path, store)?;
+pub fn index_one_file(path: &Path, store: &SqliteCodeStore, root: &Path) -> Result<IndexStats> {
+    let counts = index_file(path, store, root)?;
     // Re-grade this file's outgoing edges against the (already-complete) functions
     // table. Scoped to the one path for speed — the rest of the project is already
     // resolved; only edges whose target def CHANGED in this file could drift, which
@@ -460,7 +467,7 @@ struct FileCounts {
 /// single changed file. Reads → (size-gates) → parses → `upsert_file` +
 /// `upsert_chunks`. This always reparses (no hash skip): the daemon only calls it
 /// for a file it already knows changed, so a skip check would be dead weight.
-fn index_file(path: &Path, store: &SqliteCodeStore) -> Result<FileCounts> {
+fn index_file(path: &Path, store: &SqliteCodeStore, root: &Path) -> Result<FileCounts> {
     let language =
         language_for(path).ok_or_else(|| Error::Invalid("unsupported extension".into()))?;
     let meta = std::fs::metadata(path).map_err(|e| Error::Io(e.to_string()))?;
@@ -482,7 +489,7 @@ fn index_file(path: &Path, store: &SqliteCodeStore) -> Result<FileCounts> {
     // Chunk+persist the file's symbols (graph-fast path: writes code_chunks with NO
     // vectors, so this never blocks on the network — the embed pass fills vectors
     // asynchronously). Keyed by path, idempotent per file.
-    let pf = build_parsed(path, language, &source, &meta, hash);
+    let pf = build_parsed(path, language, &source, &meta, hash, root);
     write_parsed(store, &pf)
 }
 

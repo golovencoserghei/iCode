@@ -17,6 +17,8 @@
 // TODO(chunk): emit FileWindow chunks for symbol-less files (line-window over raw
 // source) so config/sql/docs become semantically searchable.
 
+use std::path::Path;
+
 use icode_core::model::{ClassDef, CodeChunk, FunctionDef, SymbolKind};
 use sha2::{Digest, Sha256};
 
@@ -29,16 +31,35 @@ pub const CHUNK_BUDGET_BYTES: usize = 24_000;
 /// body is split, so a symbol straddling the boundary is not lost to either side.
 const CHUNK_OVERLAP_BYTES: usize = 200;
 
+/// Render `path` relative to `root` for the embeddable chunk HEADER, so the chunk
+/// text — and thus its `content_hash` (the embed-cache key) — is INDEPENDENT of
+/// where the repo is checked out. This is what lets the shared embed cache hit
+/// across git worktrees and re-clones: identical code at the same repo-relative
+/// path produces byte-identical chunk text everywhere. Falls back to the original
+/// path when it is not under `root` (defensive; parity then degrades to per-path).
+pub fn rel_display_path(path: &str, root: &Path) -> String {
+    Path::new(path)
+        .strip_prefix(root)
+        .map(|rel| rel.to_string_lossy().to_string())
+        .unwrap_or_else(|_| path.to_string())
+}
+
 /// Build the embeddable chunks for one file's symbols: one chunk per function and
-/// per class (split into overlapping sub-chunks when oversized).
+/// per class (split into overlapping sub-chunks when oversized). The header path is
+/// rendered RELATIVE to `root` (see [`rel_display_path`]) so a chunk's hash is
+/// independent of where the repo is checked out.
 ///
 /// `symbol_id` is left `None` — chunks are linked back to their owning symbol by
 /// `(qualified_name, path)` in a later pass, not at chunk-build time.
-pub fn chunks_for_file(functions: &[FunctionDef], classes: &[ClassDef]) -> Vec<CodeChunk> {
+pub fn chunks_for_file(
+    functions: &[FunctionDef],
+    classes: &[ClassDef],
+    root: &Path,
+) -> Vec<CodeChunk> {
     let mut out = Vec::with_capacity(functions.len() + classes.len());
 
     for f in functions {
-        let header = function_header(f);
+        let header = function_header(&rel_display_path(&f.path, root), f);
         push_symbol_chunks(
             &mut out,
             SymbolKind::Function,
@@ -52,7 +73,7 @@ pub fn chunks_for_file(functions: &[FunctionDef], classes: &[ClassDef]) -> Vec<C
     }
 
     for c in classes {
-        let header = class_header(c);
+        let header = class_header(&rel_display_path(&c.path, root), c);
         push_symbol_chunks(
             &mut out,
             SymbolKind::Class,
@@ -68,30 +89,12 @@ pub fn chunks_for_file(functions: &[FunctionDef], classes: &[ClassDef]) -> Vec<C
     out
 }
 
-/// The embeddable text for one function symbol: the same parent-context header +
-/// body that [`chunks_for_file`] produces for the FIRST chunk of the symbol.
-///
-/// `find_similar` (search service) embeds a symbol to query the vector index, and
-/// the query vector MUST be computed exactly like the index-time vector or the KNN
-/// is comparing apples to oranges. Reusing [`function_header`] guarantees that.
-/// (An oversized symbol is split into `part i/N` sub-chunks at index time; this
-/// helper returns the un-split `header+body`, which is the right query text — we
-/// want the whole symbol's centroid, not one slice — and is identical to the
-/// single-chunk case that covers the overwhelming majority of symbols.)
-pub fn chunk_text_for_function(f: &FunctionDef) -> String {
-    format!("{}{}", function_header(f), f.body)
-}
-
-/// The embeddable text for one class symbol (see [`chunk_text_for_function`] for
-/// why the builder is shared with the index path).
-pub fn chunk_text_for_class(c: &ClassDef) -> String {
-    format!("{}{}", class_header(c), c.body)
-}
-
 /// Parent-context header for a function chunk: file path, qualified name with the
 /// argument list, and the docstring (when present), each on its own comment line.
-fn function_header(f: &FunctionDef) -> String {
-    let mut h = format!("// {}\n// {}({})\n", f.path, f.qualified_name, f.args);
+/// `display_path` is the repo-relative path (see [`rel_display_path`]) so the header
+/// — and the chunk hash — is checkout-location-independent.
+fn function_header(display_path: &str, f: &FunctionDef) -> String {
+    let mut h = format!("// {}\n// {}({})\n", display_path, f.qualified_name, f.args);
     if let Some(doc) = doc_line(f.docstring.as_deref()) {
         h.push_str(&doc);
     }
@@ -100,13 +103,14 @@ fn function_header(f: &FunctionDef) -> String {
 
 /// Parent-context header for a class chunk: file path, qualified name with its
 /// base list (`: Base1, Base2` when non-empty), and the docstring (when present).
-fn class_header(c: &ClassDef) -> String {
+/// `display_path` is repo-relative (see [`rel_display_path`]).
+fn class_header(display_path: &str, c: &ClassDef) -> String {
     let bases = if c.bases.is_empty() {
         String::new()
     } else {
         format!(": {}", c.bases.join(", "))
     };
-    let mut h = format!("// {}\n// {}{}\n", c.path, c.qualified_name, bases);
+    let mut h = format!("// {}\n// {}{}\n", display_path, c.qualified_name, bases);
     if let Some(doc) = doc_line(c.docstring.as_deref()) {
         h.push_str(&doc);
     }

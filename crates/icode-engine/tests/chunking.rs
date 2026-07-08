@@ -56,7 +56,7 @@ fn one_chunk_per_symbol_with_header_and_hash() {
         "struct Service { cache: Map }",
     )];
 
-    let chunks = chunks_for_file(&functions, &classes);
+    let chunks = chunks_for_file(&functions, &classes, std::path::Path::new("/"));
 
     // Exactly one chunk per symbol (no overflow at these tiny sizes).
     assert_eq!(chunks.len(), 3, "one chunk per function + class");
@@ -115,7 +115,7 @@ fn one_chunk_per_symbol_with_header_and_hash() {
 
 #[test]
 fn no_docstring_header_still_valid() {
-    let chunks = chunks_for_file(&[func("bare", "", None, "{}")], &[]);
+    let chunks = chunks_for_file(&[func("bare", "", None, "{}")], &[], std::path::Path::new("/"));
     assert_eq!(chunks.len(), 1);
     let c = &chunks[0];
     assert!(
@@ -136,7 +136,7 @@ fn oversized_body_splits_into_multiple_subchunks() {
     }
 
     let functions = vec![func("Huge::method", "&self", None, &body)];
-    let chunks = chunks_for_file(&functions, &[]);
+    let chunks = chunks_for_file(&functions, &[], std::path::Path::new("/"));
 
     assert!(
         chunks.len() > 1,
@@ -183,7 +183,7 @@ fn multibyte_body_does_not_panic_and_splits_cleanly() {
     while body.len() < CHUNK_BUDGET_BYTES * 2 {
         body.push_str(line);
     }
-    let chunks = chunks_for_file(&[func("uni::fn", "", None, &body)], &[]);
+    let chunks = chunks_for_file(&[func("uni::fn", "", None, &body)], &[], std::path::Path::new("/"));
     assert!(chunks.len() > 1);
     for ch in &chunks {
         // Round-trips through UTF-8 validation implicitly (it's a String); ensure

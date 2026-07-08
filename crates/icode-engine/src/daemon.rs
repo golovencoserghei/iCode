@@ -141,7 +141,7 @@ fn process_batch(root: &Path, store: &SqliteCodeStore, mut paths: Vec<PathBuf>) 
 
         if path.exists() {
             // Created or modified → re-index (replaces the file's old rows).
-            match index_one_file(&path, store) {
+            match index_one_file(&path, store, root) {
                 Ok(_) => reindexed += 1,
                 Err(e) => {
                     // A parse/read failure of one file must not kill the daemon.

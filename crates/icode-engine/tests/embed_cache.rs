@@ -162,3 +162,52 @@ fn cache_rehydrates_on_reindex_without_re_embedding() {
     assert_eq!(s4.rehydrated, 0);
     assert_eq!(emb.calls(), calls_steady, "idempotent: nothing pending");
 }
+
+/// The cross-project / worktree payoff: with a SHARED central embed cache, the same
+/// code at the same repo-relative path — checked out under a DIFFERENT root, exactly
+/// as a git worktree or a second clone is — re-embeds NOTHING. It relies on two
+/// pieces working together: (1) `with_embed_cache_db` routes the cache to one shared
+/// db, and (2) the chunk header path is rendered relative to the project root, so a
+/// chunk's `content_hash` is independent of where the repo lives on disk.
+#[test]
+fn shared_central_cache_reused_across_projects() {
+    let central_dir = tempfile::tempdir().expect("central tmp");
+    let central = central_dir.path().join("central.db");
+    let central = central.to_str().unwrap();
+
+    let emb = CountingEmbedder::new();
+
+    // ── Project A (its own root): index + embed into the SHARED cache (cold) ──
+    let dir_a = tempfile::tempdir().expect("A tmp");
+    fs::write(dir_a.path().join("io.rs"), SAMPLE_A).expect("write A");
+    let store_a = SqliteCodeStore::open(dir_a.path())
+        .expect("open A")
+        .with_embed_cache_db(central)
+        .expect("A shared cache");
+    index_path(dir_a.path(), &store_a).expect("index A");
+    let n = store_a.stats().expect("stats").code_chunks as usize;
+    assert!(n > 0, "A produced chunks");
+    let sa = embed_pending(&store_a, &emb, 32).expect("embed A");
+    assert_eq!(sa.embedded, n, "cold shared cache: A embeds every chunk");
+    assert_eq!(emb.calls(), n, "embedder called once per A chunk");
+
+    // ── Project B: a DIFFERENT root (worktree/clone), SAME code at the SAME
+    //    repo-relative path, SAME shared cache ──
+    let dir_b = tempfile::tempdir().expect("B tmp");
+    fs::write(dir_b.path().join("io.rs"), SAMPLE_A).expect("identical code in B");
+    let store_b = SqliteCodeStore::open(dir_b.path())
+        .expect("open B")
+        .with_embed_cache_db(central)
+        .expect("B shared cache");
+    index_path(dir_b.path(), &store_b).expect("index B");
+    let before = emb.calls();
+    let sb = embed_pending(&store_b, &emb, 32).expect("embed B");
+
+    // The payoff: B re-embeds NOTHING — every chunk is served from the shared cache
+    // A filled, because the chunk text is checkout-location-independent.
+    assert_eq!(emb.calls(), before, "B made ZERO embedder calls — served from the shared cache");
+    assert_eq!(sb.embedded, 0, "no chunk embedded in B");
+    assert_eq!(sb.rehydrated, n, "all of B's chunks rehydrated from the shared cache");
+    let st = store_b.stats().expect("stats");
+    assert_eq!(st.vec_rows, st.code_chunks, "B's vectors complete without embedding");
+}

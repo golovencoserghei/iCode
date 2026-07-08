@@ -20,7 +20,6 @@ use icode_core::error::{Error, Result};
 use icode_core::model::{CodeHit, CodeQuery, SearchMode};
 use icode_core::traits::{CodeReadStore, Embedder, VectorIndex};
 
-use crate::chunk::{chunk_text_for_class, chunk_text_for_function};
 use crate::store::SqliteCodeStore;
 
 /// RRF reciprocal constant (the classic Cormack et al. value). Larger = flatter
@@ -174,13 +173,20 @@ pub fn find_similar(
     }
     let bare = bare_name(qualified_name);
 
-    // Resolve the symbol and build its query text via the shared chunk builder.
-    let query_text = if let Some(f) = store.get_function(bare, None, true)? {
-        chunk_text_for_function(&f)
+    // Resolve the symbol, then embed its STORED chunk text as the query — byte-
+    // identical to the vector the indexer wrote (so the query inherits the same
+    // checkout-invariant relative path, with no header re-derivation). A symbol
+    // with no chunk yet yields no results.
+    let qn = if let Some(f) = store.get_function(bare, None, true)? {
+        f.qualified_name
     } else if let Some(c) = store.get_class(bare, None, true)? {
-        chunk_text_for_class(&c)
+        c.qualified_name
     } else {
         return Ok(vec![]);
+    };
+    let query_text = match store.chunk_text_for_symbol(&qn)? {
+        Some(t) => t,
+        None => return Ok(vec![]),
     };
 
     // Oversample by one extra slot so excluding the symbol itself can't shrink us

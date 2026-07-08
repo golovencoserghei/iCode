@@ -52,7 +52,7 @@ fn index_one_file_create_edit_delete() {
     // ── create ──────────────────────────────────────────────────────────────
     fs::write(&file, V1).expect("write v1");
     let path_v1 = keyed(&root, "lib.rs");
-    let s = index_one_file(&path_v1, &store).expect("index v1");
+    let s = index_one_file(&path_v1, &store, &root).expect("index v1");
     assert_eq!(s.files_indexed, 1);
 
     let st = store.stats().expect("stats");
@@ -69,7 +69,7 @@ fn index_one_file_create_edit_delete() {
     fs::write(&file, V2).expect("write v2");
     let path_v2 = keyed(&root, "lib.rs"); // same canonical key as v1
     assert_eq!(path_v1, path_v2, "edit keeps the same path key");
-    index_one_file(&path_v2, &store).expect("index v2");
+    index_one_file(&path_v2, &store, &root).expect("index v2");
 
     let st = store.stats().expect("stats after edit");
     assert_eq!(st.files, 1, "still one file (upsert replaced, not added)");

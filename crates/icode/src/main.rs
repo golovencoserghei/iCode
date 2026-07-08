@@ -345,7 +345,7 @@ fn print_examples(label: &str, examples: &[String], total: u64) {
 }
 
 fn run_index(path: &std::path::Path) -> anyhow::Result<()> {
-    let store = SqliteCodeStore::open(path).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let store = open_store_with_shared_cache(path)?;
     let stats =
         icode_engine::index_path(path, &store).map_err(|e| anyhow::anyhow!(e.to_string()))?;
     println!(
@@ -371,7 +371,7 @@ fn run_index(path: &std::path::Path) -> anyhow::Result<()> {
 /// folded into `index`, a missing embedder here IS a hard error (the user asked
 /// to embed explicitly).
 fn run_embed(path: &std::path::Path) -> anyhow::Result<()> {
-    let store = SqliteCodeStore::open(path).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let store = open_store_with_shared_cache(path)?;
     embed_pass(&store, /* hard_fail = */ true)
 }
 
@@ -619,7 +619,7 @@ fn run_serve(path: Option<PathBuf>) -> anyhow::Result<()> {
     // Serving is async (rmcp/tokio); the rest of the CLI stays sync.
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
-        let store = Arc::new(SqliteCodeStore::open(&root).map_err(|e| anyhow::anyhow!(e.to_string()))?);
+        let store = Arc::new(open_store_with_shared_cache(&root)?);
 
         // Incremental graph sync so the served working tree is CURRENT before the
         // first tool call (a fresh worktree indexes its own files here). Best-effort:
@@ -673,7 +673,7 @@ fn run_web(path: PathBuf, port: u16) -> anyhow::Result<()> {
 
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
-        let store = SqliteCodeStore::open(&path).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let store = open_store_with_shared_cache(&path)?;
         icode_serve::serve_web(Arc::new(store), embedder, memory, port).await
     })
 }
@@ -705,6 +705,17 @@ fn central_db_path() -> String {
         Ok(home) => format!("{home}/.icode/icode.db"),
         Err(_) => "~/.icode/icode.db".to_string(),
     }
+}
+
+/// Open a code store for an EMBEDDING path (index / embed / serve / web) with the
+/// SHARED central embed cache attached: an identical chunk is embedded ONCE per
+/// machine and reused across every project, git worktree, and re-clone. Read-only
+/// paths (stats/doctor/check_exists) and the graph-only daemon skip it and open the
+/// store plainly.
+fn open_store_with_shared_cache(path: &std::path::Path) -> anyhow::Result<SqliteCodeStore> {
+    SqliteCodeStore::open(path)
+        .and_then(|s| s.with_embed_cache_db(&central_db_path()))
+        .map_err(|e| anyhow::anyhow!(e.to_string()))
 }
 
 /// Build the cross-session memory store for `serve`, wrapped in the WAL audit

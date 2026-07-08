@@ -13,7 +13,7 @@ mod schema;
 mod vector;
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once};
 
@@ -95,6 +95,14 @@ type CachedAdjacency = HashMap<String, Vec<String>>;
 
 pub struct SqliteCodeStore {
     conn: Arc<Mutex<Connection>>,
+    /// Optional handle to the SHARED code-embedding cache in the central db
+    /// (`~/.icode/icode.db`). When present, `embed_cache_lookup`/`embed_cache_store`
+    /// route to it instead of this project's `index.db`, so an identical chunk is
+    /// embedded ONCE per machine and reused across every project, git worktree, and
+    /// re-clone. `None` (tests, or `open` without `with_embed_cache_db`) keeps the
+    /// legacy per-project cache. Its own `Mutex` — never held with `conn` — so a
+    /// cache hit never blocks a graph write.
+    cache_conn: Option<Arc<Mutex<Connection>>>,
     /// Monotonic write-epoch of the call graph. Every mutation that can change the
     /// `calls` table (`upsert_file`, `delete_file`, `resolve_call_edges`) bumps
     /// this INSIDE its `conn`-lock critical section; the adjacency cache below is
@@ -148,10 +156,129 @@ impl SqliteCodeStore {
         Self::from_conn(conn)
     }
 
+    /// Attach the SHARED code-embedding cache in the central db at `central_db_path`
+    /// (`~/` expanded against `$HOME`). Once attached, `embed_cache_lookup` /
+    /// `embed_cache_store` route to it, so an identical chunk is embedded ONCE per
+    /// machine and reused across every project, git worktree, and re-clone — the
+    /// biggest lever against embedding cost (a worktree of an indexed repo re-embeds
+    /// nothing). Best-effort folds this project's existing per-project cache into the
+    /// shared one on first attach. Builder style.
+    pub fn with_embed_cache_db(mut self, central_db_path: &str) -> Result<Self> {
+        fn expand_tilde(path: &str) -> PathBuf {
+            if let Some(rest) = path.strip_prefix("~/") {
+                if let Ok(home) = std::env::var("HOME") {
+                    return Path::new(&home).join(rest);
+                }
+            }
+            PathBuf::from(path)
+        }
+        // Same shape as the per-project `embed_cache`, so the lookup/store SQL is
+        // identical whichever connection backs it.
+        const DDL: &str = "CREATE TABLE IF NOT EXISTS embed_cache (\
+            content_hash TEXT NOT NULL, embed_model TEXT NOT NULL, \
+            embed_dim INTEGER NOT NULL, vec BLOB NOT NULL, \
+            PRIMARY KEY (content_hash, embed_model)) WITHOUT ROWID;";
+
+        let path = expand_tilde(central_db_path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| Error::Io(e.to_string()))?;
+        }
+        let conn = Connection::open(&path).map_err(store_err)?;
+        conn.pragma_update(None, "journal_mode", "WAL").map_err(store_err)?;
+        conn.busy_timeout(std::time::Duration::from_millis(5_000)).map_err(store_err)?;
+        conn.execute_batch(DDL).map_err(store_err)?;
+        let cache = Arc::new(Mutex::new(conn));
+        // Fold this project's local cache into the shared one (once) so chunks
+        // already embedded here are not re-embedded after the switch.
+        self.migrate_local_cache_into(&cache)?;
+        self.cache_conn = Some(cache);
+        Ok(self)
+    }
+
+    /// One-time copy of this project's per-project `embed_cache` into the shared
+    /// `cache` (INSERT OR IGNORE), gated by a `meta` flag so it runs at most once.
+    fn migrate_local_cache_into(&self, cache: &Arc<Mutex<Connection>>) -> Result<()> {
+        let done: i64 = {
+            let local = self.conn.lock().map_err(store_err)?;
+            local
+                .query_row(
+                    "SELECT COUNT(*) FROM meta WHERE key = 'embed_cache_migrated'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(store_err)?
+        };
+        if done > 0 {
+            return Ok(());
+        }
+        let rows: Vec<(String, String, i64, Vec<u8>)> = {
+            let local = self.conn.lock().map_err(store_err)?;
+            let mut stmt = local
+                .prepare("SELECT content_hash, embed_model, embed_dim, vec FROM embed_cache")
+                .map_err(store_err)?;
+            let it = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .map_err(store_err)?;
+            let mut v = Vec::new();
+            for row in it {
+                v.push(row.map_err(store_err)?);
+            }
+            v
+        };
+        if !rows.is_empty() {
+            let mut c = cache.lock().map_err(store_err)?;
+            let tx = c.transaction().map_err(store_err)?;
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "INSERT OR IGNORE INTO embed_cache \
+                         (content_hash, embed_model, embed_dim, vec) VALUES (?1,?2,?3,?4)",
+                    )
+                    .map_err(store_err)?;
+                for (h, m, d, v) in &rows {
+                    stmt.execute(rusqlite::params![h, m, d, v]).map_err(store_err)?;
+                }
+            }
+            tx.commit().map_err(store_err)?;
+        }
+        let local = self.conn.lock().map_err(store_err)?;
+        local
+            .execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('embed_cache_migrated', '1')",
+                [],
+            )
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// The connection backing the embed cache: the shared central db when attached,
+    /// else this project's own `index.db` (legacy per-project cache).
+    fn cache_connection(&self) -> &Arc<Mutex<Connection>> {
+        self.cache_conn.as_ref().unwrap_or(&self.conn)
+    }
+
     /// A vector index sharing this store's connection (single-writer). `dim` is
     /// fixed at [`schema::VEC_DIM`] — the `vec_code` column width.
     pub fn vector_index(&self) -> Vec0Index {
         Vec0Index::new(Arc::clone(&self.conn), schema::VEC_DIM)
+    }
+
+    /// The stored embeddable `chunk_text` for a symbol (its FIRST chunk, by id), or
+    /// `None` when the symbol has no chunk yet. `find_similar` embeds THIS exact text
+    /// as its query, so the query vector is byte-identical to the symbol's indexed
+    /// vector — no header-format re-derivation, and it inherits the checkout-invariant
+    /// relative path the indexer wrote.
+    pub fn chunk_text_for_symbol(&self, qualified_name: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().map_err(store_err)?;
+        match conn.query_row(
+            "SELECT chunk_text FROM code_chunks WHERE qualified_name = ?1 ORDER BY id LIMIT 1",
+            rusqlite::params![qualified_name],
+            |r| r.get::<_, String>(0),
+        ) {
+            Ok(t) => Ok(Some(t)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(store_err(e)),
+        }
     }
 
     /// Stamp a chunk as embedded with `model`/`dim` after its vector has been
@@ -264,7 +391,7 @@ impl SqliteCodeStore {
         if hashes.is_empty() {
             return Ok(HashMap::new());
         }
-        let conn = self.conn.lock().map_err(store_err)?;
+        let conn = self.cache_connection().lock().map_err(store_err)?;
         // ?1 = model; ?2.. = the hashes. The batch is ≤ the embed batch size, far
         // under SQLite's bound-variable limit, so one IN-list query is fine.
         let placeholders: String = (0..hashes.len())
@@ -309,7 +436,7 @@ impl SqliteCodeStore {
         if items.is_empty() {
             return Ok(());
         }
-        let mut conn = self.conn.lock().map_err(store_err)?;
+        let mut conn = self.cache_connection().lock().map_err(store_err)?;
         let tx = conn.transaction().map_err(store_err)?;
         {
             let mut stmt = tx
@@ -410,6 +537,7 @@ impl SqliteCodeStore {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION).map_err(store_err)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            cache_conn: None,
             graph_epoch: AtomicU64::new(0),
             adjacency_cache: Mutex::new(None),
             #[cfg(test)]
