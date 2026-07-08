@@ -636,11 +636,22 @@ fn run_serve(path: Option<PathBuf>) -> anyhow::Result<()> {
         }
 
         // Drain embeddings in the BACKGROUND so semantic recall completes on its own
-        // without blocking startup. A down Ollama simply leaves the graph lexical
-        // (query-time JIT still embeds the query). `embed_pending` locks the store
-        // per batch (the network `embed` call is outside the lock), so this never
-        // starves the serving reads.
-        if let Some(emb) = embedder.clone() {
+        // without blocking startup. Cheap now that the embed cache is shared per
+        // machine (a worktree/re-clone re-embeds nothing), but cost-sensitive users
+        // can opt OUT with `ICODE_SERVE_EMBED=0` — the graph stays lexical and
+        // semantic fills lazily via query-time JIT or an explicit `icode embed`. A
+        // down Ollama simply leaves the graph lexical too. `embed_pending` locks the
+        // store per batch (the network `embed` call is outside the lock), so the
+        // drain never starves the serving reads.
+        let drain_enabled = std::env::var("ICODE_SERVE_EMBED")
+            .map(|v| !matches!(v.trim(), "0" | "false" | "no" | "off"))
+            .unwrap_or(true);
+        if !drain_enabled {
+            eprintln!(
+                "icode serve: background embedding disabled (ICODE_SERVE_EMBED=0); \
+                 semantic fills via JIT / `icode embed`"
+            );
+        } else if let Some(emb) = embedder.clone() {
             let store_bg = store.clone();
             let batch = EmbedConfig::default().batch;
             tokio::task::spawn_blocking(move || {
