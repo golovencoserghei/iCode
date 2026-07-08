@@ -108,6 +108,16 @@ pub struct SemanticSearchArgs {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct CheckExistsArgs {
+    /// The feature/behaviour to check for, in plain words (e.g. "a calendar for
+    /// reminders", "rate limiting on login").
+    pub query: String,
+    /// Symbol space to interrogate: "function" | "class" | "route" | "any"
+    /// (default "any").
+    pub kind: Option<String>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
 pub struct FindSimilarArgs {
     /// Qualified name of an existing symbol to find semantic neighbours of
     /// (e.g. "TreeWalker::walk" or "parse_rust_source").
@@ -360,6 +370,10 @@ pub struct AddDeveloperNoteArgs {
     pub tags: Option<Vec<String>>,
     /// Importance 0..5 (default 0).
     pub importance: Option<f32>,
+    /// Store the note even if it looks project/machine-specific (names a filesystem
+    /// path). Default false — such a note is rejected because the profile is
+    /// injected into EVERY project; use add_memory(project=…) for a project fact.
+    pub force: Option<bool>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -569,6 +583,41 @@ impl CodeMcpServer {
         .await;
         match result {
             Ok(Ok(hits)) => to_json(&hits),
+            Ok(Err(e)) => err_json(&e.to_string()),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }
+
+    #[tool(description = "Grounded existence oracle. Answers 'does a feature/symbol matching this description ACTUALLY exist in the index?' with a VERDICT — EXISTS | WEAK | ABSENT — plus confidence, a quotable reason, and evidence; NOT a nearest-neighbour list. USE THIS before you claim a feature exists (or is missing): plain search always returns the closest symbols, so a string literal like \"calendar\" in a permissions list can masquerade as a real calendar feature. A confident EXISTS is asserted ONLY from a name match too strong to be a word coincidence: the query is a single deliberately-typed identifier that names a DEFINED function/class/route (match_kind exact_symbol), OR ≥2 distinct query terms land on one symbol's name (match_kind name_token). Weaker signals never fake an EXISTS: one incidental term matching a name in a multi-word query is WEAK ('a symbol named X exists — verify it's what you mean'); a term only inside bodies/string literals/comments is WEAK (match_kind body_or_string: a mention, not a feature); nothing is ABSENT, with the nearest-by-meaning symbol offered as a clearly-labelled LEAD to verify. The embedder is ONLY a lead, never a verdict driver — meaning-similarity is embedder-specific and self-confirming, so it is not used to decide EXISTS. Boundaries: test files are excluded by PATH (a test fixture can't satisfy existence), but a symbol inside an inline #[cfg(test)] module in a src file can still read as EXISTS (known gap); confidence is heuristic; name matching is un-stemmed; ABSENT means 'not in THIS static index' (dynamic/reflective/external/generated code is invisible) and a feature under totally different words may return WEAK/ABSENT-with-a-lead rather than EXISTS (safe direction); without Ollama only the lead is lost. kind ∈ function|class|route|any (default any). JSON ExistenceVerdict{verdict,confidence,reason,best_match,match_kind,exact_name_hit,evidence}.")]
+    async fn check_exists(&self, Parameters(args): Parameters<CheckExistsArgs>) -> String {
+        let scope = match args.kind.as_deref() {
+            None | Some("") | Some("any") => Ok(icode_engine::ExistScope::Any),
+            Some("function") => Ok(icode_engine::ExistScope::Function),
+            Some("class") => Ok(icode_engine::ExistScope::Class),
+            Some("route") => Ok(icode_engine::ExistScope::Route),
+            Some(other) => {
+                Err(format!("invalid kind '{other}' (expected function|class|route|any)"))
+            }
+        };
+        let scope = match scope {
+            Ok(s) => s,
+            Err(e) => return err_json(&e),
+        };
+        let store = self.store.clone();
+        let embedder = self.embedder.clone();
+        let query = args.query;
+        let result = tokio::task::spawn_blocking(move || {
+            // Embed pending chunks first so the semantic signal is live (mirrors the
+            // other semantic tools); a down/absent embedder simply drops that signal
+            // and the verdict forms from the exact-name + body-or-string signals.
+            if let Some(emb) = embedder.as_deref() {
+                jit_embed(&store, emb);
+            }
+            icode_engine::check_exists(&store, embedder.as_deref(), &query, scope)
+        })
+        .await;
+        match result {
+            Ok(Ok(v)) => to_json(&v),
             Ok(Err(e)) => err_json(&e.to_string()),
             Err(e) => err_json(&e.to_string()),
         }
@@ -1089,12 +1138,25 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Save a cross-project developer note (preference / rule about how this developer works). Stored under the reserved profile project. Returns Added/Duplicate JSON.")]
+    #[tool(description = "Save a cross-project developer note (a preference / rule about how this developer works, true in EVERY project). Stored under the reserved profile project and injected into every session — so a project- or machine-specific fact does NOT belong here; use add_memory(project=…) for that. A note naming a filesystem path is rejected unless force=true. Returns Added/Duplicate JSON.")]
     async fn add_developer_note(&self, Parameters(args): Parameters<AddDeveloperNoteArgs>) -> String {
         let mem = match self.memory.clone() {
             Some(m) => m,
             None => return err_json(NO_MEMORY_ERR),
         };
+        // Cross-project leak gate: a note that names a filesystem path is almost
+        // always a project/machine fact misfiled into the always-injected profile.
+        // Reject with an actionable message unless the caller forces it.
+        if !args.force.unwrap_or(false) {
+            if let Some(marker) = looks_project_specific(&args.content) {
+                return err_json(&format!(
+                    "refused: this note contains a project/machine-specific path ('{marker}') and \
+                     would leak into EVERY project via the always-injected developer profile. Save \
+                     it with add_memory(project=…) instead. Pass force=true to store it in the \
+                     profile anyway."
+                ));
+            }
+        }
         let category = args
             .category
             .as_deref()
@@ -1312,9 +1374,52 @@ fn err_json(msg: &str) -> String {
     serde_json::json!({ "error": msg }).to_string()
 }
 
+/// Guard for `add_developer_note`: the developer profile is CROSS-PROJECT — every
+/// note is injected into every session of every project. A note that names a
+/// concrete filesystem path is almost always a project- or machine-specific fact
+/// misfiled here, and would then surface as noise in every unrelated project (the
+/// exact leak this gate exists to stop). Returns the offending marker if the
+/// content looks project-specific, else `None`.
+///
+/// Deliberately NARROW — only absolute filesystem paths — so it does not block
+/// genuine universal rules (e.g. "apply SOLID in all projects", "answer in
+/// Russian"), which virtually never embed an absolute path. The caller offers a
+/// `force` escape for the rare universal rule that legitimately cites a path.
+fn looks_project_specific(content: &str) -> Option<String> {
+    const PATH_MARKERS: &[&str] =
+        &["/home/", "/Users/", "/opt/", "/srv/", "/var/", "/mnt/", "/root/", "~/"];
+    for m in PATH_MARKERS {
+        if content.contains(m) {
+            return Some((*m).to_string());
+        }
+    }
+    // Windows drive path (e.g. `C:\`): a letter, ':', backslash.
+    let b = content.as_bytes();
+    for i in 0..b.len().saturating_sub(2) {
+        if b[i].is_ascii_alphabetic() && b[i + 1] == b':' && b[i + 2] == b'\\' {
+            return Some(format!("{}:\\", b[i] as char));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dev_note_gate_flags_paths_not_universal_rules() {
+        // Project/machine-specific → flagged (would leak into every project).
+        assert!(looks_project_specific("Vexa Pay lives at /home/worker/PROJECTS/vexa/pay").is_some());
+        assert!(looks_project_specific("config under ~/.icode/icode.db").is_some());
+        assert!(looks_project_specific("checkout is C:\\src\\app").is_some());
+        // Genuine cross-project developer rules → NOT flagged.
+        assert!(looks_project_specific("Apply SOLID in all projects").is_none());
+        assert!(looks_project_specific("Always answer the user in Russian").is_none());
+        assert!(
+            looks_project_specific("Never put real names in tests/commits (all projects)").is_none()
+        );
+    }
 
     /// No-Ollama (lexical-only) behaviour: with `embedder: None` the semantic
     /// tools must return the documented unavailable-error JSON, and the degrading

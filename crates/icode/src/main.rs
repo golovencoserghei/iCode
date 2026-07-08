@@ -4,7 +4,8 @@
 //! Commands:
 //!   `icode index <path>`   — index the tree under <path>, print counters.
 //!   `icode embed <path>`   — embed any pending chunks (catch-up pass).
-//!   `icode serve <path>`   — open the store and serve the MCP protocol over stdio.
+//!   `icode serve [path]`   — serve the MCP protocol over stdio (path defaults to the
+//!                            launch dir's working-tree root; syncs the index first).
 //!   `icode web <path>`     — open the store and serve the local web dashboard (127.0.0.1).
 //!   `icode stats <path>`   — print code-graph statistics.
 //!   `icode doctor <path>`  — read-only index health check (exit 1 on drift).
@@ -42,10 +43,15 @@ enum Command {
         /// Project root whose <path>/.icode/index.db is embedded.
         path: PathBuf,
     },
-    /// Open the store at <path> and serve the MCP protocol over stdio.
+    /// Serve the MCP protocol over stdio for a project. With NO <path>, resolves the
+    /// working-tree root of the launch dir (`$CLAUDE_PROJECT_DIR` or cwd) — so one
+    /// MCP registration serves whichever checkout OR git worktree Claude Code opens.
+    /// Runs an incremental index sync on startup so the code graph is current, and
+    /// drains embeddings in the background.
     Serve {
-        /// Project root whose <path>/.icode/index.db is served.
-        path: PathBuf,
+        /// Project root to serve (`<path>/.icode/index.db`). Optional: omit to
+        /// resolve the enclosing working-tree root from the launch directory.
+        path: Option<PathBuf>,
     },
     /// Open the store at <path> and serve the local web dashboard on 127.0.0.1.
     Web {
@@ -70,6 +76,18 @@ enum Command {
     Doctor {
         /// Project root whose <path>/.icode/index.db is diagnosed against disk.
         path: PathBuf,
+    },
+    /// Grounded existence check: does a feature/symbol matching <query> ACTUALLY
+    /// exist in the index? Prints a VERDICT (EXISTS/WEAK/ABSENT) + evidence, so a
+    /// term that only appears in a string literal is not mistaken for a feature.
+    CheckExists {
+        /// Project root whose <path>/.icode/index.db is queried.
+        path: PathBuf,
+        /// The feature/behaviour to check for, in plain words.
+        query: String,
+        /// Symbol space to check: function|class|route|any (default any).
+        #[arg(long)]
+        kind: Option<String>,
     },
     /// Friendly onboarding: probe Ollama (pull the embedding model if missing),
     /// print the Claude Code MCP registration snippet, and list the next steps.
@@ -103,7 +121,8 @@ enum HookAction {
         /// Project name (else the basename of `--cwd`, else the process cwd).
         #[arg(long)]
         project: Option<String>,
-        /// Working directory whose basename is the project (when `--project` is absent).
+        /// Working directory the project is derived from when `--project` is absent
+        /// (enclosing git-repo-root basename; a throwaway dir → `general`).
         #[arg(long)]
         cwd: Option<PathBuf>,
     },
@@ -115,7 +134,8 @@ enum HookAction {
         /// Project name (else the basename of `--cwd`, else the process cwd).
         #[arg(long)]
         project: Option<String>,
-        /// Working directory whose basename is the project (when `--project` is absent).
+        /// Working directory the project is derived from when `--project` is absent
+        /// (enclosing git-repo-root basename; a throwaway dir → `general`).
         #[arg(long)]
         cwd: Option<PathBuf>,
     },
@@ -128,7 +148,8 @@ enum HookAction {
         /// Project name (else the basename of `--cwd`, else the stdin `cwd`).
         #[arg(long)]
         project: Option<String>,
-        /// Working directory whose basename is the project (when `--project` is absent).
+        /// Working directory the project is derived from when `--project` is absent
+        /// (enclosing git-repo-root basename; a throwaway dir → `general`).
         #[arg(long)]
         cwd: Option<PathBuf>,
     },
@@ -161,6 +182,9 @@ fn main() -> anyhow::Result<()> {
         },
         Command::Stats { path } => run_stats(&path),
         Command::Doctor { path } => run_doctor(&path),
+        Command::CheckExists { path, query, kind } => {
+            run_check_exists(&path, &query, kind.as_deref())
+        }
         Command::Setup { project_path } => run_setup(project_path.as_deref()),
         Command::McpConfig { project_path } => run_mcp_config(project_path.as_deref()),
         Command::Hook { action } => match action {
@@ -223,6 +247,88 @@ fn run_doctor(path: &std::path::Path) -> anyhow::Result<()> {
         // Drift / broken invariant is a non-zero exit, but NOT a process error
         // (the diagnosis itself succeeded). Re-run `icode index <path>` to heal.
         std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// `icode check-exists <path> "<query>" [--kind …]` — grounded existence oracle.
+/// Opens the store, embeds pending chunks best-effort (so the semantic signal is
+/// live; a down Ollama just drops it), runs `check_exists`, and prints a
+/// human-readable verdict. Read-only.
+fn run_check_exists(
+    path: &std::path::Path,
+    query: &str,
+    kind: Option<&str>,
+) -> anyhow::Result<()> {
+    use icode_core::model::{MatchKind, SymbolKind, Verdict};
+    use icode_engine::ExistScope;
+
+    let scope = match kind {
+        None | Some("") | Some("any") => ExistScope::Any,
+        Some("function") => ExistScope::Function,
+        Some("class") => ExistScope::Class,
+        Some("route") => ExistScope::Route,
+        Some(other) => {
+            anyhow::bail!("invalid kind '{other}' (expected function|class|route|any)")
+        }
+    };
+
+    let store = SqliteCodeStore::open(path).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let embedder = build_serve_embedder();
+    if let Some(emb) = embedder.as_deref() {
+        if let Err(e) = icode_engine::embed_pending(&store, emb, EmbedConfig::default().batch) {
+            eprintln!("icode: embed pass skipped ({e}); semantic signal disabled");
+        }
+    }
+
+    let v = icode_engine::check_exists(&store, embedder.as_deref(), query, scope)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    let kind_label = |k: SymbolKind| match k {
+        SymbolKind::Function => "fn",
+        SymbolKind::Class => "class",
+        SymbolKind::FileWindow => "file",
+    };
+    let mk_label = |m: MatchKind| match m {
+        MatchKind::ExactSymbol => "exact_symbol",
+        MatchKind::NameToken => "name_token",
+        MatchKind::Semantic => "semantic",
+        MatchKind::BodyOrString => "body_or_string",
+    };
+    let verdict = match v.verdict {
+        Verdict::Exists => "EXISTS",
+        Verdict::Weak => "WEAK",
+        Verdict::Absent => "ABSENT",
+    };
+
+    println!("verdict:    {verdict}  (confidence {:.2})", v.confidence);
+    println!("reason:     {}", v.reason);
+    if let Some(b) = &v.best_match {
+        let mk = v.match_kind.map(|m| format!("  match_kind={}", mk_label(m))).unwrap_or_default();
+        println!(
+            "best_match: [{}] {} ({}:{}){mk}",
+            kind_label(b.kind),
+            b.qualified_name,
+            b.path,
+            b.line_start
+        );
+    }
+    if !v.evidence.is_empty() {
+        println!("evidence:");
+        for e in &v.evidence {
+            print!(
+                "  - [{}] {} ({}:{}) [{}]",
+                kind_label(e.hit.kind),
+                e.hit.qualified_name,
+                e.hit.path,
+                e.hit.line_start,
+                mk_label(e.match_kind)
+            );
+            if let Some(s) = &e.hit.snippet {
+                print!("  «{s}»");
+            }
+            println!();
+        }
     }
     Ok(())
 }
@@ -331,15 +437,16 @@ fn icode_exe_path() -> String {
         .unwrap_or_else(|| "icode".to_string())
 }
 
-/// Render the Claude Code MCP registration snippet for this binary. `project`
-/// is the path baked into `args` (a placeholder when the user gave none). Built
-/// by hand (no serde_json dep in the bin) but kept strictly valid: the only
-/// interpolated values are filesystem paths, which we JSON-escape.
-fn mcp_config_json(project: &str) -> String {
+/// Render the Claude Code MCP registration snippet for this binary. Emits `serve`
+/// with NO baked path: the server resolves the enclosing working-tree root from its
+/// launch cwd at runtime, so ONE registration serves whichever checkout OR git
+/// worktree Claude Code opens (no per-worktree config, no stale absolute path).
+/// Built by hand (no serde_json dep in the bin); the only interpolated value is the
+/// executable path, which we JSON-escape.
+fn mcp_config_json() -> String {
     let exe = json_escape(&icode_exe_path());
-    let proj = json_escape(project);
     format!(
-        "{{\n  \"mcpServers\": {{\n    \"icode\": {{\n      \"command\": \"{exe}\",\n      \"args\": [\"serve\", \"{proj}\"]\n    }}\n  }}\n}}"
+        "{{\n  \"mcpServers\": {{\n    \"icode\": {{\n      \"command\": \"{exe}\",\n      \"args\": [\"serve\"]\n    }}\n  }}\n}}"
     )
 }
 
@@ -372,10 +479,12 @@ fn snippet_project(project_path: Option<&std::path::Path>) -> String {
     }
 }
 
-/// `icode mcp-config [project]` — print ONLY the JSON registration snippet to
-/// stdout (pipe-friendly: `icode mcp-config /my/proj > .mcp.json`).
-fn run_mcp_config(project_path: Option<&std::path::Path>) -> anyhow::Result<()> {
-    println!("{}", mcp_config_json(&snippet_project(project_path)));
+/// `icode mcp-config` — print ONLY the JSON registration snippet to stdout
+/// (pipe-friendly: `icode mcp-config > .mcp.json`). The snippet is path-free and
+/// resolves the served project from the launch dir, so it needs no project argument
+/// and works unchanged across every checkout and worktree.
+fn run_mcp_config(_project_path: Option<&std::path::Path>) -> anyhow::Result<()> {
+    println!("{}", mcp_config_json());
     Ok(())
 }
 
@@ -391,24 +500,23 @@ fn run_setup(project_path: Option<&std::path::Path>) -> anyhow::Result<()> {
     let cfg = EmbedConfig::default();
     check_ollama(&cfg);
 
-    // Step 2: MCP registration snippet.
-    let project = snippet_project(project_path);
+    // Step 2: MCP registration snippet (path-free — resolves the served project
+    // from the launch dir at runtime, so it works across checkouts and worktrees).
     println!("\n2. Connect iCode to Claude Code (MCP server)");
     println!("   Add this to `.mcp.json` in your project root (or your");
     println!("   `~/.claude` settings) so Claude Code launches the iCode server:\n");
-    for line in mcp_config_json(&project).lines() {
+    for line in mcp_config_json().lines() {
         println!("   {line}");
     }
-    if project_path.is_none() {
-        println!("\n   (replace `/path/to/project` with the project you want indexed,");
-        println!("    or re-run `icode setup <project_path>` to bake it in.)");
-    }
+    println!("\n   The server serves whichever repo/worktree you open — no path to");
+    println!("   edit, and it syncs the code graph on startup so it's always current.");
 
-    // Step 3: next steps.
-    let hint = project_path.map(|_| project.as_str()).unwrap_or("<project>");
+    // Step 3: next steps. `serve` self-syncs, so indexing is an OPTIONAL pre-warm.
+    let hint = snippet_project(project_path);
+    let hint = if project_path.is_some() { hint.as_str() } else { "<project>" };
     println!("\n3. Next steps");
-    println!("   icode index  {hint}    # build the code-graph + embeddings");
-    println!("   icode doctor {hint}    # verify the index is healthy");
+    println!("   (optional) icode index  {hint}    # pre-build the graph + embeddings");
+    println!("   (optional) icode doctor {hint}    # verify the index is healthy");
     println!("   then connect the MCP server above and use `recall` from Claude Code");
 
     Ok(())
@@ -486,7 +594,14 @@ fn try_pull_model(model: &str) -> bool {
     }
 }
 
-fn run_serve(path: PathBuf) -> anyhow::Result<()> {
+fn run_serve(path: Option<PathBuf>) -> anyhow::Result<()> {
+    // Resolve WHICH project to serve. With no explicit path, anchor at the launch
+    // dir's working-tree root — so a git worktree (or any subdir launch) serves its
+    // OWN `.icode/index.db`, and one path-free `.mcp.json` works across worktrees.
+    let root = resolve_serve_root(path);
+    let root = std::fs::canonicalize(&root).unwrap_or(root);
+    eprintln!("icode serve: project root = {}", root.display());
+
     // Build the embedder best-effort BEFORE entering the async runtime (the build
     // + health probe are blocking). A down/unreachable Ollama must NOT fail
     // `serve` — the code-graph tools stay fully useful; only the semantic/hybrid
@@ -504,10 +619,44 @@ fn run_serve(path: PathBuf) -> anyhow::Result<()> {
     // Serving is async (rmcp/tokio); the rest of the CLI stays sync.
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
-        let store = SqliteCodeStore::open(&path).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let store = Arc::new(SqliteCodeStore::open(&root).map_err(|e| anyhow::anyhow!(e.to_string()))?);
+
+        // Incremental graph sync so the served working tree is CURRENT before the
+        // first tool call (a fresh worktree indexes its own files here). Best-effort:
+        // hash-skips unchanged files, writes only to stderr (stdout is the MCP
+        // transport), and any failure degrades to serving the existing graph rather
+        // than aborting serve. It is local + parallel (no network), so it does not
+        // stall the handshake for a typical tree.
+        match icode_engine::index_path(&root, store.as_ref()) {
+            Ok(s) => eprintln!(
+                "icode serve: graph synced ({} indexed, {} skipped, {} errors)",
+                s.files_indexed, s.files_skipped, s.errors
+            ),
+            Err(e) => eprintln!("icode serve: graph sync skipped ({e}); serving existing index"),
+        }
+
+        // Drain embeddings in the BACKGROUND so semantic recall completes on its own
+        // without blocking startup. A down Ollama simply leaves the graph lexical
+        // (query-time JIT still embeds the query). `embed_pending` locks the store
+        // per batch (the network `embed` call is outside the lock), so this never
+        // starves the serving reads.
+        if let Some(emb) = embedder.clone() {
+            let store_bg = store.clone();
+            let batch = EmbedConfig::default().batch;
+            tokio::task::spawn_blocking(move || {
+                match icode_engine::embed_pending(store_bg.as_ref(), emb.as_ref(), batch) {
+                    Ok(s) => eprintln!(
+                        "icode serve: embeddings drained ({} embedded, {} batches)",
+                        s.embedded, s.batches
+                    ),
+                    Err(e) => eprintln!("icode serve: embedding drain skipped ({e})"),
+                }
+            });
+        }
+
         // Pass the project root so the `doctor` MCP tool can reconcile the index
         // against the live source tree (it walks `root` like the indexer does).
-        icode_serve::serve_stdio(Arc::new(store), path, embedder, memory).await
+        icode_serve::serve_stdio(store, root, embedder, memory).await
     })
 }
 
@@ -638,8 +787,113 @@ const HOOK_SESSION_PROFILE_N: usize = 5;
 /// Per-line content cap in the injected context (keeps the prompt budget small).
 const HOOK_LINE_MAX: usize = 200;
 
-/// Resolve the project name for a hook: explicit `--project`, else the basename of
-/// `--cwd`, else the basename of the process cwd, else `"general"`. Never empty.
+/// Basename of a path, `None` if empty/unnameable.
+fn basename_str(d: &std::path::Path) -> Option<String> {
+    d.file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+}
+
+/// Given the `.git` FILE of a linked worktree, resolve the MAIN repository's
+/// working-tree root, so every worktree of a repo maps to the SAME project name
+/// (no per-worktree memory bucket). A linked worktree's `.git` is a file
+/// `gitdir: <repo>/.git/worktrees/<name>`; the shared git dir is that dir's
+/// `commondir` pointer (usually `../..` → `<repo>/.git`), whose parent is the main
+/// working tree. Returns `None` when this is not a resolvable worktree pointer
+/// (e.g. a submodule, whose `.git` also is a file but has no `worktrees/` segment)
+/// — the caller then falls back to the worktree dir's own basename.
+fn worktree_main_root(dot_git_file: &std::path::Path, worktree_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let text = std::fs::read_to_string(dot_git_file).ok()?;
+    let gitdir = text.lines().find_map(|l| l.trim().strip_prefix("gitdir:"))?.trim();
+    let gitdir_abs = if std::path::Path::new(gitdir).is_absolute() {
+        std::path::PathBuf::from(gitdir)
+    } else {
+        worktree_dir.join(gitdir)
+    };
+    // Only remap TRUE worktrees (…/.git/worktrees/<name>); leave submodules etc.
+    if !gitdir_abs.components().any(|c| c.as_os_str() == "worktrees") {
+        return None;
+    }
+    // Shared git dir: the `commondir` pointer if present, else strip `worktrees/<name>`.
+    let common = match std::fs::read_to_string(gitdir_abs.join("commondir")) {
+        Ok(rel) => {
+            let rel = rel.trim();
+            if std::path::Path::new(rel).is_absolute() {
+                std::path::PathBuf::from(rel)
+            } else {
+                gitdir_abs.join(rel)
+            }
+        }
+        Err(_) => gitdir_abs.parent()?.parent()?.to_path_buf(),
+    };
+    // Canonicalize to fold any `..` from the relative `commondir`; the shared dir is
+    // `<repo>/.git`, so its parent is the main working-tree root.
+    let common = std::fs::canonicalize(&common).unwrap_or(common);
+    if common.file_name().map(|n| n == ".git").unwrap_or(false) {
+        common.parent().map(|p| p.to_path_buf())
+    } else {
+        Some(common)
+    }
+}
+
+/// Basename of the enclosing GIT REPO root for `dir`: walk up until a `.git` entry
+/// is found. A `.git` DIRECTORY marks a normal checkout (this dir is the root). A
+/// `.git` FILE marks a linked worktree (or submodule): for a worktree we remap to
+/// the MAIN repo root via [`worktree_main_root`] so all worktrees share one project
+/// name; anything else falls back to this dir's own basename. `None` if `dir` is
+/// not inside a git repo.
+///
+/// This is the strong, subdirectory- and casing-stable "which project" signal
+/// (`…/iCode/crates/foo` → `iCode`, `Onyx`/`onyx` can't split), and it treats a
+/// worktree as the SAME project as its main checkout instead of a fresh bucket.
+fn git_root_basename(dir: &std::path::Path) -> Option<String> {
+    let mut cur = Some(dir);
+    while let Some(d) = cur {
+        let dot_git = d.join(".git");
+        match std::fs::metadata(&dot_git) {
+            Ok(m) if m.is_dir() => return basename_str(d),
+            Ok(m) if m.is_file() => {
+                return worktree_main_root(&dot_git, d)
+                    .and_then(|root| basename_str(&root))
+                    .or_else(|| basename_str(d));
+            }
+            _ => {}
+        }
+        cur = d.parent();
+    }
+    None
+}
+
+/// True if `dir` is a throwaway / container location that must NOT mint its own
+/// memory bucket: the home directory itself, or a temp/scratch dir. Running a hook
+/// from such a cwd (with no `--project` and no enclosing repo) is what produced the
+/// junk projects `worker` (== `$HOME`), `tmp`, and `scratchpad` that polluted
+/// cross-project listings — those now collapse to `general` instead. Keyed on the
+/// basename (and an exact `$HOME` match), NOT a path prefix, so a real project that
+/// merely lives under a system temp root (e.g. a test's tempdir) is unaffected.
+fn is_throwaway_dir(dir: &std::path::Path) -> bool {
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() && dir == std::path::Path::new(&home) {
+            return true;
+        }
+    }
+    matches!(
+        dir.file_name().and_then(|n| n.to_str()),
+        Some("tmp") | Some("temp") | Some("scratchpad") | Some(".cache")
+    )
+}
+
+/// Resolve the project name for a hook. Precedence:
+///   1. explicit `--project` (trimmed, if non-empty);
+///   2. the basename of the enclosing GIT REPO root of the cwd — the canonical,
+///      subdirectory- and casing-stable "which project" signal;
+///   3. the cwd basename, UNLESS the cwd is a throwaway/container location
+///      (`$HOME`, a `tmp`/`scratchpad`/… dir), which collapses to `general`;
+///   4. `general`.
+/// Never empty. Preferring the git root (2) and rejecting throwaway dirs (3) is what
+/// keeps one project in one bucket instead of fragmenting into `crates`, `Onyx` vs
+/// `onyx`, `worker`, `tmp`, or `scratchpad`.
 fn hook_project(project: Option<&str>, cwd: Option<&std::path::Path>) -> String {
     if let Some(p) = project {
         let p = p.trim();
@@ -650,12 +904,61 @@ fn hook_project(project: Option<&str>, cwd: Option<&std::path::Path>) -> String 
     let dir = cwd
         .map(|p| p.to_path_buf())
         .or_else(|| std::env::current_dir().ok());
-    dir.as_deref()
-        .and_then(|d| d.file_name())
+    let Some(dir) = dir else {
+        return "general".to_string();
+    };
+    if let Some(root) = git_root_basename(&dir) {
+        return root;
+    }
+    if is_throwaway_dir(&dir) {
+        return "general".to_string();
+    }
+    dir.file_name()
         .and_then(|n| n.to_str())
         .map(str::to_string)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "general".to_string())
+}
+
+/// The working-tree root for `dir`: the nearest ancestor (incl. `dir`) that holds a
+/// `.git` entry — a normal repo root OR a linked worktree's OWN root. Unlike
+/// [`git_root_basename`] (which remaps a worktree to its MAIN checkout so cross-tree
+/// MEMORY stays in one bucket), this keeps the worktree's own root: the per-tree
+/// CODE index must reflect THIS working tree's files/branch, so a worktree indexes
+/// into its own `.icode/index.db`. `None` when `dir` is not inside a git repo.
+fn find_repo_top(dir: &std::path::Path) -> Option<PathBuf> {
+    let mut cur = Some(dir);
+    while let Some(d) = cur {
+        if d.join(".git").exists() {
+            return Some(d.to_path_buf());
+        }
+        cur = d.parent();
+    }
+    None
+}
+
+/// Resolve the project root for `serve`. Precedence:
+///   1. an explicit `<path>` argument;
+///   2. else the working-tree root of the launch dir — `$CLAUDE_PROJECT_DIR` if
+///      Claude Code set it, otherwise the process cwd — via [`find_repo_top`], so a
+///      launch from any SUBDIRECTORY (or a git worktree) anchors the single
+///      `.icode/index.db` at the tree root, never in a subdir;
+///   3. else that launch dir as-is (not inside a repo).
+/// This is what lets ONE path-free `.mcp.json` serve whichever checkout or worktree
+/// Claude Code opens; the memory side resolves to the shared canonical name, so the
+/// two together Just Work across worktrees.
+fn resolve_serve_root(explicit: Option<PathBuf>) -> PathBuf {
+    if let Some(p) = explicit {
+        return p;
+    }
+    let launch = std::env::var("CLAUDE_PROJECT_DIR")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    find_repo_top(&launch).unwrap_or(launch)
 }
 
 /// Full JSON string escaping for arbitrary memory content (which can carry quotes,
@@ -734,7 +1037,9 @@ fn hook_session_fallback(project: &str) -> String {
     format!(
         "This project (`{project}`) has iCode cross-session memory. \
          Call `session_start`/`recall`/`search_memory` via the iCode MCP server when you need \
-         past context, decisions, or the developer profile."
+         past context, decisions, or the developer profile. \
+         Use `project=\"{project}\"` for every icode call — it is the canonical name for this \
+         repo; do not derive a different one from the working directory."
     )
 }
 
@@ -793,6 +1098,16 @@ fn build_session_start_context(project: &str) -> String {
             lines.push(format!("- {}", hook_memory_line(rec)));
         }
     }
+
+    // Pin the canonical project name so memory stays in ONE bucket: the agent picks
+    // the `project` argument for every icode call, and deriving it ad-hoc from the
+    // path is exactly what fragments a repo across `crates`, `Onyx`/`onyx`, etc.
+    lines.push(String::new());
+    lines.push(format!(
+        "> Use `project=\"{project}\"` for EVERY icode memory call this session \
+         (session_start / recall / add_memory / …). It is the canonical name for \
+         this repo — do not derive a different one from the working directory."
+    ));
 
     lines.join("\n")
 }
@@ -944,4 +1259,113 @@ fn hook_settings_json() -> String {
     format!(
         "{{\n  \"hooks\": {{\n    \"SessionStart\": [\n      {{\n        \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \"{cmd_session}\" }}\n        ]\n      }}\n    ],\n    \"PreCompact\": [\n      {{\n        \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \"{cmd_precompact}\" }}\n        ]\n      }}\n    ],\n    \"Stop\": [\n      {{\n        \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \"{cmd_stop}\" }}\n        ]\n      }}\n    ]\n  }}\n}}"
     )
+}
+
+#[cfg(test)]
+mod derivation_tests {
+    use super::{find_repo_top, git_root_basename, hook_project, is_throwaway_dir, resolve_serve_root};
+    use std::path::Path;
+
+    /// A tempdir whose `root/` holds a `.git` dir and a nested `a/b` subtree.
+    fn repo_with_subdir() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = td.path().join("root");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let deep = root.join("a").join("b");
+        std::fs::create_dir_all(&deep).unwrap();
+        (td, root, deep)
+    }
+
+    #[test]
+    fn git_root_basename_is_stable_across_subdirs() {
+        let (_td, root, deep) = repo_with_subdir();
+        assert_eq!(git_root_basename(&deep).as_deref(), Some("root"));
+        assert_eq!(git_root_basename(&root).as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn git_root_basename_none_outside_repo() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let plain = td.path().join("nogit").join("x");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert_eq!(git_root_basename(&plain), None);
+    }
+
+    #[test]
+    fn throwaway_dirs_by_basename() {
+        assert!(is_throwaway_dir(Path::new("/whatever/scratchpad")));
+        assert!(is_throwaway_dir(Path::new("/whatever/tmp")));
+        assert!(is_throwaway_dir(Path::new("/whatever/temp")));
+        assert!(!is_throwaway_dir(Path::new("/whatever/myproj")));
+    }
+
+    #[test]
+    fn hook_project_prefers_git_root_then_general_for_throwaway() {
+        let (_td, _root, deep) = repo_with_subdir();
+        // Explicit --project always wins.
+        assert_eq!(hook_project(Some("Explicit"), Some(&deep)), "Explicit");
+        // A subdir of a repo resolves to the repo-root basename (canonical).
+        assert_eq!(hook_project(None, Some(&deep)), "root");
+
+        // A non-repo throwaway dir collapses to "general" (no junk bucket).
+        let td = tempfile::tempdir().expect("tempdir");
+        let scratch = td.path().join("scratchpad");
+        std::fs::create_dir_all(&scratch).unwrap();
+        assert_eq!(hook_project(None, Some(&scratch)), "general");
+
+        // A non-repo, non-throwaway dir still resolves to its basename.
+        let proj = td.path().join("myproj");
+        std::fs::create_dir_all(&proj).unwrap();
+        assert_eq!(hook_project(None, Some(&proj)), "myproj");
+    }
+
+    #[test]
+    fn git_root_basename_maps_worktree_to_main_repo() {
+        let td = tempfile::tempdir().expect("tempdir");
+        // Main checkout with the worktree admin dir under its real `.git`.
+        let main = td.path().join("main");
+        let wt_admin = main.join(".git").join("worktrees").join("feat");
+        std::fs::create_dir_all(&wt_admin).unwrap();
+        std::fs::write(wt_admin.join("commondir"), "../..\n").unwrap();
+        // Linked worktree: its `.git` is a FILE pointing at the admin dir.
+        let wt = td.path().join("feat-wt");
+        let deep = wt.join("crates").join("x");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", wt_admin.display())).unwrap();
+
+        // From anywhere inside the worktree, the project is the MAIN repo name —
+        // NOT the worktree dir's basename ("feat-wt"). One repo, one memory bucket.
+        assert_eq!(git_root_basename(&deep).as_deref(), Some("main"));
+        assert_eq!(hook_project(None, Some(&deep)), "main");
+    }
+
+    #[test]
+    fn find_repo_top_is_worktree_own_root_not_main() {
+        let td = tempfile::tempdir().expect("tempdir");
+        // Main checkout: `.git` dir; a subdir resolves UP to the repo root.
+        let main = td.path().join("main");
+        std::fs::create_dir_all(main.join(".git")).unwrap();
+        let sub = main.join("crates").join("x");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert_eq!(find_repo_top(&sub).as_deref(), Some(main.as_path()));
+
+        // Worktree: its OWN root (NOT remapped to main) — the code index is per-tree.
+        let wt_admin = main.join(".git").join("worktrees").join("feat");
+        std::fs::create_dir_all(&wt_admin).unwrap();
+        let wt = td.path().join("feat-wt");
+        let wsub = wt.join("crates");
+        std::fs::create_dir_all(&wsub).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", wt_admin.display())).unwrap();
+        assert_eq!(find_repo_top(&wsub).as_deref(), Some(wt.as_path()));
+
+        // Outside any repo → None.
+        let bare = tempfile::tempdir().expect("tempdir");
+        assert_eq!(find_repo_top(bare.path()), None);
+    }
+
+    #[test]
+    fn resolve_serve_root_prefers_explicit_path() {
+        let p = std::path::PathBuf::from("/explicit/project/root");
+        assert_eq!(resolve_serve_root(Some(p.clone())), p);
+    }
 }

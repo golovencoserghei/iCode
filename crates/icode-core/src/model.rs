@@ -180,6 +180,71 @@ pub struct SymbolContext {
     pub similar_symbols: Vec<CodeHit>,
 }
 
+// ──────────────────────── existence verdict (check_exists) ────────────────────────
+
+/// A calibrated answer to "does a feature/symbol matching this query actually
+/// exist in the index?". Plain search always returns the K nearest neighbours, so
+/// an agent can read "closest" as "found" (a string literal `"calendar"` in a
+/// permissions list is NOT a calendar feature). This commits to a verdict so the
+/// answer can be quoted, not vibed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum Verdict {
+    /// A real DEFINED symbol (function/class/route) matches the query.
+    Exists,
+    /// Something related is nearby, but not a clear match — verify before trusting.
+    Weak,
+    /// Nothing in the index matches. NOT proof it can't exist elsewhere
+    /// (dynamic/external/generated code is invisible to a static index).
+    Absent,
+}
+
+/// WHY a hit matched — the discriminator that stops a string-literal mention from
+/// being read as a real feature.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchKind {
+    /// A query term equals a defined function/class/route name (case-insensitive).
+    ExactSymbol,
+    /// A query term is a segment of a defined symbol's name.
+    NameToken,
+    /// Vector similarity only — no lexical overlap (a paraphrase match).
+    Semantic,
+    /// The term appears ONLY inside code bodies / string literals / comments, with
+    /// no symbol of that name. A mention, not a feature.
+    BodyOrString,
+}
+
+/// One supporting hit behind a verdict, tagged with why it matched. The `hit`'s
+/// own `snippet` carries the quotable text (a signature, or the literal line for
+/// `body_or_string`) so the agent cites rather than paraphrases.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Evidence {
+    pub hit: CodeHit,
+    pub match_kind: MatchKind,
+}
+
+/// The full grounded answer for `check_exists`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExistenceVerdict {
+    pub verdict: Verdict,
+    /// 0..1 calibrated confidence in the verdict. Heuristic (thresholds tuned on
+    /// real code), NOT a proof.
+    pub confidence: f32,
+    /// Human-readable one-liner an agent can quote back verbatim.
+    pub reason: String,
+    /// The single best-matching symbol, if any (`null` on ABSENT with no neighbour).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub best_match: Option<CodeHit>,
+    /// The `match_kind` of `best_match`, if present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub match_kind: Option<MatchKind>,
+    /// True iff a query term equals a DEFINED symbol's name (the strongest signal).
+    pub exact_name_hit: bool,
+    /// Up to a few supporting hits with their match kinds.
+    pub evidence: Vec<Evidence>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum FunctionOrClass {

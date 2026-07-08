@@ -15,6 +15,7 @@ pub mod parse;
 pub mod recall;
 pub mod search;
 pub mod store;
+pub mod verdict;
 
 pub use chunk::{chunk_text_for_class, chunk_text_for_function, chunks_for_file, CHUNK_BUDGET_BYTES};
 pub use daemon::{run_daemon, DaemonLock};
@@ -33,3 +34,4 @@ pub use memory::{
 pub use recall::{code_to_memory, recall, why_this_exists};
 pub use search::{find_similar, hybrid_search, rrf_fuse, semantic_search, RRF_K};
 pub use store::{SqliteCodeStore, Vec0Index};
+pub use verdict::{check_exists, ExistScope};
