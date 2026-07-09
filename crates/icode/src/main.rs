@@ -345,6 +345,7 @@ fn print_examples(label: &str, examples: &[String], total: u64) {
 }
 
 fn run_index(path: &std::path::Path) -> anyhow::Result<()> {
+    keep_model_resident_for_bulk();
     let store = open_store_with_shared_cache(path)?;
     let stats =
         icode_engine::index_path(path, &store).map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -371,6 +372,7 @@ fn run_index(path: &std::path::Path) -> anyhow::Result<()> {
 /// folded into `index`, a missing embedder here IS a hard error (the user asked
 /// to embed explicitly).
 fn run_embed(path: &std::path::Path) -> anyhow::Result<()> {
+    keep_model_resident_for_bulk();
     let store = open_store_with_shared_cache(path)?;
     embed_pass(&store, /* hard_fail = */ true)
 }
@@ -602,6 +604,11 @@ fn run_serve(path: Option<PathBuf>) -> anyhow::Result<()> {
     let root = std::fs::canonicalize(&root).unwrap_or(root);
     eprintln!("icode serve: project root = {}", root.display());
 
+    // Several editor windows each hold a long-lived server, so keep one server's
+    // footprint small: 16 MiB of SQLite page cache instead of the 64 MiB default
+    // tuned for the bulk indexer. Explicit `ICODE_CACHE_KIB` still wins.
+    lighten_serve_memory();
+
     // Build the embedder best-effort BEFORE entering the async runtime (the build
     // + health probe are blocking). A down/unreachable Ollama must NOT fail
     // `serve` — the code-graph tools stay fully useful; only the semantic/hybrid
@@ -635,21 +642,21 @@ fn run_serve(path: Option<PathBuf>) -> anyhow::Result<()> {
             Err(e) => eprintln!("icode serve: graph sync skipped ({e}); serving existing index"),
         }
 
-        // Drain embeddings in the BACKGROUND so semantic recall completes on its own
-        // without blocking startup. Cheap now that the embed cache is shared per
-        // machine (a worktree/re-clone re-embeds nothing), but cost-sensitive users
-        // can opt OUT with `ICODE_SERVE_EMBED=0` — the graph stays lexical and
-        // semantic fills lazily via query-time JIT or an explicit `icode embed`. A
-        // down Ollama simply leaves the graph lexical too. `embed_pending` locks the
-        // store per batch (the network `embed` call is outside the lock), so the
-        // drain never starves the serving reads.
+        // Bulk embedding on startup is OPT-IN: `serve` must stay light. A developer
+        // keeps several editor windows open and EACH spawns its own server — auto-
+        // draining from every one of them hammers the local model and pins it (~800 MB)
+        // in RAM. Default OFF: the graph is lexical + structural immediately, and
+        // semantic fills lazily via query-time JIT or an explicit `icode embed`.
+        // Set `ICODE_SERVE_EMBED=1` to restore the background drain. When it does run,
+        // `embed_pending` locks the store per batch (the network `embed` call is
+        // outside the lock), so it never starves the serving reads.
         let drain_enabled = std::env::var("ICODE_SERVE_EMBED")
-            .map(|v| !matches!(v.trim(), "0" | "false" | "no" | "off"))
-            .unwrap_or(true);
+            .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
         if !drain_enabled {
             eprintln!(
-                "icode serve: background embedding disabled (ICODE_SERVE_EMBED=0); \
-                 semantic fills via JIT / `icode embed`"
+                "icode serve: background embedding off (default); semantic fills via \
+                 JIT / `icode embed`. Set ICODE_SERVE_EMBED=1 to drain on startup."
             );
         } else if let Some(emb) = embedder.clone() {
             let store_bg = store.clone();
@@ -679,6 +686,7 @@ fn run_serve(path: Option<PathBuf>) -> anyhow::Result<()> {
 /// `icode-serve::web::serve`, not configurable here. The startup URL is printed
 /// to stderr by the serve layer.
 fn run_web(path: PathBuf, port: u16) -> anyhow::Result<()> {
+    lighten_serve_memory();
     let embedder = build_serve_embedder();
     let memory = build_serve_memory(embedder.clone());
 
@@ -727,6 +735,27 @@ fn open_store_with_shared_cache(path: &std::path::Path) -> anyhow::Result<Sqlite
     SqliteCodeStore::open(path)
         .and_then(|s| s.with_embed_cache_db(&central_db_path()))
         .map_err(|e| anyhow::anyhow!(e.to_string()))
+}
+
+/// Trim a LONG-LIVED server's footprint. A developer keeps several editor windows
+/// open and each spawns its own `serve`/`web` process, so the 64 MiB SQLite page
+/// cache tuned for the bulk indexer multiplies across them. Drop it to 16 MiB unless
+/// the user set `ICODE_CACHE_KIB` explicitly. Must run BEFORE the store is opened —
+/// the pragma is applied at connection time.
+fn lighten_serve_memory() {
+    if std::env::var_os("ICODE_CACHE_KIB").is_none() {
+        std::env::set_var("ICODE_CACHE_KIB", "16384");
+    }
+}
+
+/// Bulk embed paths (`icode index` / `icode embed`) keep the model resident BETWEEN
+/// batches; otherwise the light interactive default (`keep_alive=0s`) would unload
+/// and reload it once per batch. Interactive paths (serve/web) keep the light
+/// default so an occasional embed never pins the model in RAM. Explicit env wins.
+fn keep_model_resident_for_bulk() {
+    if std::env::var_os("ICODE_OLLAMA_KEEP_ALIVE").is_none() {
+        std::env::set_var("ICODE_OLLAMA_KEEP_ALIVE", "5m");
+    }
 }
 
 /// Build the cross-session memory store for `serve`, wrapped in the WAL audit

@@ -10,11 +10,13 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 /// Request body for `POST /api/embed`. Ollama accepts an array `input`, so one
-/// call embeds a whole batch.
+/// call embeds a whole batch. `keep_alive` controls how long Ollama keeps the model
+/// resident AFTER the call (see [`OllamaEmbedder::keep_alive`]).
 #[derive(Serialize)]
 struct EmbedRequest<'a> {
     model: &'a str,
     input: &'a [&'a str],
+    keep_alive: &'a str,
 }
 
 /// Response body from `/api/embed`: one vector per input, in input order.
@@ -46,6 +48,13 @@ pub struct OllamaEmbedder {
     /// Target output dim. If the backend returns a larger native dim we apply
     /// MRL truncation + L2 renorm down to this width.
     dim: usize,
+    /// How long Ollama keeps the model resident after an embed call, as a Go
+    /// duration string. DEFAULT `"0s"`: unload immediately, so an occasional embed
+    /// (a memory write, a JIT semantic query) does not pin ~800 MB of model in RAM
+    /// for the next five minutes — the tool stays light when several editor windows
+    /// each hold a server. Bulk commands (`icode index` / `icode embed`) raise it so
+    /// they do not reload per batch. Override with `ICODE_OLLAMA_KEEP_ALIVE`.
+    keep_alive: String,
 }
 
 impl OllamaEmbedder {
@@ -61,6 +70,11 @@ impl OllamaEmbedder {
             url: cfg.ollama_url.trim_end_matches('/').to_string(),
             model: cfg.model.clone(),
             dim: cfg.dim,
+            keep_alive: std::env::var("ICODE_OLLAMA_KEEP_ALIVE")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "0s".to_string()),
         })
     }
 
@@ -108,6 +122,7 @@ impl Embedder for OllamaEmbedder {
         let body = EmbedRequest {
             model: &self.model,
             input: texts,
+            keep_alive: &self.keep_alive,
         };
 
         let resp = self
