@@ -1360,8 +1360,15 @@ fn parse_lang_arg(s: Option<&str>) -> std::result::Result<Option<Language>, Stri
 /// search — it is logged to stderr and the query proceeds against whatever vectors
 /// already exist. Runs inside the tool's `spawn_blocking` closure (sync, off the
 /// async reactor).
+/// Backfill AT MOST one small batch of missing chunk vectors on an interactive tool
+/// call. Capped on purpose: `embed_pending` drains the queue until it is EMPTY, so an
+/// uncapped call here turns a single `recall` / `semantic_search_code` into a
+/// full-project embed that pins the GPU for the length of the tool call. The rest of
+/// the queue is filled by an explicit `icode embed` (or the opt-in `serve` drain).
 fn jit_embed(store: &SqliteCodeStore, embedder: &dyn Embedder) {
-    if let Err(e) = icode_engine::embed_pending(store, embedder, JIT_EMBED_BATCH) {
+    if let Err(e) =
+        icode_engine::embed_pending_capped(store, embedder, JIT_EMBED_BATCH, JIT_EMBED_BATCH)
+    {
         eprintln!("icode: on-demand embed skipped ({e})");
     }
 }

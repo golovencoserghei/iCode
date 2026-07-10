@@ -40,18 +40,37 @@ pub struct EmbedStats {
     pub batches: usize,
 }
 
-/// Drain the pending-embedding queue: repeatedly pull up to `batch` chunks whose
-/// embedding is missing or stamped with a different model, fill their vectors
-/// (cache hit → rehydrate; miss → embed + cache), write the vectors, and stamp
-/// each chunk as embedded (which removes it from the queue).
+/// Drain the pending-embedding queue COMPLETELY: repeatedly pull up to `batch`
+/// chunks whose embedding is missing or stamped with a different model, fill their
+/// vectors (cache hit → rehydrate; miss → embed + cache), write the vectors, and
+/// stamp each chunk as embedded (which removes it from the queue).
 ///
-/// Loops until the queue is empty. A `batch` of 0 is treated as 1 so the loop
-/// always makes progress. An embedder failure (e.g. Ollama down) propagates as
-/// `Err` — the caller decides whether a partial graph without vectors is fine.
+/// Loops until the queue is EMPTY, so this is the BULK path only (`icode index` /
+/// `icode embed` / the opt-in `serve` drain). An INTERACTIVE caller must use
+/// [`embed_pending_capped`]: a full drain inside a tool call embeds the whole project
+/// synchronously and pins the GPU. An embedder failure (e.g. Ollama down) propagates
+/// as `Err` — the caller decides whether a partial graph without vectors is fine.
 pub fn embed_pending(
     store: &SqliteCodeStore,
     embedder: &dyn Embedder,
     batch: usize,
+) -> Result<EmbedStats> {
+    embed_pending_capped(store, embedder, batch, usize::MAX)
+}
+
+/// Like [`embed_pending`], but touches AT MOST `max_chunks` pending chunks and then
+/// returns.
+///
+/// This is what the interactive / JIT path needs: a semantic query backfills one
+/// small slice of the queue and answers, instead of turning a single tool call into
+/// a full-project embed. `batch` is the page size handed to the embedder;
+/// `max_chunks` is the hard ceiling on the work done in this call. A `batch` of 0 is
+/// treated as 1 so the loop always makes progress.
+pub fn embed_pending_capped(
+    store: &SqliteCodeStore,
+    embedder: &dyn Embedder,
+    batch: usize,
+    max_chunks: usize,
 ) -> Result<EmbedStats> {
     let batch = batch.max(1);
     let model = embedder.model_id().to_string();
@@ -64,12 +83,19 @@ pub fn embed_pending(
     // `c.id > after_id` (see `pending_chunks_with_hash`), so the drain is a single
     // forward pass over the primary key — O(N) — not the old scan-from-zero O(N²).
     let mut after_id: i64 = 0;
+    // Hard ceiling on chunks touched by THIS call (see `max_chunks`).
+    let mut processed: usize = 0;
 
     loop {
-        let pend = store.pending_chunks_with_hash(&model, after_id, batch)?;
+        if processed >= max_chunks {
+            break;
+        }
+        let want = batch.min(max_chunks - processed);
+        let pend = store.pending_chunks_with_hash(&model, after_id, want)?;
         if pend.is_empty() {
             break;
         }
+        processed += pend.len();
         // Advance the cursor past this batch (rows come back ORDER BY id ASC, so the
         // last one is the max). We stamp every row below, so nothing pending is left
         // behind the cursor.

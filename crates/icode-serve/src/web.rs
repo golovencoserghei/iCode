@@ -59,15 +59,19 @@ impl WebState {
 /// Batch size for the on-demand embed pass run before a semantic dashboard query.
 const JIT_EMBED_BATCH: usize = 32;
 
-/// Bring the vector index up to date ON DEMAND before a semantic dashboard query —
-/// the same seam as `mcp::jit_embed`. The daemon keeps the graph live but never
-/// embeds; vectors are filled here, only when semantic search/recall is used.
-/// Cache-accelerated (`content_hash → vector`), so a query after a `git checkout`
-/// re-embeds only genuinely-new code. Best-effort: an embedder hiccup is logged and
-/// the query proceeds against whatever vectors already exist. Runs inside the
-/// handler's `spawn_blocking` closure.
+/// Backfill AT MOST one small batch of missing chunk vectors before a semantic
+/// dashboard query — the same seam as `mcp::jit_embed`. The daemon keeps the graph
+/// live but never embeds; vectors are filled here, only when semantic search/recall
+/// is used. Cache-accelerated (`content_hash → vector`), so a query after a `git
+/// checkout` re-embeds only genuinely-new code. CAPPED on purpose: `embed_pending`
+/// drains until the queue is EMPTY, so an uncapped call would embed the whole project
+/// inside one request. Best-effort: an embedder hiccup is logged and the query
+/// proceeds against whatever vectors already exist. Runs inside the handler's
+/// `spawn_blocking` closure.
 fn jit_embed(store: &SqliteCodeStore, embedder: &dyn Embedder) {
-    if let Err(e) = icode_engine::embed_pending(store, embedder, JIT_EMBED_BATCH) {
+    if let Err(e) =
+        icode_engine::embed_pending_capped(store, embedder, JIT_EMBED_BATCH, JIT_EMBED_BATCH)
+    {
         eprintln!("icode web: on-demand embed skipped ({e})");
     }
 }

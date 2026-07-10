@@ -20,7 +20,7 @@ pub mod verdict;
 pub use chunk::{chunks_for_file, rel_display_path, CHUNK_BUDGET_BYTES};
 pub use daemon::{run_daemon, DaemonLock};
 pub use doctor::{diagnose, DiagnosticReport};
-pub use embed::{embed_pending, EmbedStats};
+pub use embed::{embed_pending, embed_pending_capped, EmbedStats};
 pub use index::{
     index_one_file, index_path, is_in_excluded_dir, is_supported_source, walk_source_files,
     IndexStats,

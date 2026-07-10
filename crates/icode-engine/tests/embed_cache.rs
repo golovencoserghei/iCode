@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use icode_core::error::Result;
 use icode_core::traits::{CodeReadStore, Embedder};
-use icode_engine::{embed_pending, index_path, SqliteCodeStore};
+use icode_engine::{embed_pending, embed_pending_capped, index_path, SqliteCodeStore};
 
 /// Output dim — must match the `vec_code` vec0 column width (`schema::VEC_DIM`),
 /// else `upsert_batch` rejects the vector with `DimMismatch`.
@@ -161,6 +161,39 @@ fn cache_rehydrates_on_reindex_without_re_embedding() {
     assert_eq!(s4.embedded, 0);
     assert_eq!(s4.rehydrated, 0);
     assert_eq!(emb.calls(), calls_steady, "idempotent: nothing pending");
+}
+
+/// An INTERACTIVE (JIT) call must never turn into a full-project embed. `embed_pending`
+/// loops until the queue is empty; `embed_pending_capped` stops at `max_chunks`, so a
+/// single `recall` / semantic query backfills a slice and answers instead of pinning
+/// the GPU for the whole index.
+#[test]
+fn capped_embed_never_drains_the_whole_queue() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    fs::write(dir.path().join("io.rs"), SAMPLE_A).expect("write");
+    let store = SqliteCodeStore::open(dir.path()).expect("open");
+    index_path(dir.path(), &store).expect("index");
+    let n = store.stats().expect("stats").code_chunks as usize;
+    assert!(n >= 2, "sample yields at least two chunks, got {n}");
+
+    let emb = CountingEmbedder::new();
+    // Cap at ONE chunk: the call must touch exactly one, not all `n`.
+    let s = embed_pending_capped(&store, &emb, 32, 1).expect("capped embed");
+    assert_eq!(s.embedded + s.rehydrated, 1, "exactly one chunk processed");
+    assert_eq!(emb.calls(), 1, "embedder called for exactly one chunk");
+
+    let st = store.stats().expect("stats");
+    assert!(
+        st.vec_rows < st.code_chunks,
+        "queue must NOT be drained by a capped call ({} vec vs {} chunks)",
+        st.vec_rows,
+        st.code_chunks
+    );
+
+    // The bulk path still drains the remainder.
+    embed_pending(&store, &emb, 32).expect("bulk drain");
+    let st = store.stats().expect("stats");
+    assert_eq!(st.vec_rows, st.code_chunks, "bulk drain completes the index");
 }
 
 /// The cross-project / worktree payoff: with a SHARED central embed cache, the same
