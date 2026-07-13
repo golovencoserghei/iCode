@@ -119,11 +119,15 @@ fn hybrid_search_finds_read_file() {
 
 #[test]
 fn find_similar_excludes_self_and_returns_neighbours() {
-    let (_dir, store, embedder) = setup();
+    let (_dir, store, _embedder) = setup();
 
     // read_file and load_file_bytes are near-synonyms; the nearest neighbour of
     // read_file should be load_file_bytes, and read_file must NOT appear.
-    let hits = find_similar(&store, &embedder, "read_file", 5).expect("find_similar");
+    //
+    // NOTE: `find_similar` no longer takes an embedder — it is MinHash over token
+    // shingles, so this runs with no model at all (the `setup()` embedder is still
+    // built for the semantic/hybrid cases in this file, just not used here).
+    let hits = find_similar(&store, "read_file", 5).expect("find_similar");
     assert!(!hits.is_empty(), "find_similar returned a non-empty list");
     assert!(
         hits.iter().all(|h| h.name != "read_file" && h.qualified_name != "read_file"),
