@@ -1380,6 +1380,25 @@ impl CodeMcpServer {
         }
     }
 
+    /// Resolve a caller-supplied path to the ABSOLUTE form the index is keyed on.
+    ///
+    /// The graph stores absolute paths (the indexer walks an absolute root), but an
+    /// agent naturally writes a repo-relative path (`crates/foo/src/lib.rs`) — which
+    /// matched nothing and returned an empty list, the worst kind of failure: a
+    /// silent one. A relative path is joined to the project root; an absolute path is
+    /// passed through untouched.
+    fn abs_path(&self, path: &str) -> String {
+        let p = std::path::Path::new(path);
+        if p.is_absolute() {
+            return path.to_string();
+        }
+        let joined = self.root.join(p);
+        std::fs::canonicalize(&joined)
+            .unwrap_or(joined)
+            .to_string_lossy()
+            .to_string()
+    }
+
     // ──────────────────────── consolidated tool surface (12) ────────────────────────
     //
     // The 42 fine-grained handlers above are now PRIVATE. Their schemas were loaded
@@ -1507,14 +1526,14 @@ impl CodeMcpServer {
             }
             "impact" => {
                 self.impact_analysis(Parameters(ImpactArgs {
-                    path: a.target,
+                    path: self.abs_path(&a.target),
                     depth: a.depth,
                 }))
                 .await
             }
             "deps" => {
                 self.find_dependencies(Parameters(DependenciesArgs {
-                    path: a.target,
+                    path: self.abs_path(&a.target),
                     depth: a.depth,
                 }))
                 .await
@@ -1532,15 +1551,22 @@ impl CodeMcpServer {
     async fn file(&self, Parameters(a): Parameters<FileArgs>) -> String {
         match a.op.as_str() {
             "outline" => match a.path {
-                Some(path) => self.get_file_outline(Parameters(FileOutlineArgs { path })).await,
+                Some(path) => {
+                    let path = self.abs_path(&path);
+                    self.get_file_outline(Parameters(FileOutlineArgs { path })).await
+                }
                 None => err_json("file op=outline needs `path`"),
             },
             "stat" => match a.path {
-                Some(path) => self.stat_file(Parameters(StatFileArgs { path })).await,
+                Some(path) => {
+                    let path = self.abs_path(&path);
+                    self.stat_file(Parameters(StatFileArgs { path })).await
+                }
                 None => err_json("file op=stat needs `path`"),
             },
             "read" => match a.path {
                 Some(path) => {
+                    let path = self.abs_path(&path);
                     self.read_file(Parameters(ReadFileArgs {
                         path,
                         start: a.start,
@@ -1717,12 +1743,17 @@ impl CodeMcpServer {
     async fn session(&self, Parameters(a): Parameters<SessionArgs>) -> String {
         match a.op.as_str() {
             "start" => {
-                self.session_start(Parameters(SessionStartArgs {
-                    project: a.project,
-                    n_project_memories: a.limit,
-                    n_profile_notes: None,
-                }))
-                .await
+                // Full MemoryRecords measured 19 KB (~4.8k tokens) per session start —
+                // access_count, timestamps and ids the agent never reads. Compact to
+                // `[category] content` lines; ids stay fetchable via memory op=list.
+                let json = self
+                    .session_start(Parameters(SessionStartArgs {
+                        project: a.project,
+                        n_project_memories: a.limit,
+                        n_profile_notes: None,
+                    }))
+                    .await;
+                compact_session_start(&json)
             }
             "end" => {
                 self.session_end(Parameters(SessionEndArgs {
@@ -1867,6 +1898,53 @@ fn to_json<T: serde::Serialize>(value: &T) -> String {
 
 fn err_json(msg: &str) -> String {
     serde_json::json!({ "error": msg }).to_string()
+}
+
+/// Per-memory content cap in the compacted session-start block.
+const SESSION_LINE_MAX: usize = 240;
+
+/// Compact the `session_start` payload.
+///
+/// The raw form serializes full `MemoryRecord`s — ids, timestamps, `access_count`,
+/// tags — and measured 19 KB (~4.8k tokens) on a real project. An MCP tool result
+/// stays in the model's context for the REST of the session, so that is 4.8k tokens
+/// of rent paid once per session for fields the agent never reads. This renders the
+/// same information as `[category] content` lines, truncated; the full records remain
+/// one `memory op=list` away.
+///
+/// Best-effort: anything unexpected (an error object, a shape change) is passed
+/// through untouched rather than swallowed.
+fn compact_session_start(json: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return json.to_string();
+    };
+    if v.get("error").is_some() {
+        return json.to_string();
+    }
+
+    fn lines(v: &serde_json::Value, key: &str, out: &mut String) {
+        let Some(arr) = v.get(key).and_then(|x| x.as_array()) else {
+            return;
+        };
+        for rec in arr {
+            let cat = rec.get("category").and_then(|c| c.as_str()).unwrap_or("general");
+            let content = rec.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            let flat = content.split_whitespace().collect::<Vec<_>>().join(" ");
+            let text: String = if flat.chars().count() > SESSION_LINE_MAX {
+                flat.chars().take(SESSION_LINE_MAX).collect::<String>() + "…"
+            } else {
+                flat
+            };
+            out.push_str(&format!("- [{cat}] {text}\n"));
+        }
+    }
+
+    let mut out = String::new();
+    out.push_str("## Developer profile (cross-project — honour these):\n");
+    lines(&v, "developer_profile", &mut out);
+    out.push_str("\n## Recent project memory:\n");
+    lines(&v, "project_context", &mut out);
+    out
 }
 
 /// Guard for `add_developer_note`: the developer profile is CROSS-PROJECT — every
