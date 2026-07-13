@@ -54,7 +54,11 @@ CREATE TABLE IF NOT EXISTS functions (
     -- verbatim AND exploded into its words, so FTS5's word tokenizer can match
     -- `Handler` against `HttpRequestHandler`. Indexed as an extra FTS column; the
     -- raw `body` stays indexed too, so nothing is lost.
-    search_text    TEXT NOT NULL DEFAULT ''
+    search_text    TEXT NOT NULL DEFAULT '',
+    -- MinHash signature of the body (see `minhash`): 512 B, lexical + structural
+    -- views. Powers "find similar code" with NO embedding model — a renamed clone
+    -- still matches on the structural half.
+    minhash        BLOB
 );
 
 CREATE INDEX IF NOT EXISTS idx_functions_file ON functions(file_id);
@@ -77,7 +81,9 @@ CREATE TABLE IF NOT EXISTS classes (
     body           TEXT NOT NULL,
     node_hash      TEXT,
     -- Derived identifier-split text — see the note on `functions.search_text`.
-    search_text    TEXT NOT NULL DEFAULT ''
+    search_text    TEXT NOT NULL DEFAULT '',
+    -- MinHash signature — see the note on `functions.minhash`.
+    minhash        BLOB
 );
 
 CREATE INDEX IF NOT EXISTS idx_classes_file ON classes(file_id);

@@ -153,53 +153,19 @@ pub fn hybrid_search(
     Ok(rrf_fuse(&[semantic, lexical], RRF_K, k))
 }
 
-/// "More like this symbol": resolve `qualified_name` to its definition (function
-/// then class), rebuild its embeddable chunk text with the SAME builder the index
-/// uses ([`chunk_text_for_function`] / [`chunk_text_for_class`]), embed it, KNN the
-/// index, drop the symbol itself from the results, and return the top `k` distinct
-/// symbols by cosine similarity.
+/// "More like this symbol" — with NO embedding model.
 ///
-/// Resolution is by bare last segment (the store's `get_function`/`get_class` key
-/// on the bare name); a `qualified_name` like `TreeWalker::walk` resolves on
-/// `walk`. Returns an empty list (not an error) when the symbol is unknown.
-pub fn find_similar(
-    store: &SqliteCodeStore,
-    embedder: &dyn Embedder,
-    qualified_name: &str,
-    k: usize,
-) -> Result<Vec<CodeHit>> {
-    if k == 0 {
-        return Ok(vec![]);
-    }
-    let bare = bare_name(qualified_name);
-
-    // Resolve the symbol, then embed its STORED chunk text as the query — byte-
-    // identical to the vector the indexer wrote (so the query inherits the same
-    // checkout-invariant relative path, with no header re-derivation). A symbol
-    // with no chunk yet yields no results.
-    let qn = if let Some(f) = store.get_function(bare, None, true)? {
-        f.qualified_name
-    } else if let Some(c) = store.get_class(bare, None, true)? {
-        c.qualified_name
-    } else {
-        return Ok(vec![]);
-    };
-    let query_text = match store.chunk_text_for_symbol(&qn)? {
-        Some(t) => t,
-        None => return Ok(vec![]),
-    };
-
-    // Oversample by one extra slot so excluding the symbol itself can't shrink us
-    // below k.
-    let over = oversample(k).saturating_add(1);
-    let candidates = dense_candidates(store, embedder, &query_text, over)?;
-
-    // Drop the symbol itself (match on qualified_name), then dedup + top-k.
-    let filtered: Vec<CodeHit> = candidates
-        .into_iter()
-        .filter(|h| h.qualified_name != qualified_name && h.qualified_name != bare)
-        .collect();
-    Ok(dedup_by_qualified_name(filtered, k))
+/// Ranks the project's symbols against the target's MinHash signature (mean of a
+/// lexical and a structural Jaccard estimate — see [`crate::minhash`]). This replaced
+/// an embed + vector-KNN round trip: for CODE a dense vector encodes *topic*, while
+/// "show me code like this" is a question about *shape*, and the structural half of
+/// the signature still recognises a clone whose variables were all renamed. It is also
+/// free — no GPU, no model, microseconds over a full-project scan.
+///
+/// Returns an empty list (not an error) when the symbol is unknown or has no stored
+/// signature.
+pub fn find_similar(store: &SqliteCodeStore, qualified_name: &str, k: usize) -> Result<Vec<CodeHit>> {
+    store.find_similar_minhash(qualified_name, k)
 }
 
 // ──────────────────────────── helpers ────────────────────────────
@@ -262,13 +228,6 @@ fn dedup_by_qualified_name(hits: Vec<CodeHit>, k: usize) -> Vec<CodeHit> {
         }
     }
     out
-}
-
-/// The bare last segment of a (possibly) qualified name (`A::b` → `b`,
-/// `A.b` → `b`). Mirrors the store's resolution key.
-fn bare_name(name: &str) -> &str {
-    let after_colons = name.rsplit("::").next().unwrap_or(name);
-    after_colons.rsplit('.').next().unwrap_or(after_colons)
 }
 
 #[cfg(test)]

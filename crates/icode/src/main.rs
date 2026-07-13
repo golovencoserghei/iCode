@@ -345,7 +345,6 @@ fn print_examples(label: &str, examples: &[String], total: u64) {
 }
 
 fn run_index(path: &std::path::Path) -> anyhow::Result<()> {
-    keep_model_resident_for_bulk();
     let store = open_store_with_shared_cache(path)?;
     let stats =
         icode_engine::index_path(path, &store).map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -361,10 +360,26 @@ fn run_index(path: &std::path::Path) -> anyhow::Result<()> {
         stats.errors
     );
 
-    // Best-effort embed pass: the graph is already useful without vectors, so a
-    // down/unreachable Ollama must NOT fail `index`. Run `icode embed <path>`
-    // later to catch up once the embedder is available.
-    embed_pass(&store, /* hard_fail = */ false)?;
+    // Indexing is now FREE by default — pure CPU, no model, no GPU.
+    //
+    // The graph, the identifier-aware lexical search and MinHash similarity all come
+    // out of the parse; vectors only power `search mode=semantic|hybrid`, which is no
+    // longer the default. Embedding every chunk here meant a plain `icode index` woke
+    // a local model and chewed the GPU for a capability most calls never use. Opt in
+    // with `ICODE_EMBED=1` (or run `icode embed <path>` later).
+    let want_embed = std::env::var("ICODE_EMBED")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    if want_embed {
+        keep_model_resident_for_bulk();
+        // Best-effort: a down/unreachable Ollama must NOT fail `index`.
+        embed_pass(&store, /* hard_fail = */ false)?;
+    } else {
+        println!(
+            "vectors skipped (free mode). Graph + lexical + similarity are ready. \
+             For `search mode=semantic`: ICODE_EMBED=1 icode index <path>, or icode embed <path>."
+        );
+    }
     Ok(())
 }
 

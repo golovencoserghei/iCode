@@ -35,7 +35,7 @@ pub use vector::Vec0Index;
 /// v3 (Wave 1): receiver-aware call resolution — `calls.resolved_callee`
 /// (qualified target) + `calls.confidence` (how the edge resolved). Discard-and-
 /// rebuild handles the added columns; no in-place migration.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// Gate the one-time sqlite-vec auto-extension registration.
 static VEC_INIT: Once = Once::new();
@@ -261,6 +261,96 @@ impl SqliteCodeStore {
     /// fixed at [`schema::VEC_DIM`] — the `vec_code` column width.
     pub fn vector_index(&self) -> Vec0Index {
         Vec0Index::new(Arc::clone(&self.conn), schema::VEC_DIM)
+    }
+
+    /// "Code like this" — WITHOUT an embedding model.
+    ///
+    /// Ranks every symbol in the project against `qualified_name`'s MinHash signature
+    /// (see [`crate::minhash`]): the mean of a lexical and a structural Jaccard
+    /// estimate. The structural half is normalised over identifiers, so a copy-pasted
+    /// clone whose variables were all renamed still scores high — which a dense vector
+    /// captures poorly, since it encodes topic rather than shape.
+    ///
+    /// A full scan: signatures are 512 B and a repo has ~1k symbols, so this is a
+    /// microsecond-scale pass and needs no ANN index. The symbol itself is excluded.
+    /// Returns hits best-first; an unknown symbol (or one with no signature, e.g. a
+    /// stale row from before this column existed) yields an empty list, not an error.
+    pub fn find_similar_minhash(&self, qualified_name: &str, limit: usize) -> Result<Vec<CodeHit>> {
+        if limit == 0 {
+            return Ok(vec![]);
+        }
+        let conn = self.conn.lock().map_err(store_err)?;
+
+        // The query symbol's signature (functions first, then classes).
+        let target: Option<Vec<u8>> = match conn.query_row(
+            "SELECT minhash FROM functions WHERE qualified_name = ?1 OR name = ?1 \
+             UNION ALL \
+             SELECT minhash FROM classes WHERE qualified_name = ?1 OR name = ?1 \
+             LIMIT 1",
+            rusqlite::params![qualified_name],
+            |r| r.get::<_, Option<Vec<u8>>>(0),
+        ) {
+            Ok(v) => v,
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(store_err(e)),
+        };
+        let Some(target) = target else {
+            return Ok(vec![]);
+        };
+        let target = crate::minhash::from_blob(&target);
+
+        let mut scored: Vec<(f32, CodeHit)> = Vec::new();
+        for (kind, table) in [
+            (SymbolKind::Function, "functions"),
+            (SymbolKind::Class, "classes"),
+        ] {
+            let sql = format!(
+                "SELECT name, qualified_name, path, line_start, line_end, minhash \
+                 FROM {table} WHERE minhash IS NOT NULL"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(store_err)?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, i64>(4)?,
+                        r.get::<_, Vec<u8>>(5)?,
+                    ))
+                })
+                .map_err(store_err)?;
+            for row in rows {
+                let (name, qname, path, ls, le, blob) = row.map_err(store_err)?;
+                // Never return the query symbol as its own neighbour.
+                if qname == qualified_name || name == qualified_name {
+                    continue;
+                }
+                let score = crate::minhash::similarity(&target, &crate::minhash::from_blob(&blob));
+                if score <= 0.0 {
+                    continue;
+                }
+                scored.push((
+                    score,
+                    CodeHit {
+                        kind,
+                        name,
+                        qualified_name: qname,
+                        path,
+                        line_start: ls as u32,
+                        line_end: le as u32,
+                        score,
+                        snippet: None,
+                        stale: false,
+                    },
+                ));
+            }
+        }
+
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
+        Ok(scored.into_iter().map(|(_, h)| h).collect())
     }
 
     /// The stored embeddable `chunk_text` for a symbol (its FIRST chunk, by id), or
@@ -1550,8 +1640,8 @@ impl CodeWriteStore for SqliteCodeStore {
                 .prepare(
                     "INSERT INTO functions \
                      (file_id, name, qualified_name, path, language, line_start, line_end, \
-                      args, return_type, docstring, body, is_async, search_text) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                      args, return_type, docstring, body, is_async, search_text, minhash) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
                 )
                 .map_err(store_err)?;
             for f in functions {
@@ -1577,6 +1667,7 @@ impl CodeWriteStore for SqliteCodeStore {
                     f.body,
                     f.is_async as i64,
                     search_text,
+                    crate::minhash::to_blob(&crate::minhash::signature(&f.body)),
                 ])
                 .map_err(store_err)?;
             }
@@ -1587,8 +1678,8 @@ impl CodeWriteStore for SqliteCodeStore {
                 .prepare(
                     "INSERT INTO classes \
                      (file_id, name, qualified_name, path, language, line_start, line_end, \
-                      bases, docstring, body, node_hash, search_text) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                      bases, docstring, body, node_hash, search_text, minhash) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
                 )
                 .map_err(store_err)?;
             for c in classes {
@@ -1614,6 +1705,7 @@ impl CodeWriteStore for SqliteCodeStore {
                     c.body,
                     Option::<String>::None,
                     search_text,
+                    crate::minhash::to_blob(&crate::minhash::signature(&c.body)),
                 ])
                 .map_err(store_err)?;
             }

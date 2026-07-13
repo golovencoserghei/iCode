@@ -616,23 +616,18 @@ impl CodeMcpServer {
 
     async fn get_symbol_context(&self, Parameters(args): Parameters<SymbolContextArgs>) -> String {
         let store = self.store.clone();
-        let embedder = self.embedder.clone();
         let result = tokio::task::spawn_blocking(move || {
             let mut ctx = store.symbol_context(&args.name, args.file_hint.as_deref())?;
-            // Enrich `similar_symbols` semantically when an embedder is wired up.
-            // Best-effort: a vector/embed failure must NOT sink the whole context
-            // call, so it leaves `similar_symbols` empty rather than erroring.
-            // With no embedder the field stays empty (the store left it empty).
-            if let Some(emb) = embedder.as_deref() {
-                if let Some(def) = ctx.definition.as_ref() {
-                    let qn = match def {
-                        icode_core::model::FunctionOrClass::Function(f) => f.qualified_name.clone(),
-                        icode_core::model::FunctionOrClass::Class(c) => c.qualified_name.clone(),
-                    };
-                    jit_embed(&store, emb);
-                    if let Ok(similar) = icode_engine::find_similar(&store, emb, &qn, 5) {
-                        ctx.similar_symbols = similar;
-                    }
+            // `similar_symbols` is filled by MinHash — no embedder needed, so the
+            // field is populated even with Ollama down. Best-effort: a failure leaves
+            // it empty rather than sinking the whole context call.
+            if let Some(def) = ctx.definition.as_ref() {
+                let qn = match def {
+                    icode_core::model::FunctionOrClass::Function(f) => f.qualified_name.clone(),
+                    icode_core::model::FunctionOrClass::Class(c) => c.qualified_name.clone(),
+                };
+                if let Ok(similar) = icode_engine::find_similar(&store, &qn, 5) {
+                    ctx.similar_symbols = similar;
                 }
             }
             Ok::<_, icode_core::error::Error>(ctx)
@@ -779,19 +774,16 @@ impl CodeMcpServer {
         }
     }
 
+    /// No embedder gate any more: similarity is MinHash over token shingles, so this
+    /// works with Ollama down — and it answers the question actually being asked
+    /// ("code shaped like this") rather than "code about the same topic".
     async fn find_similar(&self, Parameters(args): Parameters<FindSimilarArgs>) -> String {
-        let emb = match self.embedder.clone() {
-            Some(e) => e,
-            None => return err_json(NO_EMBEDDER_ERR),
-        };
         let store = self.store.clone();
         let limit = args.limit.unwrap_or(10);
         let qn = args.qualified_name;
-        let result = tokio::task::spawn_blocking(move || {
-            jit_embed(&store, emb.as_ref());
-            icode_engine::find_similar(&store, emb.as_ref(), &qn, limit)
-        })
-        .await;
+        let result =
+            tokio::task::spawn_blocking(move || icode_engine::find_similar(&store, &qn, limit))
+                .await;
         match result {
             Ok(Ok(hits)) => to_json(&hits),
             Ok(Err(e)) => err_json(&e.to_string()),
@@ -2011,13 +2003,16 @@ mod tests {
             .await;
         assert_eq!(s, err_json(NO_EMBEDDER_ERR), "semantic_search_code reports unavailable");
 
+        // find_similar is NO LONGER a semantic tool: it is MinHash over token
+        // shingles, so it works with the embedder absent. On an empty db that means
+        // an empty list — NOT the unavailable error it used to return.
         let fs = server
             .find_similar(Parameters(FindSimilarArgs {
                 qualified_name: "whatever".into(),
                 limit: None,
             }))
             .await;
-        assert_eq!(fs, err_json(NO_EMBEDDER_ERR), "find_similar reports unavailable");
+        assert_eq!(fs, "[]", "find_similar works with no embedder (empty db → [])");
 
         // find_existing degrades to lexical-only and must NOT error (empty db → []).
         let fe = server

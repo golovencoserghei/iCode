@@ -231,22 +231,22 @@ async fn api_search_code(
 }
 
 /// `GET /api/symbol?name=...` → `SymbolContext` (definition + callers/callees +
-/// imports/routes/implementations + semantically-similar symbols when available).
+/// imports/routes/implementations + structurally-similar symbols). Similar symbols
+/// come from MinHash, so they no longer depend on an embedder being available.
 async fn api_symbol(State(st): State<WebState>, Query(p): Query<SymbolParams>) -> impl IntoResponse {
     let store = st.store.clone();
-    let embedder = st.embedder.clone();
     let name = p.name;
     blocking_json(move || {
         let mut ctx = store.symbol_context(&name, None)?;
         // Enrich `similar_symbols` semantically when an embedder is available; the
         // store leaves the field empty in lexical-only mode (mirrors mcp.rs).
-        if let (Some(emb), Some(def)) = (embedder.as_deref(), ctx.definition.as_ref()) {
+        // MinHash-backed: no embedder needed, so neighbours show up with Ollama down.
+        if let Some(def) = ctx.definition.as_ref() {
             let qn = match def {
                 icode_core::model::FunctionOrClass::Function(f) => f.qualified_name.clone(),
                 icode_core::model::FunctionOrClass::Class(c) => c.qualified_name.clone(),
             };
-            jit_embed(&store, emb);
-            if let Ok(similar) = search::find_similar(&store, emb, &qn, 8) {
+            if let Ok(similar) = search::find_similar(&store, &qn, 8) {
                 ctx.similar_symbols = similar;
             }
         }
