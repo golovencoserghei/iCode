@@ -57,7 +57,160 @@ pub struct CodeMcpServer {
     tool_router: ToolRouter<Self>,
 }
 
-// ──────────────────────────── arg structs ────────────────────────────
+// ──────────────── arg structs for the consolidated (12-tool) surface ────────────────
+//
+// Keep these descriptions SHORT: every one of them is serialized into the model's
+// context on every single request.
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct SearchArgs {
+    /// What to look for: plain words or an identifier.
+    pub query: String,
+    /// function | class | any (default any).
+    pub kind: Option<String>,
+    /// lexical (default, no model) | semantic | hybrid.
+    pub mode: Option<String>,
+    /// Max hits (default 10).
+    pub limit: Option<usize>,
+    /// Include symbol bodies (default false; costs context).
+    pub with_body: Option<bool>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct SymbolArgs {
+    /// Symbol name (bare or qualified).
+    pub name: String,
+    /// context (default) | def | callers | callees | implementations | similar.
+    pub op: Option<String>,
+    /// Disambiguate a symbol defined in several files.
+    pub file_hint: Option<String>,
+    /// Language filter for op=def.
+    pub language: Option<String>,
+    /// Include the body (op=def).
+    pub with_body: Option<bool>,
+    /// Max rows (default 50).
+    pub limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct GraphArgs {
+    /// chain | impact | deps.
+    pub op: String,
+    /// Symbol (chain: the source) or file path (impact/deps).
+    pub target: String,
+    /// chain: the destination symbol.
+    pub to: Option<String>,
+    /// Hops to traverse.
+    pub depth: Option<usize>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct MapArgs {
+    /// Entries per section (default 30).
+    pub top: Option<usize>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct FileArgs {
+    /// outline | list | stat | read.
+    pub op: String,
+    /// File path (op=list: an optional glob-ish filter).
+    pub path: Option<String>,
+    /// op=read: first line (1-based).
+    pub start: Option<u32>,
+    /// op=read: last line (inclusive).
+    pub end: Option<u32>,
+    /// Language filter (op=list).
+    pub language: Option<String>,
+    /// Max rows.
+    pub limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct AuditArgs {
+    /// dead | unreachable | complex | routes | health.
+    pub op: String,
+    /// Language filter.
+    pub language: Option<String>,
+    /// Max rows.
+    pub limit: Option<usize>,
+    /// op=routes: HTTP method filter.
+    pub method: Option<String>,
+    /// op=routes: path filter.
+    pub path: Option<String>,
+    /// op=routes: handler filter.
+    pub handler: Option<String>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct MemoryArgs {
+    /// add | search | list | update | delete | resolve | search_all | projects | for_symbol | why.
+    pub op: String,
+    /// Project the memory belongs to.
+    pub project: Option<String>,
+    /// Memory text (op=add/update).
+    pub content: Option<String>,
+    /// Query (op=search/search_all).
+    pub query: Option<String>,
+    /// Memory id (op=update/delete/resolve).
+    pub memory_id: Option<String>,
+    /// Symbol (op=for_symbol/why).
+    pub symbol: Option<String>,
+    /// decision|progress|context|bug|todo|code|general.
+    pub category: Option<String>,
+    /// Free-form tags.
+    pub tags: Option<Vec<String>>,
+    /// Importance 0..5 (5 = always-on).
+    pub importance: Option<f32>,
+    /// Why it is resolved (op=resolve).
+    pub reason: Option<String>,
+    /// Max rows.
+    pub limit: Option<usize>,
+    /// Include resolved memories.
+    pub include_resolved: Option<bool>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct SessionArgs {
+    /// start | end.
+    pub op: String,
+    /// Project name.
+    pub project: String,
+    /// op=end: one-paragraph summary.
+    pub summary: Option<String>,
+    /// op=end: finished items.
+    pub completed: Option<Vec<String>>,
+    /// op=end: decisions made.
+    pub decisions: Option<Vec<String>>,
+    /// op=end: open next steps.
+    pub todos: Option<Vec<String>>,
+    /// op=end: session id.
+    pub session_id: Option<String>,
+    /// op=start: how many project memories to load.
+    pub limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct DeveloperArgs {
+    /// note | profile.
+    pub op: String,
+    /// op=note: the cross-project rule/preference.
+    pub content: Option<String>,
+    /// op=profile: optional search query.
+    pub query: Option<String>,
+    /// Category.
+    pub category: Option<String>,
+    /// Tags.
+    pub tags: Option<Vec<String>>,
+    /// Importance 0..5.
+    pub importance: Option<f32>,
+    /// Store even if it looks project-specific.
+    pub force: Option<bool>,
+    /// Max rows.
+    pub limit: Option<usize>,
+}
+
+// ──────────────────────────── arg structs (internal handlers) ────────────────────────────
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub struct RepoMapArgs {
@@ -438,18 +591,7 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Return code-graph statistics (file/function/class/call/import/route counts) as JSON.")]
-    async fn get_stats(&self) -> String {
-        let store = self.store.clone();
-        let result = tokio::task::spawn_blocking(move || store.stats()).await;
-        match result {
-            Ok(Ok(stats)) => to_json(&stats),
-            Ok(Err(e)) => err_json(&e.to_string()),
-            Err(e) => err_json(&e.to_string()),
-        }
-    }
 
-    #[tool(description = "Read-only index health check: drift vs the source tree on disk (missing/outdated/stale files) plus embedding/orphan invariants. Returns a DiagnosticReport as JSON. Re-run `icode index <path>` to heal any reported drift.")]
     async fn doctor(&self) -> String {
         let store = self.store.clone();
         let root = self.root.clone();
@@ -461,7 +603,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Architecture overview in one call: stats, languages, modules, complex functions, call hotspots, entry points.")]
     async fn get_repo_map(&self, Parameters(args): Parameters<RepoMapArgs>) -> String {
         let store = self.store.clone();
         let top = args.top.unwrap_or(30);
@@ -473,7 +614,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Everything about a symbol in one call: definition, callers, callees, imports, routes, implementations, and (when an embedder is available) semantically similar symbols.")]
     async fn get_symbol_context(&self, Parameters(args): Parameters<SymbolContextArgs>) -> String {
         let store = self.store.clone();
         let embedder = self.embedder.clone();
@@ -505,7 +645,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Lexical search over function names. Returns a JSON array of CodeHit.")]
     async fn search_function(&self, Parameters(args): Parameters<SearchFunctionArgs>) -> String {
         let store = self.store.clone();
         let query = CodeQuery {
@@ -524,7 +663,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Lexical search over class names. Returns a JSON array of CodeHit.")]
     async fn search_class(&self, Parameters(args): Parameters<SearchClassArgs>) -> String {
         let store = self.store.clone();
         let query = CodeQuery {
@@ -543,7 +681,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Find existing functions/classes that already do what you describe (avoid duplicate work). Semantic+lexical RRF fusion when an embedder is available, else lexical-only. NOTE: passing a `kind` filter (function|class) forces the lexical-only path EVEN with a live embedder — semantic similarity is NOT applied in that case; omit `kind` (or pass 'all') to get semantic matching. JSON array of CodeHit.")]
     async fn find_existing(&self, Parameters(args): Parameters<FindExistingArgs>) -> String {
         let kind = match args.kind.as_deref() {
             None | Some("") | Some("all") => Ok(None),
@@ -588,8 +725,7 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Grounded existence oracle. Answers 'does a feature/symbol matching this description ACTUALLY exist in the index?' with a VERDICT — EXISTS | WEAK | ABSENT — plus confidence, a quotable reason, and evidence; NOT a nearest-neighbour list. USE THIS before you claim a feature exists (or is missing): plain search always returns the closest symbols, so a string literal like \"calendar\" in a permissions list can masquerade as a real calendar feature. A confident EXISTS is asserted ONLY from a name match too strong to be a word coincidence: the query is a single deliberately-typed identifier that names a DEFINED function/class/route (match_kind exact_symbol), OR ≥2 distinct query terms land on one symbol's name (match_kind name_token). Weaker signals never fake an EXISTS: one incidental term matching a name in a multi-word query is WEAK ('a symbol named X exists — verify it's what you mean'); a term only inside bodies/string literals/comments is WEAK (match_kind body_or_string: a mention, not a feature); nothing is ABSENT, with the nearest-by-meaning symbol offered as a clearly-labelled LEAD to verify. The embedder is ONLY a lead, never a verdict driver — meaning-similarity is embedder-specific and self-confirming, so it is not used to decide EXISTS. Boundaries: test files are excluded by PATH (a test fixture can't satisfy existence), but a symbol inside an inline #[cfg(test)] module in a src file can still read as EXISTS (known gap); confidence is heuristic; name matching is un-stemmed; ABSENT means 'not in THIS static index' (dynamic/reflective/external/generated code is invisible) and a feature under totally different words may return WEAK/ABSENT-with-a-lead rather than EXISTS (safe direction); without Ollama only the lead is lost. kind ∈ function|class|route|any (default any). JSON ExistenceVerdict{verdict,confidence,reason,best_match,match_kind,exact_name_hit,evidence}.")]
-    async fn check_exists(&self, Parameters(args): Parameters<CheckExistsArgs>) -> String {
+    async fn check_exists_impl(&self, Parameters(args): Parameters<CheckExistsArgs>) -> String {
         let scope = match args.kind.as_deref() {
             None | Some("") | Some("any") => Ok(icode_engine::ExistScope::Any),
             Some("function") => Ok(icode_engine::ExistScope::Function),
@@ -623,7 +759,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Semantic (vector KNN) search over the code base by natural-language meaning. Requires an embedder (Ollama); JSON array of CodeHit or an error if unavailable.")]
     async fn semantic_search_code(&self, Parameters(args): Parameters<SemanticSearchArgs>) -> String {
         let emb = match self.embedder.clone() {
             Some(e) => e,
@@ -644,7 +779,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Find symbols semantically similar to an existing symbol (by qualified name). Requires an embedder (Ollama); the symbol itself is excluded. JSON array of CodeHit or an error if unavailable.")]
     async fn find_similar(&self, Parameters(args): Parameters<FindSimilarArgs>) -> String {
         let emb = match self.embedder.clone() {
             Some(e) => e,
@@ -665,7 +799,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Fetch one function definition by name (optionally narrowed by language). JSON FunctionDef or null.")]
     async fn get_function(&self, Parameters(args): Parameters<GetFunctionArgs>) -> String {
         let lang = match parse_lang_arg(args.language.as_deref()) {
             Ok(l) => l,
@@ -682,7 +815,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Fetch one class definition by name (optionally narrowed by language). JSON ClassDef or null.")]
     async fn get_class(&self, Parameters(args): Parameters<GetClassArgs>) -> String {
         let lang = match parse_lang_arg(args.language.as_deref()) {
             Ok(l) => l,
@@ -699,7 +831,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "List a file's functions and classes (ordered by line) as a JSON array of CodeHit.")]
     async fn get_file_outline(&self, Parameters(args): Parameters<FileOutlineArgs>) -> String {
         let store = self.store.clone();
         let result = tokio::task::spawn_blocking(move || store.file_outline(&args.path)).await;
@@ -710,7 +841,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Direct callers of a symbol. Receiver-aware: pass a QUALIFIED name (e.g. `ServiceA::handle`) for a precise, class-scoped answer; a bare name (`handle`) keeps broad recall. JSON array of Call — each edge carries `resolved_callee` (the disambiguated target) and `confidence` (0.3..0.9, higher = surer).")]
     async fn get_callers(&self, Parameters(args): Parameters<CallersArgs>) -> String {
         let store = self.store.clone();
         let limit = args.limit.unwrap_or(50);
@@ -722,7 +852,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Direct callees of a symbol (by-name call graph). JSON array of Call — each edge carries `resolved_callee` (receiver-aware target, e.g. `ServiceA::handle`) and `confidence` (0.3..0.9).")]
     async fn get_callees(&self, Parameters(args): Parameters<CalleesArgs>) -> String {
         let store = self.store.clone();
         let limit = args.limit.unwrap_or(50);
@@ -734,7 +863,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Shortest call path between two symbols (BFS over the call graph). JSON array of symbol names.")]
     async fn get_call_chain(&self, Parameters(args): Parameters<CallChainArgs>) -> String {
         let store = self.store.clone();
         let max_depth = args.max_depth.unwrap_or(12);
@@ -747,7 +875,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Modules a file depends on, followed transitively. JSON array of module strings.")]
     async fn find_dependencies(&self, Parameters(args): Parameters<DependenciesArgs>) -> String {
         let store = self.store.clone();
         let depth = args.depth.unwrap_or(3);
@@ -759,7 +886,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Reverse dependencies: files that import the given file (impact set), followed transitively. JSON array of paths.")]
     async fn impact_analysis(&self, Parameters(args): Parameters<ImpactArgs>) -> String {
         let store = self.store.clone();
         let depth = args.depth.unwrap_or(3);
@@ -771,7 +897,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Classes that implement / extend the given base class or interface. JSON array of qualified names.")]
     async fn find_implementations(&self, Parameters(args): Parameters<ImplementationsArgs>) -> String {
         let store = self.store.clone();
         let result = tokio::task::spawn_blocking(move || store.find_implementations(&args.name)).await;
@@ -782,7 +907,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "APPROXIMATE candidate dead-code — functions whose NAME never appears as a call CALLEE (by-name in-degree = 0). This is NOT proof they are never called: dynamic/reflective calls, callers outside the indexed project, trait/virtual dispatch, and same-name collisions are all invisible. Entry points (main + route handlers) are excluded. Treat hits as candidates to review, not confirmed dead code; do not delete on this basis alone. JSON array of CodeHit.")]
     async fn find_dead_code(&self, Parameters(args): Parameters<AnalysisArgs>) -> String {
         let lang = match parse_lang_arg(args.language.as_deref()) {
             Ok(l) => l,
@@ -798,7 +922,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "APPROXIMATE candidate dead-code detector — NOT proof. Walks the call graph by BFS from entry points (main + route handlers) over BARE call-NAME edges, catching dead clusters (a->b->c where a is itself dead), not just zero-in-degree functions. Caveats: same-named functions collide; trait/virtual/dynamic/reflective dispatch is invisible; a LIBRARY crate with no main and no routes has no entry points, so almost everything is reported unreachable (mass false positives). Treat every hit as a candidate to review; never delete code on this basis alone. JSON array of CodeHit.")]
     async fn find_unreachable(&self, Parameters(args): Parameters<AnalysisArgs>) -> String {
         let lang = match parse_lang_arg(args.language.as_deref()) {
             Ok(l) => l,
@@ -814,7 +937,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Functions ranked by a complexity proxy (span + fan_out*5 + callers*2). JSON array of ComplexFunction.")]
     async fn find_complex_functions(&self, Parameters(args): Parameters<AnalysisArgs>) -> String {
         let lang = match parse_lang_arg(args.language.as_deref()) {
             Ok(l) => l,
@@ -830,7 +952,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Find HTTP routes by method / path / handler filters. JSON array of Route.")]
     async fn find_routes(&self, Parameters(args): Parameters<FindRoutesArgs>) -> String {
         let store = self.store.clone();
         let limit = args.limit.unwrap_or(50);
@@ -850,7 +971,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Regex search over stored symbol bodies. JSON array of GrepHit (path/line/text).")]
     async fn grep_code(&self, Parameters(args): Parameters<GrepCodeArgs>) -> String {
         let lang = match parse_lang_arg(args.language.as_deref()) {
             Ok(l) => l,
@@ -867,7 +987,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "List indexed files (optional path/language filters). JSON array of FileRecord.")]
     async fn list_files(&self, Parameters(args): Parameters<ListFilesArgs>) -> String {
         let lang = match parse_lang_arg(args.language.as_deref()) {
             Ok(l) => l,
@@ -886,7 +1005,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Stat one indexed file (path/language/hashes/lines/size). JSON FileRecord or null.")]
     async fn stat_file(&self, Parameters(args): Parameters<StatFileArgs>) -> String {
         let store = self.store.clone();
         let result = tokio::task::spawn_blocking(move || store.stat_file(&args.path)).await;
@@ -897,7 +1015,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Read a line range [start,end] of a file from disk (1-based inclusive; capped). Returns the text.")]
     async fn read_file(&self, Parameters(args): Parameters<ReadFileArgs>) -> String {
         let store = self.store.clone();
         let result = tokio::task::spawn_blocking(move || {
@@ -913,7 +1030,6 @@ impl CodeMcpServer {
 
     // ──────────────────────────── memory tools ────────────────────────────
 
-    #[tool(description = "Start a session: load the developer profile (cross-project preferences) AND recent project context in one call. Returns {developer_profile, project_context}. Call this FIRST.")]
     async fn session_start(&self, Parameters(args): Parameters<SessionStartArgs>) -> String {
         let mem = match self.memory.clone() {
             Some(m) => m,
@@ -937,7 +1053,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "End a session: save summary (Progress), decisions (Decision), completed (Progress), todos (Todo); auto-resolve the bug/todo memories each completed item closes. Returns {saved, auto_resolved}.")]
     async fn session_end(&self, Parameters(args): Parameters<SessionEndArgs>) -> String {
         let mem = match self.memory.clone() {
             Some(m) => m,
@@ -977,7 +1092,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Save one memory. category: decision|progress|context|bug|todo|code|general (default general). A near-duplicate is reported as {outcome:duplicate} (not an error).")]
     async fn add_memory(&self, Parameters(args): Parameters<AddMemoryArgs>) -> String {
         let mem = match self.memory.clone() {
             Some(m) => m,
@@ -1004,7 +1118,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Semantic + lexical (RRF) search of one project's memories. JSON array of MemoryHit.")]
     async fn search_memory(&self, Parameters(args): Parameters<SearchMemoryArgs>) -> String {
         let mem = match self.memory.clone() {
             Some(m) => m,
@@ -1026,7 +1139,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Cross-project semantic memory search (reserved projects excluded). JSON array of MemoryHit.")]
     async fn search_all(&self, Parameters(args): Parameters<SearchAllArgs>) -> String {
         let mem = match self.memory.clone() {
             Some(m) => m,
@@ -1052,7 +1164,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "List a project's memories (newest first; optional category filter). JSON array of MemoryRecord.")]
     async fn list_memories(&self, Parameters(args): Parameters<ListMemoriesArgs>) -> String {
         let mem = match self.memory.clone() {
             Some(m) => m,
@@ -1073,7 +1184,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "List known projects with their memory counts (reserved projects excluded). JSON array of [name, count].")]
     async fn list_projects(&self) -> String {
         let mem = match self.memory.clone() {
             Some(m) => m,
@@ -1087,7 +1197,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Update a memory's content and/or tags by id. Re-embeds only when the content actually changes. Returns {ok:true} or an error.")]
     async fn update_memory(&self, Parameters(args): Parameters<UpdateMemoryArgs>) -> String {
         let mem = match self.memory.clone() {
             Some(m) => m,
@@ -1107,7 +1216,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Delete a memory by id (removes its vector + lexical row too). Returns {ok:true} or an error.")]
     async fn delete_memory(&self, Parameters(args): Parameters<DeleteMemoryArgs>) -> String {
         let mem = match self.memory.clone() {
             Some(m) => m,
@@ -1122,7 +1230,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Mark a bug/todo memory resolved by id, recording the reason. Returns {ok:true} or an error.")]
     async fn resolve_memory(&self, Parameters(args): Parameters<ResolveMemoryArgs>) -> String {
         let mem = match self.memory.clone() {
             Some(m) => m,
@@ -1138,7 +1245,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Save a cross-project developer note (a preference / rule about how this developer works, true in EVERY project). Stored under the reserved profile project and injected into every session — so a project- or machine-specific fact does NOT belong here; use add_memory(project=…) for that. A note naming a filesystem path is rejected unless force=true. Returns Added/Duplicate JSON.")]
     async fn add_developer_note(&self, Parameters(args): Parameters<AddDeveloperNoteArgs>) -> String {
         let mem = match self.memory.clone() {
             Some(m) => m,
@@ -1178,7 +1284,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Read the developer profile: with a query, semantically search it; without, list it newest-first. JSON array of MemoryRecord (list) or MemoryHit (search).")]
     async fn get_developer_profile(&self, Parameters(args): Parameters<GetDeveloperProfileArgs>) -> String {
         let mem = match self.memory.clone() {
             Some(m) => m,
@@ -1204,8 +1309,7 @@ impl CodeMcpServer {
 
     // ──────────────────────────── recall (code + memory synergy) ────────────────────────────
 
-    #[tool(description = "Flagship recall: one query → relevant CODE and relevant MEMORY in SEPARATE, independently-ranked sections (plus a facts section, empty until the knowledge graph lands). JSON {relevant_code, relevant_memory, facts}. Degrades gracefully: with no embedder the code section is lexical-only; with no memory store relevant_memory is empty (the code section still answers).")]
-    async fn recall(&self, Parameters(args): Parameters<RecallArgs>) -> String {
+    async fn recall_impl(&self, Parameters(args): Parameters<RecallArgs>) -> String {
         let store = self.store.clone();
         // Clone the Arcs BEFORE spawn_blocking; `.as_deref()` inside the closure
         // turns each `Option<Arc<dyn ..>>` into the `Option<&dyn ..>` the engine
@@ -1238,7 +1342,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Memory semantically related to a code symbol ('what do we remember about this symbol?'). JSON array of MemoryHit, or an error if the memory store is unavailable.")]
     async fn code_to_memory(&self, Parameters(args): Parameters<CodeToMemoryArgs>) -> String {
         let mem = match self.memory.clone() {
             Some(m) => m,
@@ -1258,7 +1361,6 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Why a symbol exists: DECISION-category memory recording the rationale behind it. JSON array of MemoryHit, or an error if the memory store is unavailable.")]
     async fn why_this_exists(&self, Parameters(args): Parameters<WhyThisExistsArgs>) -> String {
         let mem = match self.memory.clone() {
             Some(m) => m,
@@ -1275,6 +1377,392 @@ impl CodeMcpServer {
             Ok(Ok(hits)) => to_json(&hits),
             Ok(Err(e)) => err_json(&e.to_string()),
             Err(e) => err_json(&e.to_string()),
+        }
+    }
+
+    // ──────────────────────── consolidated tool surface (12) ────────────────────────
+    //
+    // The 42 fine-grained handlers above are now PRIVATE. Their schemas were loaded
+    // into the model's context on EVERY request — measured at ~6.7k tokens of pure
+    // overhead before a single question was asked, and MCP tool results stay in
+    // context for the rest of the session. Twelve `op`-dispatching tools expose the
+    // same capability for a fraction of that fixed cost.
+
+    #[tool(description = "Search code by words or identifier. Identifier-aware: `Handler` finds `HttpRequestHandler`. kind: function|class|any. mode: lexical (default, free)|semantic|hybrid.")]
+    async fn search(&self, Parameters(a): Parameters<SearchArgs>) -> String {
+        let kind = a.kind.as_deref().unwrap_or("any");
+        match a.mode.as_deref().unwrap_or("lexical") {
+            "semantic" => {
+                self.semantic_search_code(Parameters(SemanticSearchArgs {
+                    query: a.query,
+                    limit: a.limit,
+                }))
+                .await
+            }
+            "hybrid" => {
+                self.find_existing(Parameters(FindExistingArgs {
+                    query: a.query,
+                    kind: a.kind,
+                    limit: a.limit,
+                }))
+                .await
+            }
+            _ => match kind {
+                "function" => {
+                    self.search_function(Parameters(SearchFunctionArgs {
+                        query: a.query,
+                        limit: a.limit,
+                    }))
+                    .await
+                }
+                "class" => {
+                    self.search_class(Parameters(SearchClassArgs {
+                        query: a.query,
+                        limit: a.limit,
+                    }))
+                    .await
+                }
+                _ => {
+                    self.find_existing(Parameters(FindExistingArgs {
+                        query: a.query,
+                        kind: None,
+                        limit: a.limit,
+                    }))
+                    .await
+                }
+            },
+        }
+    }
+
+    #[tool(description = "Everything about a symbol. op: context (default: def+callers+callees) | def | callers | callees | implementations | similar.")]
+    async fn symbol(&self, Parameters(a): Parameters<SymbolArgs>) -> String {
+        match a.op.as_deref().unwrap_or("context") {
+            "def" => {
+                let f = self
+                    .get_function(Parameters(GetFunctionArgs {
+                        name: a.name.clone(),
+                        language: a.language.clone(),
+                        with_body: a.with_body,
+                    }))
+                    .await;
+                if f != "null" && !f.starts_with("{\"error\"") {
+                    return f;
+                }
+                self.get_class(Parameters(GetClassArgs {
+                    name: a.name,
+                    language: a.language,
+                    with_body: a.with_body,
+                }))
+                .await
+            }
+            "callers" => {
+                self.get_callers(Parameters(CallersArgs {
+                    name: a.name,
+                    limit: a.limit,
+                }))
+                .await
+            }
+            "callees" => {
+                self.get_callees(Parameters(CalleesArgs {
+                    name: a.name,
+                    limit: a.limit,
+                }))
+                .await
+            }
+            "implementations" => {
+                self.find_implementations(Parameters(ImplementationsArgs { name: a.name }))
+                    .await
+            }
+            "similar" => {
+                self.find_similar(Parameters(FindSimilarArgs {
+                    qualified_name: a.name,
+                    limit: a.limit,
+                }))
+                .await
+            }
+            _ => {
+                self.get_symbol_context(Parameters(SymbolContextArgs {
+                    name: a.name,
+                    file_hint: a.file_hint,
+                }))
+                .await
+            }
+        }
+    }
+
+    #[tool(description = "Call/import graph. op: chain (target->to) | impact (reverse deps of a file) | deps (a file's deps).")]
+    async fn graph(&self, Parameters(a): Parameters<GraphArgs>) -> String {
+        match a.op.as_str() {
+            "chain" => {
+                let to = match a.to {
+                    Some(t) => t,
+                    None => return err_json("graph op=chain needs `to`"),
+                };
+                self.get_call_chain(Parameters(CallChainArgs {
+                    from: a.target,
+                    to,
+                    max_depth: a.depth,
+                }))
+                .await
+            }
+            "impact" => {
+                self.impact_analysis(Parameters(ImpactArgs {
+                    path: a.target,
+                    depth: a.depth,
+                }))
+                .await
+            }
+            "deps" => {
+                self.find_dependencies(Parameters(DependenciesArgs {
+                    path: a.target,
+                    depth: a.depth,
+                }))
+                .await
+            }
+            other => err_json(&format!("unknown graph op `{other}` (chain|impact|deps)")),
+        }
+    }
+
+    #[tool(description = "Architecture overview in one call: stats, languages, modules, complex symbols, hotspots.")]
+    async fn map(&self, Parameters(a): Parameters<MapArgs>) -> String {
+        self.get_repo_map(Parameters(RepoMapArgs { top: a.top })).await
+    }
+
+    #[tool(description = "Files. op: outline (symbols in a file) | list | stat | read (needs start/end).")]
+    async fn file(&self, Parameters(a): Parameters<FileArgs>) -> String {
+        match a.op.as_str() {
+            "outline" => match a.path {
+                Some(path) => self.get_file_outline(Parameters(FileOutlineArgs { path })).await,
+                None => err_json("file op=outline needs `path`"),
+            },
+            "stat" => match a.path {
+                Some(path) => self.stat_file(Parameters(StatFileArgs { path })).await,
+                None => err_json("file op=stat needs `path`"),
+            },
+            "read" => match a.path {
+                Some(path) => {
+                    self.read_file(Parameters(ReadFileArgs {
+                        path,
+                        start: a.start,
+                        end: a.end,
+                    }))
+                    .await
+                }
+                None => err_json("file op=read needs `path`"),
+            },
+            "list" => {
+                self.list_files(Parameters(ListFilesArgs {
+                    pattern: a.path,
+                    language: a.language,
+                    limit: a.limit,
+                }))
+                .await
+            }
+            other => err_json(&format!("unknown file op `{other}` (outline|list|stat|read)")),
+        }
+    }
+
+    #[tool(description = "Regex search over stored symbol bodies. JSON array of GrepHit (path/line/snippet).")]
+    async fn grep(&self, Parameters(a): Parameters<GrepCodeArgs>) -> String {
+        self.grep_code(Parameters(a)).await
+    }
+
+    #[tool(description = "Codebase audit. op: dead (unreferenced) | unreachable (from entrypoints) | complex | routes | health (index drift).")]
+    async fn audit(&self, Parameters(a): Parameters<AuditArgs>) -> String {
+        let analysis = AnalysisArgs {
+            language: a.language,
+            limit: a.limit,
+        };
+        match a.op.as_str() {
+            "dead" => self.find_dead_code(Parameters(analysis)).await,
+            "unreachable" => self.find_unreachable(Parameters(analysis)).await,
+            "complex" => self.find_complex_functions(Parameters(analysis)).await,
+            "health" => self.doctor().await,
+            "routes" => {
+                self.find_routes(Parameters(FindRoutesArgs {
+                    method: a.method,
+                    path: a.path,
+                    handler: a.handler,
+                    limit: a.limit,
+                }))
+                .await
+            }
+            other => err_json(&format!(
+                "unknown audit op `{other}` (dead|unreachable|complex|routes|health)"
+            )),
+        }
+    }
+
+    #[tool(description = "Grounded existence oracle: does a feature matching this description ACTUALLY exist? Returns VERDICT (EXISTS/WEAK/ABSENT) + evidence. Use before claiming something is missing.")]
+    async fn check_exists(&self, Parameters(a): Parameters<CheckExistsArgs>) -> String {
+        self.check_exists_impl(Parameters(a)).await
+    }
+
+    #[tool(description = "Flagship recall: one query -> relevant CODE and relevant MEMORY, ranked separately.")]
+    async fn recall(&self, Parameters(a): Parameters<RecallArgs>) -> String {
+        self.recall_impl(Parameters(a)).await
+    }
+
+    #[tool(description = "Cross-session memory. op: add | search | list | update | delete | resolve | search_all (all projects) | projects | for_symbol | why (decisions behind a symbol).")]
+    async fn memory(&self, Parameters(a): Parameters<MemoryArgs>) -> String {
+        let need = |v: Option<String>, what: &str| -> Result<String, String> {
+            v.ok_or_else(|| err_json(&format!("memory op={} needs `{}`", a.op, what)))
+        };
+        match a.op.as_str() {
+            "add" => {
+                let (project, content) = match (a.project.clone(), a.content.clone()) {
+                    (Some(p), Some(c)) => (p, c),
+                    _ => return err_json("memory op=add needs `project` and `content`"),
+                };
+                self.add_memory(Parameters(AddMemoryArgs {
+                    project,
+                    content,
+                    category: a.category,
+                    tags: a.tags,
+                    importance: a.importance,
+                }))
+                .await
+            }
+            "search" => {
+                let (project, query) = match (a.project.clone(), a.query.clone()) {
+                    (Some(p), Some(q)) => (p, q),
+                    _ => return err_json("memory op=search needs `project` and `query`"),
+                };
+                self.search_memory(Parameters(SearchMemoryArgs {
+                    project,
+                    query,
+                    n_results: a.limit,
+                    category: a.category,
+                    include_resolved: a.include_resolved,
+                }))
+                .await
+            }
+            "search_all" => match need(a.query.clone(), "query") {
+                Ok(query) => {
+                    self.search_all(Parameters(SearchAllArgs {
+                        query,
+                        n_results: a.limit,
+                        category: a.category,
+                        include_resolved: a.include_resolved,
+                    }))
+                    .await
+                }
+                Err(e) => e,
+            },
+            "list" => match need(a.project.clone(), "project") {
+                Ok(project) => {
+                    self.list_memories(Parameters(ListMemoriesArgs {
+                        project,
+                        category: a.category,
+                        limit: a.limit,
+                        include_resolved: a.include_resolved,
+                    }))
+                    .await
+                }
+                Err(e) => e,
+            },
+            "projects" => self.list_projects().await,
+            "update" => match need(a.memory_id.clone(), "memory_id") {
+                Ok(memory_id) => {
+                    self.update_memory(Parameters(UpdateMemoryArgs {
+                        memory_id,
+                        content: a.content,
+                        tags: a.tags,
+                    }))
+                    .await
+                }
+                Err(e) => e,
+            },
+            "delete" => match need(a.memory_id.clone(), "memory_id") {
+                Ok(memory_id) => self.delete_memory(Parameters(DeleteMemoryArgs { memory_id })).await,
+                Err(e) => e,
+            },
+            "resolve" => {
+                let (memory_id, reason) = match (a.memory_id.clone(), a.reason.clone()) {
+                    (Some(m), Some(r)) => (m, r),
+                    _ => return err_json("memory op=resolve needs `memory_id` and `reason`"),
+                };
+                self.resolve_memory(Parameters(ResolveMemoryArgs { memory_id, reason }))
+                    .await
+            }
+            "for_symbol" => {
+                let (project, symbol) = match (a.project.clone(), a.symbol.clone()) {
+                    (Some(p), Some(s)) => (p, s),
+                    _ => return err_json("memory op=for_symbol needs `project` and `symbol`"),
+                };
+                self.code_to_memory(Parameters(CodeToMemoryArgs {
+                    project,
+                    symbol,
+                    limit: a.limit,
+                }))
+                .await
+            }
+            "why" => {
+                let (project, symbol) = match (a.project.clone(), a.symbol.clone()) {
+                    (Some(p), Some(s)) => (p, s),
+                    _ => return err_json("memory op=why needs `project` and `symbol`"),
+                };
+                self.why_this_exists(Parameters(WhyThisExistsArgs {
+                    project,
+                    symbol,
+                    limit: a.limit,
+                }))
+                .await
+            }
+            other => err_json(&format!("unknown memory op `{other}`")),
+        }
+    }
+
+    #[tool(description = "Session lifecycle. op: start (load developer profile + project context; call FIRST) | end (persist summary/decisions/completed/todos).")]
+    async fn session(&self, Parameters(a): Parameters<SessionArgs>) -> String {
+        match a.op.as_str() {
+            "start" => {
+                self.session_start(Parameters(SessionStartArgs {
+                    project: a.project,
+                    n_project_memories: a.limit,
+                    n_profile_notes: None,
+                }))
+                .await
+            }
+            "end" => {
+                self.session_end(Parameters(SessionEndArgs {
+                    project: a.project,
+                    summary: a.summary.unwrap_or_default(),
+                    completed: a.completed,
+                    decisions: a.decisions,
+                    todos: a.todos,
+                    session_id: a.session_id,
+                }))
+                .await
+            }
+            other => err_json(&format!("unknown session op `{other}` (start|end)")),
+        }
+    }
+
+    #[tool(description = "Cross-project developer profile (preferences/rules true in EVERY project). op: note (save) | profile (read).")]
+    async fn developer(&self, Parameters(a): Parameters<DeveloperArgs>) -> String {
+        match a.op.as_str() {
+            "note" => match a.content {
+                Some(content) => {
+                    self.add_developer_note(Parameters(AddDeveloperNoteArgs {
+                        content,
+                        category: a.category,
+                        tags: a.tags,
+                        importance: a.importance,
+                        force: a.force,
+                    }))
+                    .await
+                }
+                None => err_json("developer op=note needs `content`"),
+            },
+            "profile" => {
+                self.get_developer_profile(Parameters(GetDeveloperProfileArgs {
+                    query: a.query,
+                    n_results: a.limit,
+                }))
+                .await
+            }
+            other => err_json(&format!("unknown developer op `{other}` (note|profile)")),
         }
     }
 }
