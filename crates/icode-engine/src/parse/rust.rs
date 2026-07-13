@@ -398,20 +398,24 @@ fn extract_call(node: Node<'_>, src: &[u8], path: &str, caller: Option<&str>) ->
     let func = node.child_by_field_name("function")?;
     let line = node.start_position().row as u32 + 1;
 
-    let (callee, receiver) = match func.kind() {
-        "identifier" => (node_text(func, src)?, None),
+    // `is_method` is the `.` vs `::` distinction, which Rust makes unambiguously:
+    // `a.b()` is a method on a value and can NEVER be a free `fn b`, while `a::b()`
+    // is a path and can. Flattening both into `receiver` is what let every
+    // `.collect()` in the repo link to a local `fn collect`.
+    let (callee, receiver, is_method) = match func.kind() {
+        "identifier" => (node_text(func, src)?, None, false),
         "scoped_identifier" => {
             let receiver = func.child_by_field_name("path").and_then(|n| node_text(n, src));
             let callee = func.child_by_field_name("name").and_then(|n| node_text(n, src))?;
-            (callee, receiver)
+            (callee, receiver, false)
         }
         "field_expression" => {
             let receiver = func.child_by_field_name("value").and_then(|n| node_text(n, src));
             let callee = func.child_by_field_name("field").and_then(|n| node_text(n, src))?;
-            (callee, receiver)
+            (callee, receiver, true)
         }
         // generic_function (turbofish) etc.: fall back to the raw function text.
-        _ => (node_text(func, src)?, None),
+        _ => (node_text(func, src)?, None, false),
     };
 
     Some(Call {
@@ -419,6 +423,7 @@ fn extract_call(node: Node<'_>, src: &[u8], path: &str, caller: Option<&str>) ->
         caller: caller.to_string(),
         callee,
         receiver,
+        is_method,
         line,
         ..Default::default()
     })

@@ -120,6 +120,12 @@ CREATE TABLE IF NOT EXISTS calls (
     caller          TEXT NOT NULL,
     callee          TEXT NOT NULL,
     receiver        TEXT,
+    -- 1 when the call was written with METHOD syntax (`a.b()`, `$a->b()`). A method
+    -- call can never target a FREE function, so `get_callers` uses this to stop every
+    -- `.collect()` in the repo from being credited to a local `fn collect`. Only set
+    -- where the grammar is unambiguous (Rust `.` vs `::`, PHP `->` vs `::`); in
+    -- Python/Go/JS a dot also means module access, so it stays 0 there.
+    is_method       INTEGER NOT NULL DEFAULT 0,
     resolved_callee TEXT,
     confidence      REAL NOT NULL DEFAULT 0.3,
     line            INTEGER NOT NULL

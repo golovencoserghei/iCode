@@ -390,6 +390,11 @@ fn extract_call(node: Node<'_>, src: &[u8], path: &str, caller: Option<&str>) ->
         caller: caller.to_string(),
         callee,
         receiver,
+        // NOT marked as a method call: in this language `a.b()` is ambiguous —
+        // `obj.method()` and `module.func()` share one syntax node, so claiming
+        // "method" here would delete real calls to module-level free functions.
+        // Only Rust (`.` vs `::`) and PHP (`->` vs `::`) separate them in the grammar.
+        is_method: false,
         line,
         ..Default::default()
     })

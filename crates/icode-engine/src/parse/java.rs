@@ -318,6 +318,8 @@ fn extract_call(node: Node<'_>, src: &[u8], path: &str, caller: Option<&str>) ->
         caller: caller.to_string(),
         callee,
         receiver,
+        // Java has no free functions, so this never removes an edge; kept accurate.
+        is_method: node.child_by_field_name("object").is_some(),
         line: node.start_position().row as u32 + 1,
         ..Default::default()
     })

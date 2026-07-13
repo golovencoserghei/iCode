@@ -13,6 +13,7 @@ pub mod ident;
 pub mod index;
 pub mod memory;
 pub mod minhash;
+pub mod pagerank;
 pub mod parse;
 pub mod recall;
 pub mod search;

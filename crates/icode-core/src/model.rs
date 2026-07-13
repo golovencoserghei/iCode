@@ -110,6 +110,20 @@ pub struct Call {
     pub callee: String,
     /// Receiver of a method call ($this/self/ClassName/$var) for OOP resolution.
     pub receiver: Option<String>,
+    /// TRUE when the call was written with method syntax (`a.b()`, `$a->b()`), FALSE
+    /// for a free call (`b()`) or a path/associated call (`A::b()`, `mod::b()`).
+    ///
+    /// The parsers always knew this — tree-sitter hands them a `field_expression` for
+    /// `a.b()` and a `scoped_identifier` for `a::b()` — but the model used to flatten
+    /// both into `receiver`, and the distinction was lost. It is load-bearing: a
+    /// METHOD call can never target a FREE function, so without it every `.collect()`
+    /// in the repo linked to a local `fn collect`, every `.join()` to a local `fn
+    /// join`. Measured on this project: 133 false callers on `join`, 82 on `collect`,
+    /// 38 on `walk`. `receiver` alone cannot recover it — `icode_engine::index_path()`
+    /// (a real path call) and `store.add()` (a method call) both leave a bare
+    /// lowercase word behind.
+    #[serde(default)]
+    pub is_method: bool,
     pub line: u32,
     /// Receiver-aware resolved target: the callee's fully-qualified name
     /// (`EnclosingType::method`) when the receiver let us qualify it against a real

@@ -35,7 +35,7 @@ pub use vector::Vec0Index;
 /// v3 (Wave 1): receiver-aware call resolution — `calls.resolved_callee`
 /// (qualified target) + `calls.confidence` (how the edge resolved). Discard-and-
 /// rebuild handles the added columns; no in-place migration.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// Gate the one-time sqlite-vec auto-extension registration.
 static VEC_INIT: Once = Once::new();
@@ -1038,14 +1038,42 @@ impl CodeReadStore for SqliteCodeStore {
     fn get_callers(&self, name: &str, limit: usize) -> Result<Vec<Call>> {
         let conn = self.conn.lock().map_err(store_err)?;
         let qualified_query = name != last_name_segment(name);
+
+        // Is the target a FREE function — i.e. is its only definition unqualified?
+        // If so, a METHOD call (`x.name()`) CANNOT be calling it: you cannot invoke a
+        // free function through a value. Without this, a project that happens to
+        // define `fn collect` collects every `.collect()` in the repo as a caller.
+        // Measured here before the fix: 133 false callers on `join`, 95 on `collect`,
+        // 38 on `walk`. `is_method` is only set where the grammar is unambiguous
+        // (Rust, PHP), so in Python/Go/JS this predicate is simply never true and the
+        // old recall is preserved.
+        let target_is_free_fn: bool = !qualified_query
+            && conn
+                .query_row(
+                    "SELECT EXISTS( \
+                       SELECT 1 FROM functions WHERE name = ?1 AND instr(qualified_name, ':') = 0 \
+                     ) AND NOT EXISTS( \
+                       SELECT 1 FROM functions WHERE name = ?1 AND instr(qualified_name, ':') > 0 \
+                     )",
+                    rusqlite::params![name],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map_err(store_err)?
+                != 0;
+
         let sql = if qualified_query {
             // Precise: only edges receiver-resolved to this exact qualified target.
-            "SELECT path, caller, callee, receiver, line, resolved_callee, confidence FROM calls \
+            "SELECT path, caller, callee, receiver, line, resolved_callee, confidence, is_method FROM calls \
              WHERE resolved_callee = ?1 OR callee = ?1 \
+             ORDER BY path, line LIMIT ?2"
+        } else if target_is_free_fn {
+            // Bare name for a free function: method-syntax edges cannot target it.
+            "SELECT path, caller, callee, receiver, line, resolved_callee, confidence, is_method FROM calls \
+             WHERE (callee = ?1 OR resolved_callee = ?1) AND is_method = 0 \
              ORDER BY path, line LIMIT ?2"
         } else {
             // Bare name: every edge with this bare callee (approximate recall).
-            "SELECT path, caller, callee, receiver, line, resolved_callee, confidence FROM calls \
+            "SELECT path, caller, callee, receiver, line, resolved_callee, confidence, is_method FROM calls \
              WHERE callee = ?1 OR resolved_callee = ?1 \
              ORDER BY path, line LIMIT ?2"
         };
@@ -1071,7 +1099,7 @@ impl CodeReadStore for SqliteCodeStore {
         // (the receiver-aware target) and `confidence` for the edge.
         let mut stmt = conn
             .prepare(
-                "SELECT path, caller, callee, receiver, line, resolved_callee, confidence FROM calls \
+                "SELECT path, caller, callee, receiver, line, resolved_callee, confidence, is_method FROM calls \
                  WHERE caller = ?1 OR caller = ?2 \
                  ORDER BY path, line LIMIT ?3",
             )
@@ -1736,8 +1764,8 @@ impl CodeWriteStore for SqliteCodeStore {
             let mut stmt = tx
                 .prepare(
                     "INSERT INTO calls \
-                     (file_id, path, caller, callee, receiver, resolved_callee, confidence, line) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                     (file_id, path, caller, callee, receiver, is_method, resolved_callee, confidence, line) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
                 )
                 .map_err(store_err)?;
             for c in calls {
@@ -1753,6 +1781,7 @@ impl CodeWriteStore for SqliteCodeStore {
                     c.caller,
                     c.callee,
                     c.receiver,
+                    c.is_method as i64,
                     guess,
                     CONF_UNRESOLVED as f64, // placeholder until resolve_call_edges runs
                     c.line as i64,
@@ -1894,7 +1923,7 @@ fn collect<T>(rows: impl Iterator<Item = rusqlite::Result<T>>) -> Result<Vec<T>>
 }
 
 /// Map a `calls` row (path, caller, callee, receiver, line, resolved_callee,
-/// confidence) into a `Call`.
+/// confidence, is_method) into a `Call`.
 fn map_call(row: &rusqlite::Row<'_>) -> rusqlite::Result<Call> {
     Ok(Call {
         path: row.get(0)?,
@@ -1904,6 +1933,7 @@ fn map_call(row: &rusqlite::Row<'_>) -> rusqlite::Result<Call> {
         line: row.get::<_, i64>(4)? as u32,
         resolved_callee: row.get(5)?,
         confidence: row.get::<_, f64>(6)? as f32,
+        is_method: row.get::<_, i64>(7).unwrap_or(0) != 0,
     })
 }
 
