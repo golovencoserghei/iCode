@@ -2714,6 +2714,9 @@ mod adjacency_cache_tests {
             caller: caller.to_string(),
             callee: callee.to_string(),
             receiver: None,
+            // A free call (`callee()`), not method syntax — so these fixtures keep
+            // exercising the plain bare-name caller path.
+            is_method: false,
             line: 1,
             resolved_callee: None,
             confidence: 0.0,
