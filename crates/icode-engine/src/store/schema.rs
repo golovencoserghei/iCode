@@ -49,7 +49,12 @@ CREATE TABLE IF NOT EXISTS functions (
     return_type    TEXT,
     docstring      TEXT,
     body           TEXT NOT NULL,
-    is_async       INTEGER NOT NULL DEFAULT 0
+    is_async       INTEGER NOT NULL DEFAULT 0,
+    -- Derived (see `ident::search_text`): every identifier in the symbol, kept
+    -- verbatim AND exploded into its words, so FTS5's word tokenizer can match
+    -- `Handler` against `HttpRequestHandler`. Indexed as an extra FTS column; the
+    -- raw `body` stays indexed too, so nothing is lost.
+    search_text    TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_functions_file ON functions(file_id);
@@ -70,7 +75,9 @@ CREATE TABLE IF NOT EXISTS classes (
     bases          TEXT NOT NULL DEFAULT '[]',   -- JSON array of base/super names
     docstring      TEXT,
     body           TEXT NOT NULL,
-    node_hash      TEXT
+    node_hash      TEXT,
+    -- Derived identifier-split text — see the note on `functions.search_text`.
+    search_text    TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_classes_file ON classes(file_id);
@@ -151,25 +158,26 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts_functions USING fts5(
     qualified_name,
     docstring,
     body,
+    search_text,
     content='functions',
     content_rowid='id'
 );
 
 CREATE TRIGGER IF NOT EXISTS functions_ai AFTER INSERT ON functions BEGIN
-    INSERT INTO fts_functions(rowid, name, qualified_name, docstring, body)
-    VALUES (new.id, new.name, new.qualified_name, new.docstring, new.body);
+    INSERT INTO fts_functions(rowid, name, qualified_name, docstring, body, search_text)
+    VALUES (new.id, new.name, new.qualified_name, new.docstring, new.body, new.search_text);
 END;
 
 CREATE TRIGGER IF NOT EXISTS functions_ad AFTER DELETE ON functions BEGIN
-    INSERT INTO fts_functions(fts_functions, rowid, name, qualified_name, docstring, body)
-    VALUES ('delete', old.id, old.name, old.qualified_name, old.docstring, old.body);
+    INSERT INTO fts_functions(fts_functions, rowid, name, qualified_name, docstring, body, search_text)
+    VALUES ('delete', old.id, old.name, old.qualified_name, old.docstring, old.body, old.search_text);
 END;
 
 CREATE TRIGGER IF NOT EXISTS functions_au AFTER UPDATE ON functions BEGIN
-    INSERT INTO fts_functions(fts_functions, rowid, name, qualified_name, docstring, body)
-    VALUES ('delete', old.id, old.name, old.qualified_name, old.docstring, old.body);
-    INSERT INTO fts_functions(rowid, name, qualified_name, docstring, body)
-    VALUES (new.id, new.name, new.qualified_name, new.docstring, new.body);
+    INSERT INTO fts_functions(fts_functions, rowid, name, qualified_name, docstring, body, search_text)
+    VALUES ('delete', old.id, old.name, old.qualified_name, old.docstring, old.body, old.search_text);
+    INSERT INTO fts_functions(rowid, name, qualified_name, docstring, body, search_text)
+    VALUES (new.id, new.name, new.qualified_name, new.docstring, new.body, new.search_text);
 END;
 
 -- ──────────────────────────── FTS5: classes ────────────────────────────
@@ -179,25 +187,26 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts_classes USING fts5(
     qualified_name,
     docstring,
     body,
+    search_text,
     content='classes',
     content_rowid='id'
 );
 
 CREATE TRIGGER IF NOT EXISTS classes_ai AFTER INSERT ON classes BEGIN
-    INSERT INTO fts_classes(rowid, name, qualified_name, docstring, body)
-    VALUES (new.id, new.name, new.qualified_name, new.docstring, new.body);
+    INSERT INTO fts_classes(rowid, name, qualified_name, docstring, body, search_text)
+    VALUES (new.id, new.name, new.qualified_name, new.docstring, new.body, new.search_text);
 END;
 
 CREATE TRIGGER IF NOT EXISTS classes_ad AFTER DELETE ON classes BEGIN
-    INSERT INTO fts_classes(fts_classes, rowid, name, qualified_name, docstring, body)
-    VALUES ('delete', old.id, old.name, old.qualified_name, old.docstring, old.body);
+    INSERT INTO fts_classes(fts_classes, rowid, name, qualified_name, docstring, body, search_text)
+    VALUES ('delete', old.id, old.name, old.qualified_name, old.docstring, old.body, old.search_text);
 END;
 
 CREATE TRIGGER IF NOT EXISTS classes_au AFTER UPDATE ON classes BEGIN
-    INSERT INTO fts_classes(fts_classes, rowid, name, qualified_name, docstring, body)
-    VALUES ('delete', old.id, old.name, old.qualified_name, old.docstring, old.body);
-    INSERT INTO fts_classes(rowid, name, qualified_name, docstring, body)
-    VALUES (new.id, new.name, new.qualified_name, new.docstring, new.body);
+    INSERT INTO fts_classes(fts_classes, rowid, name, qualified_name, docstring, body, search_text)
+    VALUES ('delete', old.id, old.name, old.qualified_name, old.docstring, old.body, old.search_text);
+    INSERT INTO fts_classes(rowid, name, qualified_name, docstring, body, search_text)
+    VALUES (new.id, new.name, new.qualified_name, new.docstring, new.body, new.search_text);
 END;
 
 -- ──────────────────────────── meta (key/value) ────────────────────────────

@@ -9,6 +9,7 @@ pub mod chunk;
 pub mod daemon;
 pub mod doctor;
 pub mod embed;
+pub mod ident;
 pub mod index;
 pub mod memory;
 pub mod parse;

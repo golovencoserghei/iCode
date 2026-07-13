@@ -35,7 +35,7 @@ pub use vector::Vec0Index;
 /// v3 (Wave 1): receiver-aware call resolution — `calls.resolved_callee`
 /// (qualified target) + `calls.confidence` (how the edge resolved). Discard-and-
 /// rebuild handles the added columns; no in-place migration.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// Gate the one-time sqlite-vec auto-extension registration.
 static VEC_INIT: Once = Once::new();
@@ -1550,11 +1550,19 @@ impl CodeWriteStore for SqliteCodeStore {
                 .prepare(
                     "INSERT INTO functions \
                      (file_id, name, qualified_name, path, language, line_start, line_end, \
-                      args, return_type, docstring, body, is_async) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                      args, return_type, docstring, body, is_async, search_text) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
                 )
                 .map_err(store_err)?;
             for f in functions {
+                // Derived identifier-split text (see `ident::search_text`): what makes
+                // `Handler` match `HttpRequestHandler` without an embedding model.
+                let search_text = crate::ident::search_text(&[
+                    &f.name,
+                    &f.qualified_name,
+                    f.docstring.as_deref().unwrap_or(""),
+                    &f.body,
+                ]);
                 stmt.execute(rusqlite::params![
                     file_id,
                     f.name,
@@ -1568,6 +1576,7 @@ impl CodeWriteStore for SqliteCodeStore {
                     f.docstring,
                     f.body,
                     f.is_async as i64,
+                    search_text,
                 ])
                 .map_err(store_err)?;
             }
@@ -1578,13 +1587,20 @@ impl CodeWriteStore for SqliteCodeStore {
                 .prepare(
                     "INSERT INTO classes \
                      (file_id, name, qualified_name, path, language, line_start, line_end, \
-                      bases, docstring, body, node_hash) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                      bases, docstring, body, node_hash, search_text) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
                 )
                 .map_err(store_err)?;
             for c in classes {
                 // `bases` is stored as a JSON array of strings (serde_json).
                 let bases_json = serde_json::to_string(&c.bases).map_err(store_err)?;
+                // Derived identifier-split text — see the note in the functions insert.
+                let search_text = crate::ident::search_text(&[
+                    &c.name,
+                    &c.qualified_name,
+                    c.docstring.as_deref().unwrap_or(""),
+                    &c.body,
+                ]);
                 stmt.execute(rusqlite::params![
                     file_id,
                     c.name,
@@ -1597,6 +1613,7 @@ impl CodeWriteStore for SqliteCodeStore {
                     c.docstring,
                     c.body,
                     Option::<String>::None,
+                    search_text,
                 ])
                 .map_err(store_err)?;
             }
