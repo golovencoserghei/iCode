@@ -58,7 +58,12 @@ CREATE TABLE IF NOT EXISTS functions (
     -- MinHash signature of the body (see `minhash`): 512 B, lexical + structural
     -- views. Powers "find similar code" with NO embedding model — a renamed clone
     -- still matches on the structural half.
-    minhash        BLOB
+    minhash        BLOB,
+    -- Graph centrality in 0..1 (see `pagerank`): sqrt(authority * hub) over the call
+    -- graph, normalised. A small tiebreaker in search ranking — BM25 says which
+    -- symbols MENTION the words, this says which of them the codebase actually leans
+    -- on. Recomputed after each full index.
+    rank           REAL NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_functions_file ON functions(file_id);
@@ -83,7 +88,9 @@ CREATE TABLE IF NOT EXISTS classes (
     -- Derived identifier-split text — see the note on `functions.search_text`.
     search_text    TEXT NOT NULL DEFAULT '',
     -- MinHash signature — see the note on `functions.minhash`.
-    minhash        BLOB
+    minhash        BLOB,
+    -- Graph centrality — see the note on `functions.rank`.
+    rank           REAL NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_classes_file ON classes(file_id);

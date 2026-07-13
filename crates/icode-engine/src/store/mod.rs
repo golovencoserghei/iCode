@@ -35,7 +35,12 @@ pub use vector::Vec0Index;
 /// v3 (Wave 1): receiver-aware call resolution — `calls.resolved_callee`
 /// (qualified target) + `calls.confidence` (how the edge resolved). Discard-and-
 /// rebuild handles the added columns; no in-place migration.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
+
+/// Weight of the graph-centrality nudge in the lexical search score. BM25 ranks span
+/// single digits here while an exact-name hit adds 1000, so 5.0 is enough to reorder
+/// otherwise-equivalent body matches and far too small to outrank a name match.
+const CENTRALITY_WEIGHT: f32 = 5.0;
 
 /// Gate the one-time sqlite-vec auto-extension registration.
 static VEC_INIT: Once = Once::new();
@@ -261,6 +266,109 @@ impl SqliteCodeStore {
     /// fixed at [`schema::VEC_DIM`] — the `vec_code` column width.
     pub fn vector_index(&self) -> Vec0Index {
         Vec0Index::new(Arc::clone(&self.conn), schema::VEC_DIM)
+    }
+
+    /// Recompute graph centrality for every symbol and store it in `rank` (0..1).
+    ///
+    /// BM25 answers "which symbols mention these words"; it cannot say which of six
+    /// equally-worded matches the codebase actually leans on. `sqrt(authority * hub)`
+    /// over the call graph (see [`crate::pagerank`]) can, for free.
+    ///
+    /// Edges obey the same soundness rule as `get_callers`: a METHOD call is never
+    /// credited to a same-named FREE function. Skipping that made the authority view
+    /// rank `collect`, `join` and `split` — pure artefacts of false edges — as the
+    /// most important symbols in this project.
+    ///
+    /// Call AFTER `resolve_call_edges`, once the graph is complete. Cheap: a handful
+    /// of passes over ~1.5k edges.
+    pub fn compute_symbol_ranks(&self) -> Result<()> {
+        let conn = self.conn.lock().map_err(store_err)?;
+
+        let mut stmt = conn
+            .prepare("SELECT qualified_name FROM functions UNION SELECT qualified_name FROM classes")
+            .map_err(store_err)?;
+        let nodes: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(store_err)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(store_err)?;
+        drop(stmt);
+        if nodes.is_empty() {
+            return Ok(());
+        }
+
+        // Free functions (unqualified definition, and no method of the same name):
+        // the set a method-syntax edge must NOT be allowed to point at.
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM functions WHERE instr(qualified_name, ':') = 0 \
+                 AND name NOT IN (SELECT name FROM functions WHERE instr(qualified_name, ':') > 0)",
+            )
+            .map_err(store_err)?;
+        let free: std::collections::HashSet<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(store_err)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(store_err)?;
+        drop(stmt);
+
+        let mut stmt = conn
+            .prepare("SELECT caller, callee, resolved_callee, is_method FROM calls")
+            .map_err(store_err)?;
+        let raw: Vec<(String, String, Option<String>, bool)> = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, i64>(3)? != 0,
+                ))
+            })
+            .map_err(store_err)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(store_err)?;
+        drop(stmt);
+
+        let node_set: std::collections::HashSet<&str> = nodes.iter().map(|s| s.as_str()).collect();
+        let edges: Vec<(&str, &str)> = raw
+            .iter()
+            .filter(|(_, callee, _, is_method)| !(*is_method && free.contains(callee.as_str())))
+            .map(|(caller, callee, resolved, _)| {
+                (caller.as_str(), resolved.as_deref().unwrap_or(callee.as_str()))
+            })
+            .filter(|(f, t)| node_set.contains(f) && node_set.contains(t))
+            .collect();
+
+        let centrality = crate::pagerank::centrality(&edges, &nodes);
+        let scores: Vec<(&String, f32)> = nodes
+            .iter()
+            .map(|n| (n, crate::pagerank::blend(&centrality, n)))
+            .collect();
+        // Normalise to 0..1 so the search nudge has a stable magnitude regardless of
+        // how many symbols the project has.
+        let max = scores.iter().map(|(_, v)| *v).fold(0.0f32, f32::max);
+        if max <= 0.0 {
+            return Ok(());
+        }
+
+        drop(conn);
+        let mut conn = self.conn.lock().map_err(store_err)?;
+        let tx = conn.transaction().map_err(store_err)?;
+        {
+            let mut uf = tx
+                .prepare("UPDATE functions SET rank = ?1 WHERE qualified_name = ?2")
+                .map_err(store_err)?;
+            let mut uc = tx
+                .prepare("UPDATE classes SET rank = ?1 WHERE qualified_name = ?2")
+                .map_err(store_err)?;
+            for (name, v) in scores {
+                let norm = (v / max) as f64;
+                uf.execute(rusqlite::params![norm, name]).map_err(store_err)?;
+                uc.execute(rusqlite::params![norm, name]).map_err(store_err)?;
+            }
+        }
+        tx.commit().map_err(store_err)?;
+        Ok(())
     }
 
     /// "Code like this" — WITHOUT an embedding model.
@@ -2448,7 +2556,7 @@ fn collect_symbol_hits(
     let fetch = (limit.max(1) * 4).min(200) as i64;
     let sql = format!(
         "SELECT s.name, s.qualified_name, s.path, s.line_start, s.line_end, s.body, \
-                bm25({fts}) AS rank \
+                bm25({fts}) AS rank, s.rank AS centrality \
          FROM {fts} \
          JOIN {base} s ON s.id = {fts}.rowid \
          WHERE {fts} MATCH ?1 \
@@ -2461,6 +2569,7 @@ fn collect_symbol_hits(
             let name: String = row.get(0)?;
             let body: String = row.get(5)?;
             let rank: f64 = row.get(6)?;
+            let centrality: f64 = row.get(7).unwrap_or(0.0);
             let lname = name.to_lowercase();
             // Base relevance from BM25 (negated: higher = better).
             let mut score = -rank as f32;
@@ -2471,6 +2580,11 @@ fn collect_symbol_hits(
             } else if lname.starts_with(needle) || needle.starts_with(&lname) {
                 score += 500.0;
             }
+            // Graph-centrality nudge (0..1, see `compute_symbol_ranks`). Deliberately
+            // sized to the BM25 spread, NOT to the name boost: it breaks ties among
+            // body-only matches toward the code the project actually leans on, and can
+            // never drag a peripheral symbol above a real name hit.
+            score += CENTRALITY_WEIGHT * centrality as f32;
             Ok(CodeHit {
                 kind,
                 name,

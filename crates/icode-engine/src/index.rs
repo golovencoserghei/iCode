@@ -243,6 +243,9 @@ pub fn index_path(root: &Path, store: &SqliteCodeStore) -> Result<IndexStats> {
     // full-table UPDATE would only burn a write for an identical result.
     if any_change {
         store.resolve_call_edges(None)?;
+        // Graph centrality (free, CPU-only) — a search-ranking prior. Must run AFTER
+        // the edges are resolved, since it reads the finished call graph.
+        store.compute_symbol_ranks()?;
     }
 
     Ok(stats)
