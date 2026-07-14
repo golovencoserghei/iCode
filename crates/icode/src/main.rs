@@ -301,7 +301,7 @@ fn run_check_exists(
         }
     }
 
-    let v = icode_engine::check_exists(&store, embedder.as_deref(), query, scope)
+    let v = icode_engine::check_exists(&store, None, query, scope)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
     let kind_label = |k: SymbolKind| match k {

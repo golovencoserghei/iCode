@@ -74,6 +74,9 @@ pub struct SearchArgs {
     pub limit: Option<usize>,
     /// Include symbol bodies (default false; costs context).
     pub with_body: Option<bool>,
+    /// Sub-project to search within (a monorepo member, e.g. "internal-agent"). Omit to
+    /// search the whole tree. Without this a monorepo drowns the answer in siblings.
+    pub scope: Option<String>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -744,7 +747,18 @@ impl CodeMcpServer {
             if let Some(emb) = embedder.as_deref() {
                 jit_embed(&store, emb);
             }
-            icode_engine::check_exists(&store, embedder.as_deref(), &query, scope)
+            // The embedder is DELIBERATELY not passed.
+            //
+            // check_exists is an oracle over the INDEX; the semantic "lead" it used the
+            // embedder for is a nicety that cost the answer. With vectors absent (index
+            // is free by default now) the semantic arm has nothing to match, so it
+            // offered whatever was nearest in another sub-project — the reported case
+            // answered a question about `internal-agent` with `admin_ui` from
+            // `data-gateway`, while the literal `page_metrics` sat in the index. It also
+            // dragged the query through the embedding backend, which on a real project
+            // took minutes. Lexical evidence is what makes this oracle honest; a guess
+            // from a model is what makes it dangerous.
+            icode_engine::check_exists(&store, None, &query, scope)
         })
         .await;
         match result {
@@ -782,6 +796,46 @@ impl CodeMcpServer {
             tokio::task::spawn_blocking(move || store.find_tests_covering(&name, depth)).await;
         match result {
             Ok(Ok(t)) => to_json(&t),
+            Ok(Err(e)) => err_json(&e.to_string()),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }
+
+    /// Lexical search over BOTH symbol kinds, with a module scope.
+    ///
+    /// `search` used to route kind=any into `find_existing`, which fuses dense+lexical
+    /// with RRF — and RRF re-ranks by POSITION, which throws away `search_code`'s
+    /// exact-name boost. The visible symptom: querying `page_metrics` returned the
+    /// symbol literally named `page_metrics` in SECOND place, behind an unrelated
+    /// `_fetch_members`. For an existence question that is the most expensive error
+    /// there is, because the honest answer was sitting in the index.
+    async fn search_lexical(&self, Parameters(args): Parameters<SearchArgs>) -> String {
+        let store = self.store.clone();
+        let limit = args.limit.unwrap_or(10);
+        let with_body = args.with_body.unwrap_or(false);
+        let scope = args.scope.clone();
+        let kind = match args.kind.as_deref() {
+            Some("function") => Some(SymbolKind::Function),
+            Some("class") => Some(SymbolKind::Class),
+            _ => None,
+        };
+        let query = args.query;
+        let result = tokio::task::spawn_blocking(move || {
+            store.search_code_scoped(
+                &CodeQuery {
+                    text: query,
+                    kind,
+                    lang: None,
+                    limit,
+                    mode: SearchMode::Lexical,
+                    with_body,
+                },
+                scope.as_deref(),
+            )
+        })
+        .await;
+        match result {
+            Ok(Ok(hits)) => to_json(&hits),
             Ok(Err(e)) => err_json(&e.to_string()),
             Err(e) => err_json(&e.to_string()),
         }
@@ -1425,9 +1479,8 @@ impl CodeMcpServer {
     // context for the rest of the session. Twelve `op`-dispatching tools expose the
     // same capability for a fraction of that fixed cost.
 
-    #[tool(description = "Search code by words or identifier. Identifier-aware: `Handler` finds `HttpRequestHandler`. kind: function|class|any. mode: lexical (default, free)|semantic|hybrid.")]
+    #[tool(description = "Search code by words or identifier. Identifier-aware: `Handler` finds `HttpRequestHandler`. kind: function|class|any. mode: lexical (default, free, exact-name-first)|semantic|hybrid. scope: limit to one sub-project in a monorepo.")]
     async fn search(&self, Parameters(a): Parameters<SearchArgs>) -> String {
-        let kind = a.kind.as_deref().unwrap_or("any");
         match a.mode.as_deref().unwrap_or("lexical") {
             "semantic" => {
                 self.semantic_search_code(Parameters(SemanticSearchArgs {
@@ -1444,30 +1497,9 @@ impl CodeMcpServer {
                 }))
                 .await
             }
-            _ => match kind {
-                "function" => {
-                    self.search_function(Parameters(SearchFunctionArgs {
-                        query: a.query,
-                        limit: a.limit,
-                    }))
-                    .await
-                }
-                "class" => {
-                    self.search_class(Parameters(SearchClassArgs {
-                        query: a.query,
-                        limit: a.limit,
-                    }))
-                    .await
-                }
-                _ => {
-                    self.find_existing(Parameters(FindExistingArgs {
-                        query: a.query,
-                        kind: None,
-                        limit: a.limit,
-                    }))
-                    .await
-                }
-            },
+            // Lexical is the default and the free path: identifier-aware, and it keeps
+            // the exact-name boost that hybrid's RRF fusion discards.
+            _ => self.search_lexical(Parameters(a)).await,
         }
     }
 

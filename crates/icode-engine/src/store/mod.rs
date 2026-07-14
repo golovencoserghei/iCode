@@ -281,6 +281,59 @@ impl SqliteCodeStore {
         Vec0Index::new(Arc::clone(&self.conn), schema::VEC_DIM)
     }
 
+    /// [`CodeReadStore::search_code`], optionally restricted to one sub-project.
+    ///
+    /// In a monorepo an unscoped search is mostly noise: a query about one member
+    /// competes with 4000 files of an upstream vendored service that the caller does not
+    /// even work on. `scope` is a module (see [`crate::module`]) — `"internal-agent"` —
+    /// and `None` searches the whole tree, exactly as before.
+    pub fn search_code_scoped(&self, q: &CodeQuery, scope: Option<&str>) -> Result<Vec<CodeHit>> {
+        let Some(scope) = scope.filter(|s| !s.trim().is_empty()) else {
+            return self.search_code(q);
+        };
+        // Over-fetch, then filter: the FTS index is not module-partitioned, and a
+        // post-filter keeps the ranking (exact-name boost included) intact.
+        let wide = CodeQuery {
+            limit: q.limit.saturating_mul(8).clamp(q.limit, 400),
+            ..q.clone()
+        };
+        let mut hits = self.search_code(&wide)?;
+        let in_scope: std::collections::HashSet<String> = {
+            let conn = self.conn.lock().map_err(store_err)?;
+            let mut stmt = conn
+                .prepare("SELECT path FROM files WHERE module = ?1")
+                .map_err(store_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![scope], |r| r.get::<_, String>(0))
+                .map_err(store_err)?;
+            let mut v = std::collections::HashSet::new();
+            for r in rows {
+                v.insert(r.map_err(store_err)?);
+            }
+            v
+        };
+        hits.retain(|h| in_scope.contains(&h.path));
+        hits.truncate(q.limit);
+        Ok(hits)
+    }
+
+    /// The sub-projects in this tree, with how many files each holds. Empty (or a single
+    /// `""` entry) means a plain single-project repo.
+    pub fn list_modules(&self) -> Result<Vec<(String, u64)>> {
+        let conn = self.conn.lock().map_err(store_err)?;
+        let mut stmt = conn
+            .prepare("SELECT module, COUNT(*) FROM files GROUP BY module ORDER BY COUNT(*) DESC")
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
     /// Which TESTS exercise `symbol` — reverse reachability over the call graph.
     ///
     /// The question an agent asks before changing anything ("what breaks, and what
