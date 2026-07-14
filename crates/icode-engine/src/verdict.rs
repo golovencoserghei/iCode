@@ -347,32 +347,45 @@ fn lexical(store: &SqliteCodeStore, text: &str, kind: Option<SymbolKind>, limit:
 /// snippet. Unresolvable routes are weak evidence and are skipped.
 fn route_match(store: &SqliteCodeStore, tokens: &[String]) -> Result<Option<(CodeHit, usize)>> {
     let routes = store.find_routes(None, None, None, 500)?;
+
+    // Take the BEST route, not the first one that shares a word.
+    //
+    // This used to `return` on the first non-zero overlap, so asking about a "metrics
+    // page in the dashboard" answered with `GET /dashboard/api/capabilities` — one
+    // shared word, "dashboard" — while `GET /dashboard/metrics -> page_metrics`, which
+    // matches TWO of the three terms, sat further down the list. Route order is
+    // insertion order; it carries no relevance at all.
+    let mut best: Option<(CodeHit, usize)> = None;
     for r in &routes {
+        // Match on the ROUTE and its handler — not on the file path. A file called
+        // `dashboard.py` would otherwise lend its name to every route it declares,
+        // manufacturing overlap that says nothing about what the route does.
         let hay = format!(
-            "{} {} {} {} {}",
+            "{} {} {} {}",
             r.route,
-            r.path,
             r.handler_method.as_deref().unwrap_or(""),
             r.handler_class.as_deref().unwrap_or(""),
             r.name.as_deref().unwrap_or("")
         )
         .to_lowercase();
         let ov = tokens.iter().filter(|t| hay.contains(t.as_str())).count();
-        if ov == 0 {
+        if ov == 0 || best.as_ref().is_some_and(|(_, b)| ov <= *b) {
             continue;
         }
-        if let Some(hm) = &r.handler_method {
-            if let Some(f) = store.get_function(hm, None, false)? {
-                if is_test_path(&f.path) {
-                    continue;
-                }
-                let mut hit = code_hit_from_fn(&f);
-                hit.snippet = Some(format!("{} {} → {}", r.method, r.path, hit.qualified_name));
-                return Ok(Some((hit, ov)));
-            }
+        let Some(hm) = &r.handler_method else { continue };
+        let Some(f) = store.get_function(hm, None, false)? else {
+            continue;
+        };
+        if is_test_path(&f.path) {
+            continue;
         }
+        let mut hit = code_hit_from_fn(&f);
+        // `r.route` — the URL. `r.path` is the FILE the route is declared in, and
+        // printing it here reported a route as `GET /home/.../dashboard.py`.
+        hit.snippet = Some(format!("{} {} → {}", r.method, r.route, hit.qualified_name));
+        best = Some((hit, ov));
     }
-    Ok(None)
+    Ok(best)
 }
 
 /// Evidence that a term lives ONLY in bodies/literals. Prefer an enclosing symbol

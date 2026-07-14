@@ -294,13 +294,19 @@ fn run_check_exists(
     };
 
     let store = SqliteCodeStore::open(path).map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    let embedder = build_serve_embedder();
-    if let Some(emb) = embedder.as_deref() {
-        if let Err(e) = icode_engine::embed_pending(&store, emb, EmbedConfig::default().batch) {
-            eprintln!("icode: embed pass skipped ({e}); semantic signal disabled");
-        }
-    }
 
+    // NO embedder, and above all NO `embed_pending`.
+    //
+    // This used to drain the ENTIRE pending-embed queue before answering. Once indexing
+    // went free (vectors are opt-in), that queue is every chunk in the project — so the
+    // oracle you are supposed to run BEFORE claiming a feature is missing sat there for
+    // minutes embedding the whole codebase. Measured: >2 min on a 2279-function project.
+    //
+    // It also does not need one. The verdict is built from lexical evidence — a defined
+    // name, a route, a body mention. The embedder only ever supplied a "nearest by
+    // meaning" LEAD, and that lead is what made the tool dangerous: asked whether
+    // `internal-agent` has a metrics page, it answered with `admin_ui` from a different
+    // service while the literal `page_metrics` sat in the index.
     let v = icode_engine::check_exists(&store, None, query, scope)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
