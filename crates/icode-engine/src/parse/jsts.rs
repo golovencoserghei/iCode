@@ -273,6 +273,9 @@ fn extract_function(
         docstring: None,
         body,
         is_async,
+        // JS/TS tests are CALLS (`it(...)`, `test(...)`), not named functions, so a
+        // function-level marker does not exist. The indexer flags test PATHS.
+        is_test: false,
         override_type: None,
         override_target: None,
     })

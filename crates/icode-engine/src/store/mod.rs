@@ -35,7 +35,7 @@ pub use vector::Vec0Index;
 /// v3 (Wave 1): receiver-aware call resolution — `calls.resolved_callee`
 /// (qualified target) + `calls.confidence` (how the edge resolved). Discard-and-
 /// rebuild handles the added columns; no in-place migration.
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 /// Weight of the graph-centrality nudge in the lexical search score. BM25 ranks span
 /// single digits here while an exact-name hit adds 1000, so 5.0 is enough to reorder
@@ -266,6 +266,133 @@ impl SqliteCodeStore {
     /// fixed at [`schema::VEC_DIM`] — the `vec_code` column width.
     pub fn vector_index(&self) -> Vec0Index {
         Vec0Index::new(Arc::clone(&self.conn), schema::VEC_DIM)
+    }
+
+    /// Which TESTS exercise `symbol` — reverse reachability over the call graph.
+    ///
+    /// The question an agent asks before changing anything ("what breaks, and what
+    /// will tell me?") and the one nothing in the toolbox could answer. Grepping the
+    /// test suite for the symbol name only finds tests that mention it DIRECTLY; a
+    /// test that reaches it three calls deep — the common case — is invisible.
+    ///
+    /// BFS backwards from `symbol` over caller edges up to `max_depth` hops, returning
+    /// the test functions found, nearest first. `depth` is how many calls separate the
+    /// test from the symbol (1 = the test calls it directly).
+    ///
+    /// Edges obey the same soundness rule as `get_callers` (a method call is never
+    /// credited to a same-named free function), so a test that merely calls `.collect()`
+    /// is not reported as covering a local `fn collect`.
+    ///
+    /// Returns an empty list when nothing reaches it — which is itself the answer:
+    /// this code is untested.
+    ///
+    /// KNOWN GAP, stated rather than hidden: the parsers do not descend into MACRO
+    /// bodies, so a call written only inside `assert!(foo(x))` produces no call edge
+    /// and the test will not be linked to `foo`. In Rust that under-reports coverage
+    /// for functions exercised purely through assertion macros — an empty result is
+    /// therefore weak evidence of "untested", not proof. `symbol op=references` still
+    /// shows those lines (as mentions).
+    pub fn find_tests_covering(&self, symbol: &str, max_depth: usize) -> Result<Vec<TestCoverage>> {
+        let max_depth = max_depth.clamp(1, 10);
+        let conn = self.conn.lock().map_err(store_err)?;
+
+        // Free functions: the set a method-syntax edge must not be allowed to reach.
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM functions WHERE instr(qualified_name, ':') = 0 \
+                 AND name NOT IN (SELECT name FROM functions WHERE instr(qualified_name, ':') > 0)",
+            )
+            .map_err(store_err)?;
+        let free: std::collections::HashSet<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(store_err)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(store_err)?;
+        drop(stmt);
+
+        // Reverse adjacency: callee -> callers, built once.
+        let mut stmt = conn
+            .prepare("SELECT caller, callee, resolved_callee, is_method FROM calls")
+            .map_err(store_err)?;
+        let mut callers_of: HashMap<String, Vec<String>> = HashMap::new();
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, i64>(3)? != 0,
+                ))
+            })
+            .map_err(store_err)?;
+        for row in rows {
+            let (caller, callee, resolved, is_method) = row.map_err(store_err)?;
+            if is_method && free.contains(&callee) {
+                continue; // a `.foo()` cannot be calling the free `fn foo`
+            }
+            let target = resolved.unwrap_or(callee);
+            callers_of.entry(target).or_default().push(caller);
+        }
+        drop(stmt);
+
+        // Which symbols are tests, and where they live.
+        let mut stmt = conn
+            .prepare("SELECT qualified_name, name, path FROM functions WHERE is_test = 1")
+            .map_err(store_err)?;
+        let mut tests: HashMap<String, (String, String)> = HashMap::new();
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(store_err)?;
+        for row in rows {
+            let (qname, name, path) = row.map_err(store_err)?;
+            tests.insert(qname, (name, path));
+        }
+        drop(stmt);
+        drop(conn);
+
+        // BFS backwards. `seen` guards cycles (recursion, mutual calls).
+        let mut out: Vec<TestCoverage> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut frontier: Vec<String> = vec![symbol.to_string()];
+        seen.insert(symbol.to_string());
+
+        for depth in 1..=max_depth {
+            let mut next: Vec<String> = Vec::new();
+            for node in &frontier {
+                let Some(callers) = callers_of.get(node) else {
+                    continue;
+                };
+                for caller in callers {
+                    if !seen.insert(caller.clone()) {
+                        continue;
+                    }
+                    if let Some((name, path)) = tests.get(caller) {
+                        out.push(TestCoverage {
+                            test: name.clone(),
+                            qualified_name: caller.clone(),
+                            path: path.clone(),
+                            depth: depth as u32,
+                        });
+                    } else {
+                        // Not a test — keep walking up through it.
+                        next.push(caller.clone());
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+
+        out.sort_by(|a, b| a.depth.cmp(&b.depth).then_with(|| a.test.cmp(&b.test)));
+        Ok(out)
     }
 
     /// Every place `symbol` is referenced, CLASSIFIED — the precise answer to "where
@@ -1116,6 +1243,9 @@ impl CodeReadStore for SqliteCodeStore {
                 docstring: row.get(8)?,
                 body: if with_body { body } else { String::new() },
                 is_async: row.get::<_, i64>(10)? != 0,
+                // Not selected by this query; `is_test` is a graph fact, not part of
+                // the definition payload these call sites need.
+                is_test: false,
                 override_type: None,
                 override_target: None,
             })
@@ -1955,8 +2085,8 @@ impl CodeWriteStore for SqliteCodeStore {
                 .prepare(
                     "INSERT INTO functions \
                      (file_id, name, qualified_name, path, language, line_start, line_end, \
-                      args, return_type, docstring, body, is_async, search_text, minhash) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                      args, return_type, docstring, body, is_async, search_text, minhash, is_test) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
                 )
                 .map_err(store_err)?;
             for f in functions {
@@ -1983,6 +2113,9 @@ impl CodeWriteStore for SqliteCodeStore {
                     f.is_async as i64,
                     search_text,
                     crate::minhash::to_blob(&crate::minhash::signature(&f.body)),
+                    // The parser's own marker (Rust `#[test]`, Go `TestXxx`, …) OR the
+                    // file path (`tests/`, `*_test.go`, `*.spec.ts`). Either is enough.
+                    (f.is_test || crate::verdict::is_test_path(&f.path)) as i64,
                 ])
                 .map_err(store_err)?;
             }
@@ -2435,6 +2568,9 @@ impl SqliteCodeStore {
                 docstring: row.get(8)?,
                 body: row.get(9)?,
                 is_async: row.get::<_, i64>(10)? != 0,
+                // Not selected by this query; `is_test` is a graph fact, not part of
+                // the definition payload these call sites need.
+                is_test: false,
                 override_type: None,
                 override_target: None,
             })
@@ -2882,6 +3018,7 @@ mod adjacency_cache_tests {
             docstring: None,
             body: String::new(),
             is_async: false,
+            is_test: false,
             override_type: None,
             override_target: None,
         }

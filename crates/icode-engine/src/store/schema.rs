@@ -50,6 +50,12 @@ CREATE TABLE IF NOT EXISTS functions (
     docstring      TEXT,
     body           TEXT NOT NULL,
     is_async       INTEGER NOT NULL DEFAULT 0,
+    -- 1 when this function is a TEST: from the language's own marker (Rust `#[test]`,
+    -- Go `TestXxx`, pytest `test_*`) OR from the file path. Rust marks tests with an
+    -- ATTRIBUTE, not a naming convention, so a path/name heuristic alone would miss
+    -- most inline `#[cfg(test)] mod tests` functions. Powers "which tests cover this
+    -- symbol" (reverse reachability over the call graph).
+    is_test        INTEGER NOT NULL DEFAULT 0,
     -- Derived (see `ident::search_text`): every identifier in the symbol, kept
     -- verbatim AND exploded into its words, so FTS5's word tokenizer can match
     -- `Handler` against `HttpRequestHandler`. Indexed as an extra FTS column; the

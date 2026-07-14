@@ -73,6 +73,16 @@ pub struct FunctionDef {
     /// Empty in lean projections; populated only when a body was requested.
     pub body: String,
     pub is_async: bool,
+    /// TRUE when this function is a TEST.
+    ///
+    /// Set from the language's own marker where one exists (Rust `#[test]` /
+    /// `#[tokio::test]` / `#[bench]`), and from file/name conventions otherwise. The
+    /// attribute matters: Rust marks tests with an ATTRIBUTE, not a naming convention,
+    /// so an inline `#[cfg(test)] mod tests` function can be called
+    /// `contains_identifier_respects_token_boundaries`. A name/path heuristic alone
+    /// would therefore miss most of a Rust project's test suite.
+    #[serde(default)]
+    pub is_test: bool,
     /// Reserved: "own" | "inherited" | "override" resolution metadata. NOT yet
     /// populated — the OOP resolution model is unimplemented, so no parser sets
     /// these; both fields are always None today.
@@ -363,6 +373,19 @@ pub enum RefKind {
     /// annotation, a struct literal, a path, a trait bound. Matched on IDENTIFIER
     /// boundaries, so `walk` never matches inside `walk_source_files`.
     Mention,
+}
+
+/// A test that reaches a symbol through the call graph.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TestCoverage {
+    /// The test function's bare name.
+    pub test: String,
+    pub qualified_name: String,
+    pub path: String,
+    /// How many calls separate the test from the symbol. 1 = the test calls it
+    /// directly; 3 = it reaches it three hops down, which grepping the test suite for
+    /// the symbol's name would never find.
+    pub depth: u32,
 }
 
 /// One place a symbol is referenced, classified.

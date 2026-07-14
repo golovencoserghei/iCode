@@ -80,7 +80,7 @@ pub struct SearchArgs {
 pub struct SymbolArgs {
     /// Symbol name (bare or qualified).
     pub name: String,
-    /// context (default) | def | callers | callees | references | implementations | similar.
+    /// context (default) | def | callers | callees | references | tests | implementations | similar.
     pub op: Option<String>,
     /// Disambiguate a symbol defined in several files.
     pub file_hint: Option<String>,
@@ -774,6 +774,19 @@ impl CodeMcpServer {
         }
     }
 
+    async fn find_tests_covering(&self, Parameters(args): Parameters<CallersArgs>) -> String {
+        let store = self.store.clone();
+        let depth = args.limit.unwrap_or(5);
+        let name = args.name;
+        let result =
+            tokio::task::spawn_blocking(move || store.find_tests_covering(&name, depth)).await;
+        match result {
+            Ok(Ok(t)) => to_json(&t),
+            Ok(Err(e)) => err_json(&e.to_string()),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }
+
     async fn find_references(&self, Parameters(args): Parameters<CallersArgs>) -> String {
         let store = self.store.clone();
         let limit = args.limit.unwrap_or(100);
@@ -1458,7 +1471,7 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Everything about a symbol. op: context (default: def+callers+callees) | def | callers | callees | references (every use, classified: definition/call/import/mention - precise, not grep) | implementations | similar.")]
+    #[tool(description = "Everything about a symbol. op: context (default: def+callers+callees) | def | callers | callees | references (every use, classified: definition/call/import/mention - precise, not grep) | tests (which tests reach it, transitively - empty means UNTESTED) | implementations | similar.")]
     async fn symbol(&self, Parameters(a): Parameters<SymbolArgs>) -> String {
         match a.op.as_deref().unwrap_or("context") {
             "def" => {
@@ -1499,6 +1512,13 @@ impl CodeMcpServer {
             }
             "references" => {
                 self.find_references(Parameters(CallersArgs {
+                    name: a.name,
+                    limit: a.limit,
+                }))
+                .await
+            }
+            "tests" => {
+                self.find_tests_covering(Parameters(CallersArgs {
                     name: a.name,
                     limit: a.limit,
                 }))

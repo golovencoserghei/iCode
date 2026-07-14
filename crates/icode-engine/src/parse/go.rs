@@ -132,6 +132,8 @@ fn walk(node: Node<'_>, src: &[u8], path: &str, ctx: &Ctx, acc: &mut Acc) {
 /// `receiver` parameter list (a leading `*` is stripped).
 fn extract_function(node: Node<'_>, src: &[u8], path: &str) -> Option<FunctionDef> {
     let name = node.child_by_field_name("name").and_then(|n| node_text(n, src))?;
+    // Go marks tests by NAME: `func TestXxx(t *testing.T)` / `BenchmarkXxx`.
+    let is_test = name.starts_with("Test") || name.starts_with("Benchmark") || name.starts_with("Fuzz");
 
     let qualified_name = match receiver_type(node, src) {
         Some(ty) => format!("{ty}.{name}"),
@@ -163,6 +165,7 @@ fn extract_function(node: Node<'_>, src: &[u8], path: &str) -> Option<FunctionDe
         docstring: None,
         body,
         is_async: false, // Go has no `async` functions.
+        is_test,
         override_type: None,
         override_target: None,
     })

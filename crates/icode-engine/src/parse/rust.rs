@@ -202,6 +202,7 @@ fn extract_function(node: Node<'_>, src: &[u8], path: &str, impl_type: Option<&s
 
     let return_type = node.child_by_field_name("return_type").and_then(|n| node_text(n, src));
     let is_async = has_async_modifier(node, src);
+    let is_test = has_test_attribute(node, src);
     let body = node_text(node, src).unwrap_or_default();
 
     // tree-sitter rows are 0-based; the contract wants 1-based inclusive lines.
@@ -220,6 +221,7 @@ fn extract_function(node: Node<'_>, src: &[u8], path: &str, impl_type: Option<&s
         docstring: None,
         body,
         is_async,
+        is_test,
         override_type: None,
         override_target: None,
     })
@@ -393,6 +395,39 @@ fn last_segment(s: &str) -> Option<String> {
 /// - `field_expression`  → method call (callee = field, receiver = object text).
 ///
 /// `caller` is the qualified name of the enclosing fn (skipped if unknown).
+/// Is this `function_item` a TEST?
+///
+/// Rust marks tests with an ATTRIBUTE, not a naming convention: a unit test can be
+/// called `contains_identifier_respects_token_boundaries`. So a name/path heuristic
+/// misses essentially every inline `#[cfg(test)] mod tests` function — which in a Rust
+/// project is most of the test suite. tree-sitter emits `#[test]` as an
+/// `attribute_item` SIBLING preceding the function, so we walk back over the
+/// attributes attached to this item.
+///
+/// Matches `#[test]`, `#[tokio::test]`, `#[async_std::test]`, `#[bench]` and the
+/// `#[rstest]`/`#[test_case]` families — anything whose attribute path ends in `test`
+/// or `bench`.
+fn has_test_attribute(node: Node<'_>, src: &[u8]) -> bool {
+    let mut sib = node.prev_sibling();
+    while let Some(n) = sib {
+        if n.kind() != "attribute_item" {
+            break;
+        }
+        if let Some(text) = node_text(n, src) {
+            let t = text.to_lowercase();
+            let t = t.trim_start_matches("#[").trim_end_matches(']');
+            // The attribute PATH only (drop any arguments): `test_case(1, 2)` -> `test_case`.
+            let head = t.split('(').next().unwrap_or(t).trim();
+            let last = head.rsplit("::").next().unwrap_or(head).trim();
+            if last == "test" || last == "bench" || last.starts_with("test_") || last == "rstest" {
+                return true;
+            }
+        }
+        sib = n.prev_sibling();
+    }
+    false
+}
+
 fn extract_call(node: Node<'_>, src: &[u8], path: &str, caller: Option<&str>) -> Option<Call> {
     let caller = caller?; // top-level calls (outside any fn) are dropped
     let func = node.child_by_field_name("function")?;

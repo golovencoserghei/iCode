@@ -19,6 +19,7 @@ fn func(qname: &str, args: &str, doc: Option<&str>, body: &str) -> FunctionDef {
         docstring: doc.map(|s| s.to_string()),
         body: body.to_string(),
         is_async: false,
+        is_test: false,
         override_type: None,
         override_target: None,
     }

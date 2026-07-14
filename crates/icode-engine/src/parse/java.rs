@@ -178,6 +178,10 @@ fn extract_function(node: Node<'_>, src: &[u8], path: &str, type_name: Option<&s
         docstring: None,
         body,
         is_async: false, // Java has no `async` functions.
+        // Java marks tests with @Test, which this parser does not capture; the
+        // indexer still flags anything under a test path. Left false here rather
+        // than guessing from the name.
+        is_test: false,
         override_type: None,
         override_target: None,
     })

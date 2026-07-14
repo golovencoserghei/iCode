@@ -142,6 +142,8 @@ fn walk(node: Node<'_>, src: &[u8], path: &str, ctx: &Ctx, acc: &mut Acc) {
 /// parameter-list text; `docstring` is the body's leading string literal.
 fn extract_function(node: Node<'_>, src: &[u8], path: &str, class_stack: &[String]) -> Option<FunctionDef> {
     let name = node.child_by_field_name("name").and_then(|n| node_text(n, src))?;
+    // pytest/unittest convention: `def test_*`.
+    let is_test = name.starts_with("test");
 
     let qualified_name = if class_stack.is_empty() {
         name.clone()
@@ -175,6 +177,7 @@ fn extract_function(node: Node<'_>, src: &[u8], path: &str, class_stack: &[Strin
         docstring,
         body,
         is_async,
+        is_test,
         override_type: None,
         override_target: None,
     })

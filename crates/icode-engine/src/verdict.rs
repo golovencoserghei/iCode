@@ -425,7 +425,7 @@ fn body_or_string_evidence(
 /// file (Rust's dominant unit-test convention) have a src path and are NOT caught,
 /// so a test helper there can still read as EXISTS; excluding them needs
 /// symbol-level `cfg(test)` metadata from the parser (a tracked follow-up).
-fn is_test_path(path: &str) -> bool {
+pub fn is_test_path(path: &str) -> bool {
     let p = path.replace('\\', "/").to_lowercase();
     if p.split('/').any(|s| {
         s == "tests" || s == "test" || s == "__tests__" || s == "spec" || s == "specs" || s == "testing"
