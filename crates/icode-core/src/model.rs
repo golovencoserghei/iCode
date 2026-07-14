@@ -48,6 +48,11 @@ pub struct FileRecord {
     pub lines_total: u32,
     pub mtime: i64,
     pub file_size: u64,
+    /// Sub-project this file belongs to, relative to the indexed root (`""` = the root
+    /// module). In a monorepo this is the boundary that stops a call resolving to a
+    /// sibling project's homonym — see `icode_engine::module`.
+    #[serde(default)]
+    pub module: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

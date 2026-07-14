@@ -26,6 +26,12 @@ pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS files (
     id           INTEGER PRIMARY KEY,
     path         TEXT NOT NULL UNIQUE,
+    -- Sub-project this file belongs to, RELATIVE to the indexed root (see `module`).
+    -- '' = the root module (a plain single-project repo, where nothing changes).
+    -- A monorepo is where the name-based call graph breaks down: `get` was defined in
+    -- 4 of this tree's sub-projects and produced 4122 fabricated cross-project edges.
+    -- The boundary is what stops a call resolving to a sibling's homonym.
+    module       TEXT NOT NULL DEFAULT '',
     language     TEXT NOT NULL,
     content_hash TEXT NOT NULL,
     ast_hash     TEXT NOT NULL,
@@ -56,6 +62,9 @@ CREATE TABLE IF NOT EXISTS functions (
     -- most inline `#[cfg(test)] mod tests` functions. Powers "which tests cover this
     -- symbol" (reverse reachability over the call graph).
     is_test        INTEGER NOT NULL DEFAULT 0,
+    -- Sub-project (see `files.module`). Denormalised so search/graph can scope without
+    -- a join on every row.
+    module         TEXT NOT NULL DEFAULT '',
     -- Derived (see `ident::search_text`): every identifier in the symbol, kept
     -- verbatim AND exploded into its words, so FTS5's word tokenizer can match
     -- `Handler` against `HttpRequestHandler`. Indexed as an extra FTS column; the
@@ -96,7 +105,9 @@ CREATE TABLE IF NOT EXISTS classes (
     -- MinHash signature — see the note on `functions.minhash`.
     minhash        BLOB,
     -- Graph centrality — see the note on `functions.rank`.
-    rank           REAL NOT NULL DEFAULT 0
+    rank           REAL NOT NULL DEFAULT 0,
+    -- Sub-project (see `files.module`).
+    module         TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_classes_file ON classes(file_id);
@@ -139,6 +150,10 @@ CREATE TABLE IF NOT EXISTS calls (
     -- where the grammar is unambiguous (Rust `.` vs `::`, PHP `->` vs `::`); in
     -- Python/Go/JS a dot also means module access, so it stays 0 there.
     is_method       INTEGER NOT NULL DEFAULT 0,
+    -- Sub-project of the CALLER's file (see `files.module`). An edge may only resolve
+    -- to a definition outside this module when the module does not define the name
+    -- itself — otherwise `onyx` calling its own `get` gets credited to a sibling's.
+    module          TEXT NOT NULL DEFAULT '',
     resolved_callee TEXT,
     confidence      REAL NOT NULL DEFAULT 0.3,
     line            INTEGER NOT NULL
@@ -299,3 +314,4 @@ CREATE TABLE IF NOT EXISTS embed_cache (
     PRIMARY KEY (content_hash, embed_model)
 ) WITHOUT ROWID;
 "#;
+

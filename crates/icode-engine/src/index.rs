@@ -373,6 +373,10 @@ fn build_parsed(
         lines_total: parsed.lines_total,
         mtime: mtime_secs(meta),
         file_size: meta.len(),
+        // Which sub-project this file belongs to. In a single-project repo this is ""
+        // and nothing downstream changes; in a monorepo it is the boundary that keeps a
+        // call from resolving to a sibling project's identically-named function.
+        module: crate::module::module_of(path, root),
     };
     let chunks = chunks_for_file(&parsed.functions, &parsed.classes, root);
     ParsedFile {

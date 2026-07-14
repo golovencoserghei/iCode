@@ -35,7 +35,20 @@ pub use vector::Vec0Index;
 /// v3 (Wave 1): receiver-aware call resolution — `calls.resolved_callee`
 /// (qualified target) + `calls.confidence` (how the edge resolved). Discard-and-
 /// rebuild handles the added columns; no in-place migration.
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
+
+/// A graph node's identity: `module\u{1}qualified_name`. Keying by name ALONE collapses
+/// every homonym in the tree into one node, which in a monorepo silently rewrites the
+/// graph (see `compute_symbol_ranks`). The separator is a control char so it cannot
+/// occur in either part.
+fn node_key(module: &str, qualified_name: &str) -> String {
+    format!("{module}\u{1}{qualified_name}")
+}
+
+/// Inverse of [`node_key`].
+fn split_node_key(key: &str) -> (&str, &str) {
+    key.split_once('\u{1}').unwrap_or(("", key))
+}
 
 /// Weight of the graph-centrality nudge in the lexical search score. BM25 ranks span
 /// single digits here while an exact-name hit adds 1000, so 5.0 is enough to reorder
@@ -590,18 +603,40 @@ impl SqliteCodeStore {
     pub fn compute_symbol_ranks(&self) -> Result<()> {
         let conn = self.conn.lock().map_err(store_err)?;
 
+        // NODE IDENTITY IS (module, qualified_name) — not the name alone.
+        //
+        // A name-keyed graph collapses every homonym in the tree into ONE node. In a
+        // monorepo that is not a rounding error, it is a different graph: measured on a
+        // real 7-project tree, `get` is defined in 4 sub-projects and `health` in 6, so
+        // every `get()` call anywhere landed on the same node. The result was a
+        // confident `onyx -> data-gateway x4964` — an edge into a 29-file sibling that
+        // `onyx` never calls. Centrality, impact and reachability all inherited it.
+        //
+        // Qualifying the node by module keeps `onyx`'s `get` and `data-gateway`'s `get`
+        // apart. A single-project repo has one module (''), so the key degenerates to
+        // the plain name and nothing changes there.
         let mut stmt = conn
-            .prepare("SELECT qualified_name FROM functions UNION SELECT qualified_name FROM classes")
+            .prepare(
+                "SELECT module, qualified_name FROM functions \
+                 UNION SELECT module, qualified_name FROM classes",
+            )
             .map_err(store_err)?;
-        let nodes: Vec<String> = stmt
-            .query_map([], |r| r.get::<_, String>(0))
+        let node_rows: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
             .map_err(store_err)?
             .collect::<rusqlite::Result<_>>()
             .map_err(store_err)?;
         drop(stmt);
-        if nodes.is_empty() {
+        if node_rows.is_empty() {
             return Ok(());
         }
+        // Which modules define a given name, so an edge can be pointed at the definition
+        // in the CALLER's own module when one exists.
+        let mut defined_in: HashMap<String, Vec<String>> = HashMap::new();
+        for (m, q) in &node_rows {
+            defined_in.entry(q.clone()).or_default().push(m.clone());
+        }
+        let nodes: Vec<String> = node_rows.iter().map(|(m, q)| node_key(m, q)).collect();
 
         // Free functions (unqualified definition, and no method of the same name):
         // the set a method-syntax edge must NOT be allowed to point at.
@@ -619,15 +654,16 @@ impl SqliteCodeStore {
         drop(stmt);
 
         let mut stmt = conn
-            .prepare("SELECT caller, callee, resolved_callee, is_method FROM calls")
+            .prepare("SELECT caller, callee, resolved_callee, is_method, module FROM calls")
             .map_err(store_err)?;
-        let raw: Vec<(String, String, Option<String>, bool)> = stmt
+        let raw: Vec<(String, String, Option<String>, bool, String)> = stmt
             .query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, Option<String>>(2)?,
                     r.get::<_, i64>(3)? != 0,
+                    r.get::<_, String>(4)?,
                 ))
             })
             .map_err(store_err)?
@@ -636,12 +672,32 @@ impl SqliteCodeStore {
         drop(stmt);
 
         let node_set: std::collections::HashSet<&str> = nodes.iter().map(|s| s.as_str()).collect();
-        let edges: Vec<(&str, &str)> = raw
+        // Both endpoints are keyed by (module, name). The TARGET resolves inside the
+        // CALLER's module whenever that module defines the name — a call to `get` in
+        // `onyx` means `onyx`'s `get`, never a sibling's. Only when the caller's module
+        // does NOT define the name is a cross-module target considered, and then only if
+        // exactly one other module defines it (an unambiguous import); an ambiguous
+        // cross-module name is dropped rather than guessed.
+        let owned: Vec<(String, String)> = raw
             .iter()
-            .filter(|(_, callee, _, is_method)| !(*is_method && free.contains(callee.as_str())))
-            .map(|(caller, callee, resolved, _)| {
-                (caller.as_str(), resolved.as_deref().unwrap_or(callee.as_str()))
+            .filter(|(_, callee, _, is_method, _)| !(*is_method && free.contains(callee.as_str())))
+            .filter_map(|(caller, callee, resolved, _, module)| {
+                let target = resolved.as_deref().unwrap_or(callee.as_str());
+                let from = node_key(module, caller);
+                let owners = defined_in.get(target)?;
+                let to = if owners.iter().any(|m| m == module) {
+                    node_key(module, target)
+                } else if owners.len() == 1 {
+                    node_key(&owners[0], target)
+                } else {
+                    return None;
+                };
+                Some((from, to))
             })
+            .collect();
+        let edges: Vec<(&str, &str)> = owned
+            .iter()
+            .map(|(f, t)| (f.as_str(), t.as_str()))
             .filter(|(f, t)| node_set.contains(f) && node_set.contains(t))
             .collect();
 
@@ -662,15 +718,16 @@ impl SqliteCodeStore {
         let tx = conn.transaction().map_err(store_err)?;
         {
             let mut uf = tx
-                .prepare("UPDATE functions SET rank = ?1 WHERE qualified_name = ?2")
+                .prepare("UPDATE functions SET rank = ?1 WHERE module = ?2 AND qualified_name = ?3")
                 .map_err(store_err)?;
             let mut uc = tx
-                .prepare("UPDATE classes SET rank = ?1 WHERE qualified_name = ?2")
+                .prepare("UPDATE classes SET rank = ?1 WHERE module = ?2 AND qualified_name = ?3")
                 .map_err(store_err)?;
-            for (name, v) in scores {
+            for (key, v) in scores {
                 let norm = (v / max) as f64;
-                uf.execute(rusqlite::params![norm, name]).map_err(store_err)?;
-                uc.execute(rusqlite::params![norm, name]).map_err(store_err)?;
+                let (module, qname) = split_node_key(key);
+                uf.execute(rusqlite::params![norm, module, qname]).map_err(store_err)?;
+                uc.execute(rusqlite::params![norm, module, qname]).map_err(store_err)?;
             }
         }
         tx.commit().map_err(store_err)?;
@@ -1456,6 +1513,7 @@ impl CodeReadStore for SqliteCodeStore {
         let conn = self.conn.lock().map_err(store_err)?;
         let qualified_query = name != last_name_segment(name);
 
+
         // Is the target a FREE function — i.e. is its only definition unqualified?
         // If so, a METHOD call (`x.name()`) CANNOT be calling it: you cannot invoke a
         // free function through a value. Without this, a project that happens to
@@ -2065,8 +2123,8 @@ impl CodeWriteStore for SqliteCodeStore {
         tx.execute("DELETE FROM files WHERE path = ?1", rusqlite::params![file.path])
             .map_err(store_err)?;
         tx.execute(
-            "INSERT INTO files (path, language, content_hash, ast_hash, lines_total, mtime, file_size) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO files (path, language, content_hash, ast_hash, lines_total, mtime, file_size, module) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 file.path,
                 file.language.as_str(),
@@ -2075,6 +2133,7 @@ impl CodeWriteStore for SqliteCodeStore {
                 file.lines_total as i64,
                 file.mtime,
                 file.file_size as i64,
+                file.module,
             ],
         )
         .map_err(store_err)?;
@@ -2085,8 +2144,8 @@ impl CodeWriteStore for SqliteCodeStore {
                 .prepare(
                     "INSERT INTO functions \
                      (file_id, name, qualified_name, path, language, line_start, line_end, \
-                      args, return_type, docstring, body, is_async, search_text, minhash, is_test) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                      args, return_type, docstring, body, is_async, search_text, minhash, is_test, module) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
                 )
                 .map_err(store_err)?;
             for f in functions {
@@ -2116,6 +2175,7 @@ impl CodeWriteStore for SqliteCodeStore {
                     // The parser's own marker (Rust `#[test]`, Go `TestXxx`, …) OR the
                     // file path (`tests/`, `*_test.go`, `*.spec.ts`). Either is enough.
                     (f.is_test || crate::verdict::is_test_path(&f.path)) as i64,
+                    &file.module,
                 ])
                 .map_err(store_err)?;
             }
@@ -2126,8 +2186,8 @@ impl CodeWriteStore for SqliteCodeStore {
                 .prepare(
                     "INSERT INTO classes \
                      (file_id, name, qualified_name, path, language, line_start, line_end, \
-                      bases, docstring, body, node_hash, search_text, minhash) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                      bases, docstring, body, node_hash, search_text, minhash, module) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
                 )
                 .map_err(store_err)?;
             for c in classes {
@@ -2154,6 +2214,7 @@ impl CodeWriteStore for SqliteCodeStore {
                     Option::<String>::None,
                     search_text,
                     crate::minhash::to_blob(&crate::minhash::signature(&c.body)),
+                    &file.module,
                 ])
                 .map_err(store_err)?;
             }
@@ -2184,8 +2245,8 @@ impl CodeWriteStore for SqliteCodeStore {
             let mut stmt = tx
                 .prepare(
                     "INSERT INTO calls \
-                     (file_id, path, caller, callee, receiver, is_method, resolved_callee, confidence, line) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                     (file_id, path, caller, callee, receiver, is_method, module, resolved_callee, confidence, line) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
                 )
                 .map_err(store_err)?;
             for c in calls {
@@ -2202,6 +2263,7 @@ impl CodeWriteStore for SqliteCodeStore {
                     c.callee,
                     c.receiver,
                     c.is_method as i64,
+                    &file.module,
                     guess,
                     CONF_UNRESOLVED as f64, // placeholder until resolve_call_edges runs
                     c.line as i64,
@@ -2930,6 +2992,7 @@ fn map_file_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRecord> {
         lines_total: row.get::<_, i64>(4)? as u32,
         mtime: row.get(5)?,
         file_size: row.get::<_, i64>(6)? as u64,
+        module: row.get::<_, String>("module").unwrap_or_default(),
     })
 }
 
@@ -3002,6 +3065,7 @@ mod adjacency_cache_tests {
             lines_total: 10,
             mtime: 0,
             file_size: 100,
+            module: String::new(),
         }
     }
 
