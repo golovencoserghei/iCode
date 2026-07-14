@@ -268,6 +268,185 @@ impl SqliteCodeStore {
         Vec0Index::new(Arc::clone(&self.conn), schema::VEC_DIM)
     }
 
+    /// Every place `symbol` is referenced, CLASSIFIED — the precise answer to "where
+    /// is this used", which grep cannot give.
+    ///
+    /// Grep matches substrings, so `walk` comes back from inside `walk_source_files`,
+    /// `walker` and the word "sidewalk" in a comment; and it cannot tell a definition
+    /// from a call from an import. This returns:
+    ///
+    ///   * [`RefKind::Definition`] — from `functions`/`classes`.
+    ///   * [`RefKind::Call`]       — from the resolved call graph, so the soundness
+    ///     rule holds: a `.foo()` method call is never credited to a free `fn foo`.
+    ///   * [`RefKind::Import`]     — from `imports` (matched on name OR alias).
+    ///   * [`RefKind::Mention`]    — the identifier appears in a body but is not a
+    ///     call: a type annotation, a struct literal, a path, a trait bound. Matched
+    ///     on IDENTIFIER BOUNDARIES ([`crate::ident::contains_identifier`]).
+    ///
+    /// Lines already reported as a definition or a call are not repeated as mentions.
+    /// Results are ordered definition → call → import → mention, then by path/line.
+    pub fn find_references(&self, symbol: &str, limit: usize) -> Result<Vec<Reference>> {
+        if limit == 0 || symbol.trim().is_empty() {
+            return Ok(vec![]);
+        }
+        let bare = last_name_segment(symbol).to_string();
+        let conn = self.conn.lock().map_err(store_err)?;
+
+        let mut out: Vec<Reference> = Vec::new();
+        // (path, line) pairs already accounted for, so a call site is not ALSO
+        // reported as a mention of itself.
+        let mut claimed: std::collections::HashSet<(String, u32)> = std::collections::HashSet::new();
+
+        // ── definitions ──
+        for table in ["functions", "classes"] {
+            let sql = format!(
+                "SELECT path, line_start FROM {table} WHERE name = ?1 OR qualified_name = ?1"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(store_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![symbol], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32))
+                })
+                .map_err(store_err)?;
+            for row in rows {
+                let (path, line) = row.map_err(store_err)?;
+                claimed.insert((path.clone(), line));
+                out.push(Reference {
+                    kind: RefKind::Definition,
+                    path,
+                    line,
+                    context: String::new(),
+                    text: String::new(),
+                });
+            }
+        }
+
+        // ── calls (same soundness rule as `get_callers`) ──
+        let target_is_free_fn: bool = conn
+            .query_row(
+                "SELECT EXISTS( \
+                   SELECT 1 FROM functions WHERE name = ?1 AND instr(qualified_name, ':') = 0 \
+                 ) AND NOT EXISTS( \
+                   SELECT 1 FROM functions WHERE name = ?1 AND instr(qualified_name, ':') > 0 \
+                 )",
+                rusqlite::params![bare],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(store_err)?
+            != 0;
+        let call_sql = if target_is_free_fn {
+            "SELECT path, line, caller FROM calls \
+             WHERE (callee = ?1 OR resolved_callee = ?1) AND is_method = 0 ORDER BY path, line"
+        } else {
+            "SELECT path, line, caller FROM calls \
+             WHERE callee = ?1 OR resolved_callee = ?1 ORDER BY path, line"
+        };
+        let mut stmt = conn.prepare(call_sql).map_err(store_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![symbol], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as u32,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(store_err)?;
+        for row in rows {
+            let (path, line, caller) = row.map_err(store_err)?;
+            claimed.insert((path.clone(), line));
+            out.push(Reference {
+                kind: RefKind::Call,
+                path,
+                line,
+                context: caller,
+                text: String::new(),
+            });
+        }
+        drop(stmt);
+
+        // ── imports ──
+        let mut stmt = conn
+            .prepare("SELECT path, line, module FROM imports WHERE name = ?1 OR alias = ?1 ORDER BY path, line")
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![bare], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as u32,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(store_err)?;
+        for row in rows {
+            let (path, line, module) = row.map_err(store_err)?;
+            claimed.insert((path.clone(), line));
+            out.push(Reference {
+                kind: RefKind::Import,
+                path,
+                line,
+                context: module,
+                text: String::new(),
+            });
+        }
+        drop(stmt);
+
+        // ── mentions: whole-identifier hits in bodies that are not already claimed ──
+        for table in ["functions", "classes"] {
+            let sql = format!(
+                "SELECT path, line_start, body, qualified_name FROM {table} \
+                 WHERE search_text LIKE '%' || ?1 || '%'"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(store_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![bare], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)? as u32,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(store_err)?;
+            for row in rows {
+                let (path, line_start, body, owner) = row.map_err(store_err)?;
+                for (i, text) in body.lines().enumerate() {
+                    if !crate::ident::contains_identifier(text, &bare) {
+                        continue;
+                    }
+                    let line = line_start + i as u32;
+                    if claimed.contains(&(path.clone(), line)) {
+                        continue;
+                    }
+                    out.push(Reference {
+                        kind: RefKind::Mention,
+                        path: path.clone(),
+                        line,
+                        context: owner.clone(),
+                        text: text.trim().to_string(),
+                    });
+                }
+            }
+        }
+
+        // Definition first, then calls, then imports, then mentions.
+        fn order(k: RefKind) -> u8 {
+            match k {
+                RefKind::Definition => 0,
+                RefKind::Call => 1,
+                RefKind::Import => 2,
+                RefKind::Mention => 3,
+            }
+        }
+        out.sort_by(|a, b| {
+            order(a.kind)
+                .cmp(&order(b.kind))
+                .then_with(|| a.path.cmp(&b.path))
+                .then_with(|| a.line.cmp(&b.line))
+        });
+        out.truncate(limit);
+        Ok(out)
+    }
+
     /// Recompute graph centrality for every symbol and store it in `rank` (0..1).
     ///
     /// BM25 answers "which symbols mention these words"; it cannot say which of six

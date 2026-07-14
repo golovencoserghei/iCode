@@ -95,6 +95,41 @@ pub fn search_text(parts: &[&str]) -> String {
     out.join(" ")
 }
 
+/// Does `line` contain `ident` as a WHOLE identifier?
+///
+/// This is the difference between a reference and a grep hit. `grep walk` matches
+/// inside `walk_source_files`, `walker`, and `sidewalk`; a reference to `walk` does
+/// not. A match requires the character on each side to be a non-identifier character
+/// (or the string edge), which is exactly the boundary the language's lexer uses.
+///
+/// An empty `ident` never matches (it would otherwise match everywhere).
+pub fn contains_identifier(line: &str, ident: &str) -> bool {
+    if ident.is_empty() {
+        return false;
+    }
+    let bytes = line.as_bytes();
+    let needle = ident.as_bytes();
+    let is_ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+
+    let mut from = 0usize;
+    while let Some(rel) = line[from..].find(ident) {
+        let start = from + rel;
+        let end = start + needle.len();
+        let left_ok = start == 0 || !is_ident_byte(bytes[start - 1]);
+        let right_ok = end == bytes.len() || !is_ident_byte(bytes[end]);
+        if left_ok && right_ok {
+            return true;
+        }
+        // Advance past this occurrence; `find` works on byte offsets and `ident` is
+        // ASCII-identifier-shaped, so start+1 is always a char boundary here.
+        from = start + 1;
+        if from >= line.len() {
+            break;
+        }
+    }
+    false
+}
+
 /// Every identifier-shaped run in `text` (`[A-Za-z_][A-Za-z0-9_]*`). Hand-rolled
 /// rather than a regex: this runs over every symbol body on every index pass.
 fn identifiers(text: &str) -> Vec<String> {
@@ -158,6 +193,23 @@ mod tests {
         let body = "handler handler handler handler";
         let t = search_text(&[body]);
         assert_eq!(t, "handler", "repeated identifier is emitted once, got {t:?}");
+    }
+
+    #[test]
+    fn contains_identifier_respects_token_boundaries() {
+        // The whole point: grep would match all three of these; a reference must not.
+        assert!(!contains_identifier("let x = walk_source_files(root);", "walk"));
+        assert!(!contains_identifier("struct Walker;", "Walk"));
+        assert!(!contains_identifier("// sidewalk", "walk"));
+
+        // Real references, in the shapes they actually occur.
+        assert!(contains_identifier("walk(node, src);", "walk"));
+        assert!(contains_identifier("let f = walk;", "walk"));
+        assert!(contains_identifier("self.walk(x)", "walk"));
+        assert!(contains_identifier("Vec<walk>", "walk"));
+        assert!(contains_identifier("walk", "walk"));
+
+        assert!(!contains_identifier("anything", ""));
     }
 
     #[test]

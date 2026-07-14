@@ -344,6 +344,41 @@ pub struct GrepHit {
     pub text: String,
 }
 
+// ──────────────────────────── references ────────────────────────────
+
+/// What a reference to a symbol actually IS. Grep cannot tell these apart — it hands
+/// back a pile of line hits and leaves the agent to guess which one is the definition,
+/// which is a call, and which is a word inside a comment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RefKind {
+    /// Where the symbol is defined.
+    Definition,
+    /// A call site, taken from the resolved call graph (so the method-vs-free-function
+    /// soundness rule applies — a `.foo()` is never credited to a free `fn foo`).
+    Call,
+    /// An import / use site.
+    Import,
+    /// The identifier appears in a symbol's body but is not a call — a type
+    /// annotation, a struct literal, a path, a trait bound. Matched on IDENTIFIER
+    /// boundaries, so `walk` never matches inside `walk_source_files`.
+    Mention,
+}
+
+/// One place a symbol is referenced, classified.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Reference {
+    pub kind: RefKind,
+    pub path: String,
+    pub line: u32,
+    /// The enclosing symbol (for a call: the caller; for a mention: the symbol whose
+    /// body contains it). Empty for a definition.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub context: String,
+    /// The source line, trimmed.
+    pub text: String,
+}
+
 // ──────────────────────────── memory ────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -80,7 +80,7 @@ pub struct SearchArgs {
 pub struct SymbolArgs {
     /// Symbol name (bare or qualified).
     pub name: String,
-    /// context (default) | def | callers | callees | implementations | similar.
+    /// context (default) | def | callers | callees | references | implementations | similar.
     pub op: Option<String>,
     /// Disambiguate a symbol defined in several files.
     pub file_hint: Option<String>,
@@ -774,6 +774,19 @@ impl CodeMcpServer {
         }
     }
 
+    async fn find_references(&self, Parameters(args): Parameters<CallersArgs>) -> String {
+        let store = self.store.clone();
+        let limit = args.limit.unwrap_or(100);
+        let name = args.name;
+        let result =
+            tokio::task::spawn_blocking(move || store.find_references(&name, limit)).await;
+        match result {
+            Ok(Ok(refs)) => to_json(&refs),
+            Ok(Err(e)) => err_json(&e.to_string()),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }
+
     /// No embedder gate any more: similarity is MinHash over token shingles, so this
     /// works with Ollama down — and it answers the question actually being asked
     /// ("code shaped like this") rather than "code about the same topic".
@@ -1445,7 +1458,7 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Everything about a symbol. op: context (default: def+callers+callees) | def | callers | callees | implementations | similar.")]
+    #[tool(description = "Everything about a symbol. op: context (default: def+callers+callees) | def | callers | callees | references (every use, classified: definition/call/import/mention - precise, not grep) | implementations | similar.")]
     async fn symbol(&self, Parameters(a): Parameters<SymbolArgs>) -> String {
         match a.op.as_deref().unwrap_or("context") {
             "def" => {
@@ -1483,6 +1496,13 @@ impl CodeMcpServer {
             "implementations" => {
                 self.find_implementations(Parameters(ImplementationsArgs { name: a.name }))
                     .await
+            }
+            "references" => {
+                self.find_references(Parameters(CallersArgs {
+                    name: a.name,
+                    limit: a.limit,
+                }))
+                .await
             }
             "similar" => {
                 self.find_similar(Parameters(FindSimilarArgs {
