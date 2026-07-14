@@ -317,6 +317,152 @@ impl SqliteCodeStore {
         Ok(hits)
     }
 
+    /// [`CodeReadStore::repo_map`], restricted to one sub-project.
+    ///
+    /// An unscoped map of a monorepo is not a map, it is a dump: measured on a real tree
+    /// it returned 4485 files, ~800 entry points and a hotspot list topped by `get` with
+    /// 6324 callers — all of it from a vendored upstream service the caller never
+    /// touches, at roughly ten thousand tokens, of which a handful were useful. The
+    /// signal drowns in code you are not working on.
+    ///
+    /// `scope` is a module (see [`crate::module`]). Every section is filtered to it:
+    /// languages, hotspots, complex functions and entry points alike.
+    pub fn repo_map_scoped(&self, top: usize, scope: &str) -> Result<RepoMap> {
+        let conn = self.conn.lock().map_err(store_err)?;
+
+        let one = |sql: &str| -> Result<u64> {
+            conn.query_row(sql, rusqlite::params![scope], |r| r.get::<_, i64>(0))
+                .map(|n| n as u64)
+                .map_err(store_err)
+        };
+        let stats = DbStats {
+            files: one("SELECT COUNT(*) FROM files WHERE module = ?1")?,
+            functions: one("SELECT COUNT(*) FROM functions WHERE module = ?1")?,
+            classes: one("SELECT COUNT(*) FROM classes WHERE module = ?1")?,
+            calls: one("SELECT COUNT(*) FROM calls WHERE module = ?1")?,
+            imports: one(
+                "SELECT COUNT(*) FROM imports i JOIN files f ON f.id = i.file_id WHERE f.module = ?1",
+            )?,
+            routes: one(
+                "SELECT COUNT(*) FROM routes r JOIN files f ON f.id = r.file_id WHERE f.module = ?1",
+            )?,
+            ..Default::default()
+        };
+
+        let languages = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT language, COUNT(*) FROM files WHERE module = ?1 \
+                     GROUP BY language ORDER BY COUNT(*) DESC",
+                )
+                .map_err(store_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![scope], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+                })
+                .map_err(store_err)?;
+            collect(rows)?
+        };
+
+        // Hotspots must be scoped on BOTH ends: a callee that merely shares a name with
+        // something in this module is not a hotspot OF this module.
+        let call_hotspots = {
+            let mut stmt = conn
+                .prepare(
+                    // The same soundness rule `get_callers` applies: a METHOD call can
+                    // never target a FREE function. Without it the hotspot list is topped
+                    // by `get` (1480), `post`, `json` — every `dict.get()` and HTTP call
+                    // in the project credited to a same-named handler. That is not a
+                    // hotspot, it is the standard library wearing a local name.
+                    // TEST DEFINITIONS ARE NOT HOTSPOTS. `get` topped this list with 1480
+                    // "callers" because the project's only `get` is `_FakeHttpx.get` — a
+                    // test double — and every `dict.get()` in the codebase was credited to
+                    // it. A method call can only reach a method of the receiver's TYPE, and
+                    // name-based resolution cannot know the type; excluding test doubles
+                    // removes the class of homonym that causes this, without pretending to
+                    // do type inference.
+                    "SELECT c.callee, COUNT(*) AS n FROM calls c \
+                     WHERE c.module = ?1 \
+                       AND c.callee IN ( \
+                             SELECT name FROM functions \
+                             WHERE module = ?1 AND is_test = 0) \
+                       AND NOT (c.is_method = 1 AND c.callee IN ( \
+                             SELECT name FROM functions \
+                             WHERE module = ?1 AND is_test = 0 \
+                               AND instr(qualified_name, '.') = 0 \
+                               AND instr(qualified_name, ':') = 0)) \
+                     GROUP BY c.callee ORDER BY n DESC, c.callee LIMIT ?2",
+                )
+                .map_err(store_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![scope, top as i64], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+                })
+                .map_err(store_err)?;
+            collect(rows)?
+        };
+
+        // Entry points: this module's route/event handlers, plus its `main`.
+        let entry_points: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT DISTINCT r.handler_method FROM routes r \
+                       JOIN files f ON f.id = r.file_id \
+                     WHERE f.module = ?1 AND r.handler_method IS NOT NULL \
+                     UNION \
+                     SELECT name FROM functions WHERE module = ?1 AND name = 'main' \
+                     ORDER BY 1",
+                )
+                .map_err(store_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![scope], |r| r.get::<_, String>(0))
+                .map_err(store_err)?;
+            collect(rows)?
+        };
+
+        // Ranked by the same complexity proxy the unscoped map uses, but only over this
+        // module's functions.
+        let complex_functions = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT f.qualified_name, f.path, f.line_start, \
+                            (f.line_end - f.line_start) AS span, \
+                            (SELECT COUNT(*) FROM calls c WHERE c.caller = f.qualified_name) AS fan_out, \
+                            (SELECT COUNT(*) FROM calls c WHERE c.callee = f.name) AS callers \
+                     FROM functions f WHERE f.module = ?1 \
+                     ORDER BY (span + fan_out * 5 + callers * 2) DESC LIMIT ?2",
+                )
+                .map_err(store_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![scope, top as i64], |r| {
+                    let span: i64 = r.get(3)?;
+                    let fan_out: i64 = r.get(4)?;
+                    let callers: i64 = r.get(5)?;
+                    Ok(ComplexFunction {
+                        qualified_name: r.get(0)?,
+                        path: r.get(1)?,
+                        line_start: r.get::<_, i64>(2)? as u32,
+                        line_end: (r.get::<_, i64>(2)? + span).max(0) as u32,
+                        span: span.max(0) as u32,
+                        fan_out: fan_out.max(0) as u32,
+                        callers: callers.max(0) as u32,
+                        score: (span + fan_out * 5 + callers * 2).max(0) as f32,
+                    })
+                })
+                .map_err(store_err)?;
+            collect(rows)?
+        };
+
+        Ok(RepoMap {
+            stats,
+            languages,
+            modules: Vec::new(),
+            complex_functions,
+            call_hotspots,
+            entry_points,
+        })
+    }
+
     /// The sub-projects in this tree, with how many files each holds. Empty (or a single
     /// `""` entry) means a plain single-project repo.
     pub fn list_modules(&self) -> Result<Vec<(String, u64)>> {

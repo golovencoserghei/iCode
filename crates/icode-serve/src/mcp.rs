@@ -111,6 +111,8 @@ pub struct GraphArgs {
 pub struct MapArgs {
     /// Entries per section (default 30).
     pub top: Option<usize>,
+    /// Sub-project to map (a monorepo member). Omit to list the members.
+    pub scope: Option<String>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -1606,9 +1608,46 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Architecture overview in one call: stats, languages, modules, complex symbols, hotspots.")]
+    #[tool(description = "Architecture overview: stats, languages, hotspots, entry points, complex symbols. In a monorepo, call it WITHOUT scope first to list the sub-projects, then with scope=<member> to map one.")]
     async fn map(&self, Parameters(a): Parameters<MapArgs>) -> String {
-        self.get_repo_map(Parameters(RepoMapArgs { top: a.top })).await
+        let store = self.store.clone();
+        let top = a.top.unwrap_or(30);
+        let scope = a.scope.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            if let Some(scope) = scope.filter(|s| !s.trim().is_empty()) {
+                return store.repo_map_scoped(top, &scope).map(MapReply::Scoped);
+            }
+            // No scope. In a MONOREPO, dumping the whole tree is not a map — measured on
+            // a real one it returned 4485 files, ~800 entry points and a hotspot list
+            // topped by a `get` with 6324 callers, all from a vendored upstream service
+            // the caller never touches: ~10k tokens, a handful of them useful. So when
+            // the tree has real members, answer with the MEMBERS and let the caller pick
+            // one. A single-project repo has no members and gets the full map as before.
+            let modules = store.list_modules()?;
+            let members: Vec<(String, u64)> =
+                modules.into_iter().filter(|(m, _)| !m.is_empty()).collect();
+            if members.len() > 1 {
+                return Ok(MapReply::Members(members));
+            }
+            store.repo_map(top).map(MapReply::Scoped)
+        })
+        .await;
+        match result {
+            Ok(Ok(MapReply::Scoped(map))) => to_json(&map),
+            Ok(Ok(MapReply::Members(members))) => serde_json::json!({
+                "monorepo": true,
+                "hint": "this tree holds several sub-projects; call map again with scope=<name> \
+                         (and search/symbol accept the same scope) — an unscoped map here is a \
+                         dump, not a map",
+                "sub_projects": members
+                    .iter()
+                    .map(|(m, n)| serde_json::json!({ "name": m, "files": n }))
+                    .collect::<Vec<_>>(),
+            })
+            .to_string(),
+            Ok(Err(e)) => err_json(&e.to_string()),
+            Err(e) => err_json(&e.to_string()),
+        }
     }
 
     #[tool(description = "Files. op: outline (symbols in a file) | list | stat | read (needs start/end).")]
@@ -1958,6 +1997,13 @@ fn jit_embed(store: &SqliteCodeStore, embedder: &dyn Embedder) {
 
 fn to_json<T: serde::Serialize>(value: &T) -> String {
     serde_json::to_string(value).unwrap_or_else(|e| err_json(&e.to_string()))
+}
+
+/// `map` answers with either a real map or, in an unscoped monorepo, the list of members
+/// to scope into.
+enum MapReply {
+    Scoped(icode_core::model::RepoMap),
+    Members(Vec<(String, u64)>),
 }
 
 fn err_json(msg: &str) -> String {

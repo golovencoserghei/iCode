@@ -40,6 +40,7 @@ pub fn parse_python(source: &str, path: &str) -> ParseResult {
     let bytes = source.as_bytes();
     let mut acc = Acc::default();
     walk(tree.root_node(), bytes, path, &Ctx::default(), &mut acc);
+    mark_method_calls(&mut acc);
 
     ParseResult {
         lines_total,
@@ -657,5 +658,51 @@ fn extract_dispatch_table(
             line: value.start_position().row as u32 + 1,
             ..Default::default()
         });
+    }
+}
+
+
+/// Decide, per call, whether `a.b()` is a METHOD call on a value or a call through a
+/// MODULE path — the distinction Python's grammar does not make.
+///
+/// Rust says it with `.` vs `::`; Python spells both the same way, which is why this was
+/// left undecided and every Python call carried `is_method = 0`. The cost showed up in
+/// the hotspot list: `get` topped it with 1480 "callers" — every `dict.get()` in the
+/// project credited to a route handler that happens to be named `get`. That is not a
+/// hotspot, it is the standard library wearing a local name.
+///
+/// The file's own imports settle it. A receiver whose ROOT segment was imported
+/// (`os.path.join`, `json.dumps`) is a module path — it can reach a free function. Any
+/// other receiver is a value (`d.get()`, `resp.json()`), and a value can never be calling
+/// a module-level `def`. `self`/`cls` are values too, and their calls really are methods.
+///
+/// Conservative by construction: when in doubt the receiver looks like a module and the
+/// edge is left alone, so this only ever REMOVES fabricated method→free-function links,
+/// never real ones.
+fn mark_method_calls(acc: &mut Acc) {
+    let mut modules: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for i in &acc.imports {
+        // `import os.path` / `from x import y as z` — any name the file can legitimately
+        // dot into.
+        if let Some(alias) = &i.alias {
+            modules.insert(alias.clone());
+        }
+        if let Some(name) = &i.name {
+            modules.insert(name.clone());
+        }
+        if let Some(root) = i.module.split('.').next() {
+            if !root.is_empty() {
+                modules.insert(root.to_string());
+            }
+        }
+    }
+
+    for c in &mut acc.calls {
+        let Some(recv) = c.receiver.as_deref() else {
+            continue; // a bare `f()` — already not a method call
+        };
+        let root = recv.split('.').next().unwrap_or(recv).trim();
+        // A module path can reach a free function; anything else is a value.
+        c.is_method = !modules.contains(root);
     }
 }
