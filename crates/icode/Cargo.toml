@@ -15,6 +15,9 @@ icode-engine = { workspace = true }
 icode-embed = { workspace = true }
 icode-serve = { workspace = true }
 anyhow = { workspace = true }
+# Daemon lifecycle: detach the watcher into its own session (setsid) and probe/stop
+# it by PID. The lock itself lives in icode-engine.
+libc = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 

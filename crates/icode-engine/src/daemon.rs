@@ -142,6 +142,11 @@ fn process_batch(root: &Path, store: &SqliteCodeStore, mut paths: Vec<PathBuf>) 
         if path.exists() {
             // Created or modified → re-index (replaces the file's old rows).
             match index_one_file(&path, store, root) {
+                // A watcher event does NOT mean the bytes changed (atomic saves,
+                // `touch`, a container remounting the tree). `index_one_file` now
+                // hash-skips those and reports them as skipped, so an idle project
+                // costs a read + a hash instead of a reparse.
+                Ok(s) if s.files_indexed == 0 => {}
                 Ok(_) => reindexed += 1,
                 Err(e) => {
                     // A parse/read failure of one file must not kill the daemon.
@@ -160,6 +165,15 @@ fn process_batch(root: &Path, store: &SqliteCodeStore, mut paths: Vec<PathBuf>) 
 
     if reindexed == 0 && deleted == 0 {
         return; // batch was all noise (excluded/unsupported paths)
+    }
+
+    // Graph centrality is a WHOLE-GRAPH property: editing one file can change the rank
+    // of symbols in another. `index_one_file` only resolves the touched file's edges,
+    // so without this the `rank` column silently drifts away from the graph it is meant
+    // to describe — and search ranking quietly degrades the longer the daemon runs.
+    // Cheap: a few passes over the edge list, no parse, no I/O.
+    if let Err(e) = store.compute_symbol_ranks() {
+        log(&format!("daemon: rank refresh failed ({e}) — ranking may be stale"));
     }
 
     // Graph only. The re-index nulled out the replaced chunks' vectors; they now

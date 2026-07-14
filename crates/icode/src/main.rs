@@ -161,11 +161,28 @@ enum HookAction {
 
 #[derive(Subcommand)]
 enum DaemonAction {
-    /// Run the watcher in the foreground: initial sync, then live-reindex on every
-    /// change until Ctrl-C. One daemon per project (PID-locked). status/stop over
-    /// IPC are future work — for now stop the foreground process directly.
+    /// Run the watcher in the FOREGROUND: initial sync, then live-reindex on every
+    /// change until Ctrl-C. One daemon per project (flock'd). Use `start` for the
+    /// detached form.
     Run {
         /// Project root to watch and keep indexed.
+        path: PathBuf,
+    },
+    /// Start the watcher DETACHED (its own session, survives the terminal closing).
+    /// Logs to `<path>/.icode/daemon.log`. Idempotent: if one is already running for
+    /// this project, says so and does nothing.
+    Start {
+        /// Project root to watch and keep indexed.
+        path: PathBuf,
+    },
+    /// Is a daemon watching this project? Prints its PID, or that none is running.
+    Status {
+        /// Project root to check.
+        path: PathBuf,
+    },
+    /// Stop the daemon watching this project (SIGTERM).
+    Stop {
+        /// Project root whose daemon to stop.
         path: PathBuf,
     },
 }
@@ -179,6 +196,9 @@ fn main() -> anyhow::Result<()> {
         Command::Web { path, port } => run_web(path, port),
         Command::Daemon { action } => match action {
             DaemonAction::Run { path } => run_daemon_cmd(&path),
+            DaemonAction::Start { path } => run_daemon_start(&path),
+            DaemonAction::Status { path } => run_daemon_status(&path),
+            DaemonAction::Stop { path } => run_daemon_stop(&path),
         },
         Command::Stats { path } => run_stats(&path),
         Command::Doctor { path } => run_doctor(&path),
@@ -657,6 +677,28 @@ fn run_serve(path: Option<PathBuf>) -> anyhow::Result<()> {
             Err(e) => eprintln!("icode serve: graph sync skipped ({e}); serving existing index"),
         }
 
+        // The startup sync is a SNAPSHOT: it makes the graph true at 0 s and steadily
+        // less true from then on, as the session edits files. A stale graph does not
+        // merely omit things — it asserts that code still exists, still calls what it
+        // used to, and is still reachable. An agent believes it.
+        //
+        // So the watcher is started here rather than left as a chore the user has to
+        // remember: one detached daemon per project, flock'd so several editor windows
+        // cannot race, idle when nothing changes. `ICODE_NO_DAEMON=1` opts out.
+        let want_daemon = std::env::var("ICODE_NO_DAEMON")
+            .map(|v| !matches!(v.trim(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(true);
+        if want_daemon {
+            match daemon_pid(&root) {
+                Some(pid) => eprintln!("icode serve: watcher already running (pid {pid})"),
+                None => match spawn_daemon(&root) {
+                    Ok(()) => eprintln!("icode serve: watcher started — the graph stays live"),
+                    // Never fatal: a served snapshot is still useful.
+                    Err(e) => eprintln!("icode serve: could not start the watcher ({e})"),
+                },
+            }
+        }
+
         // Bulk embedding on startup is OPT-IN: `serve` must stay light. A developer
         // keeps several editor windows open and EACH spawns its own server — auto-
         // draining from every one of them hammers the local model and pins it (~800 MB)
@@ -718,6 +760,124 @@ fn run_web(path: PathBuf, port: u16) -> anyhow::Result<()> {
 /// `icode embed`), so a `git checkout` storm never churns the embedder. The
 /// single-writer PID-lock inside `run_daemon` rejects a second daemon on the same
 /// project with a clear error.
+/// The PID of the daemon watching `root`, if one is alive.
+///
+/// The lock file carries the holder's PID; the flock itself is what guarantees
+/// single-writer, so a stale PID in the file after a crash is harmless — we probe
+/// liveness with `kill(pid, 0)` rather than trusting the file.
+fn daemon_pid(root: &std::path::Path) -> Option<i32> {
+    let pid: i32 = std::fs::read_to_string(root.join(".icode/daemon.lock"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    // Signal 0 = existence/permission probe, sends nothing.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        Some(pid)
+    } else {
+        None
+    }
+}
+
+/// `icode daemon start <path>` — spawn the watcher DETACHED and return immediately.
+///
+/// Without this the daemon was foreground-only, so in practice nobody ran one and the
+/// graph went stale between indexes — which is worse than it sounds, because a stale
+/// graph does not merely omit things, it ASSERTS things that are no longer true.
+///
+/// Detachment is `setsid` in the child: a new session with no controlling terminal, so
+/// closing the shell does not SIGHUP it. Output goes to `<path>/.icode/daemon.log`.
+/// Idempotent — the flock in the child decides who wins, so a double `start` is safe.
+fn run_daemon_start(path: &std::path::Path) -> anyhow::Result<()> {
+    let root = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if let Some(pid) = daemon_pid(&root) {
+        println!("daemon already running for {} (pid {pid})", root.display());
+        return Ok(());
+    }
+    spawn_daemon(&root)?;
+
+    // The child writes its PID into the lock file only once it has taken the flock, so
+    // reading it immediately races and reports "not running" for a daemon that is in
+    // fact starting. Wait briefly for it to appear rather than lie.
+    for _ in 0..50 {
+        if let Some(pid) = daemon_pid(&root) {
+            println!(
+                "daemon started for {} (pid {pid}) — logging to {}",
+                root.display(),
+                root.join(".icode/daemon.log").display()
+            );
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(40));
+    }
+    println!(
+        "daemon spawned for {} but it has not taken the lock yet — check {}",
+        root.display(),
+        root.join(".icode/daemon.log").display()
+    );
+    Ok(())
+}
+
+/// Spawn `icode daemon run <root>` in its own session, logging to `.icode/daemon.log`.
+/// Best-effort and non-blocking: the caller does not wait on the child.
+fn spawn_daemon(root: &std::path::Path) -> anyhow::Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let dir = root.join(".icode");
+    std::fs::create_dir_all(&dir)?;
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("daemon.log"))?;
+    let log_err = log.try_clone()?;
+
+    let mut cmd = std::process::Command::new(icode_exe_path());
+    cmd.arg("daemon")
+        .arg("run")
+        .arg(root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log))
+        .stderr(std::process::Stdio::from(log_err));
+    unsafe {
+        // SAFETY: `setsid` is async-signal-safe and this runs in the forked child
+        // before exec. It detaches the child from our controlling terminal so the
+        // watcher outlives the shell that started it.
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    cmd.spawn()?;
+    Ok(())
+}
+
+/// `icode daemon status <path>`.
+fn run_daemon_status(path: &std::path::Path) -> anyhow::Result<()> {
+    let root = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    match daemon_pid(&root) {
+        Some(pid) => println!("daemon RUNNING for {} (pid {pid})", root.display()),
+        None => println!("no daemon for {} — the graph is only as fresh as the last index", root.display()),
+    }
+    Ok(())
+}
+
+/// `icode daemon stop <path>` — SIGTERM the watcher. The flock is released by the
+/// kernel when it exits, so no lock file needs cleaning up.
+fn run_daemon_stop(path: &std::path::Path) -> anyhow::Result<()> {
+    let root = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    match daemon_pid(&root) {
+        Some(pid) => {
+            if unsafe { libc::kill(pid, libc::SIGTERM) } == 0 {
+                println!("daemon stopped for {} (pid {pid})", root.display());
+            } else {
+                println!("could not signal pid {pid}: {}", std::io::Error::last_os_error());
+            }
+        }
+        None => println!("no daemon running for {}", root.display()),
+    }
+    Ok(())
+}
+
 fn run_daemon_cmd(path: &std::path::Path) -> anyhow::Result<()> {
     let store = SqliteCodeStore::open(path).map_err(|e| anyhow::anyhow!(e.to_string()))?;
     icode_engine::run_daemon(path, store).map_err(|e| anyhow::anyhow!(e.to_string()))

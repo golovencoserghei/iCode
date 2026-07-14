@@ -415,6 +415,13 @@ fn mtime_secs(meta: &Metadata) -> i64 {
 /// daemon turns that into a `record_parse_error` and keeps running.
 pub fn index_one_file(path: &Path, store: &SqliteCodeStore, root: &Path) -> Result<IndexStats> {
     let counts = index_file(path, store, root)?;
+    // `index_file` returns zeroed counts when the content hash matched and it skipped
+    // the reparse. Report that as SKIPPED, not indexed: the daemon uses this to decide
+    // whether anything actually changed, and a false "indexed" makes it redo the
+    // whole-graph work (edge resolution, centrality) for nothing.
+    if counts.is_empty() {
+        return Ok(IndexStats { files_skipped: 1, ..Default::default() });
+    }
     // Re-grade this file's outgoing edges against the (already-complete) functions
     // table. Scoped to the one path for speed — the rest of the project is already
     // resolved; only edges whose target def CHANGED in this file could drift, which
@@ -466,6 +473,20 @@ struct FileCounts {
     code_chunks: u64,
 }
 
+impl FileCounts {
+    /// Nothing was written — `index_file` hit the content-hash skip. Distinguishing
+    /// this from a real reindex is what stops the daemon redoing whole-graph work
+    /// (edge resolution, centrality) for a file whose bytes never changed.
+    fn is_empty(&self) -> bool {
+        self.functions == 0
+            && self.classes == 0
+            && self.imports == 0
+            && self.calls == 0
+            && self.routes == 0
+            && self.code_chunks == 0
+    }
+}
+
 /// Parse ONE file and write its graph — the point path the daemon re-runs on a
 /// single changed file. Reads → (size-gates) → parses → `upsert_file` +
 /// `upsert_chunks`. This always reparses (no hash skip): the daemon only calls it
@@ -489,6 +510,34 @@ fn index_file(path: &Path, store: &SqliteCodeStore, root: &Path) -> Result<FileC
 
     let source = std::fs::read_to_string(path).map_err(|e| Error::Io(e.to_string()))?;
     let hash = content_hash(&source);
+
+    // CONTENT-HASH SKIP — the same gate `index_path` applies, which this path was
+    // missing entirely.
+    //
+    // The daemon calls this on every filesystem EVENT, and an event does not mean the
+    // bytes changed: an editor's atomic save, a `touch`, a container remounting the
+    // tree, a git checkout of an identical blob all fire one. Without this gate each
+    // event drove a full tree-sitter reparse plus a rewrite of the file's rows — and
+    // rewriting the rows nulls the chunks' vectors, so it also dragged them back into
+    // the embed queue. Observed on a real project with a few containers running: the
+    // watcher sat at 104% CPU re-indexing 11-19 unchanged files several times a
+    // second, indefinitely.
+    //
+    // A hash of the bytes we already read is nearly free; a reparse is not.
+    if !force_reindex() {
+        if let Ok(Some(prior)) = store.stat_file(&path.to_string_lossy()) {
+            if prior.content_hash == hash {
+                // Same bytes. Mirror a clean reindex and refresh only the metadata, so
+                // a pure mtime/size drift does not keep coming back.
+                let mtime = mtime_secs(&meta);
+                if prior.mtime != mtime || prior.file_size != meta.len() {
+                    store.touch_file_meta(&path.to_string_lossy(), mtime, meta.len())?;
+                }
+                return Ok(FileCounts::default());
+            }
+        }
+    }
+
     // Chunk+persist the file's symbols (graph-fast path: writes code_chunks with NO
     // vectors, so this never blocks on the network — the embed pass fills vectors
     // asynchronously). Keyed by path, idempotent per file.
