@@ -8,10 +8,14 @@
 //! - calls:     free (`f(...)`) and method (`obj.method(...)`) calls, attributed
 //!   to the enclosing function/method; method calls carry the object as receiver.
 //!
-//! Routes stay empty (no framework route DSL extracted here). Docstrings are the
-//! first string literal in a function/class body block, when present.
+//! - routes:    the WIRING that a call graph cannot see — `@router.post("/x")`,
+//!   `@app.route(...)` (Flask) and event/hook decorators (`@client.event`,
+//!   `@bot.command`). The framework invokes these handlers, so no call edge exists;
+//!   without reading the decorator an agent concludes the endpoint is not there.
+//!
+//! Docstrings are the first string literal in a function/class body block.
 
-use icode_core::model::{Call, ClassDef, FunctionDef, Import, Language};
+use icode_core::model::{Call, ClassDef, FunctionDef, Import, Language, Route};
 use sha2::{Digest, Sha256};
 use tree_sitter::{Node, Parser};
 
@@ -44,7 +48,7 @@ pub fn parse_python(source: &str, path: &str) -> ParseResult {
         classes: acc.classes,
         imports: acc.imports,
         calls: acc.calls,
-        routes: Vec::new(),
+        routes: acc.routes,
     }
 }
 
@@ -55,6 +59,7 @@ struct Acc {
     classes: Vec<ClassDef>,
     imports: Vec<Import>,
     calls: Vec<Call>,
+    routes: Vec<Route>,
 }
 
 /// Lexical context carried down the walk. Owned (cloned at the few nesting
@@ -90,6 +95,17 @@ fn walk(node: Node<'_>, src: &[u8], path: &str, ctx: &Ctx, acc: &mut Acc) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
+            // A decorated def is where Python does its WIRING. `@router.post("/x")`
+            // attaches a handler to an HTTP route; `@client.event` attaches one to an
+            // event. Neither produces a call edge — the framework invokes the handler
+            // — so without reading the decorator the graph shows these functions as
+            // called by nobody, and an agent reading the graph concludes the endpoint
+            // does not exist. Measured on a real FastAPI service: 133 endpoints, ALL
+            // invisible.
+            "decorated_definition" => {
+                extract_routes(child, src, path, &mut acc.routes);
+                walk(child, src, path, ctx, acc);
+            }
             "function_definition" => {
                 if let Some(f) = extract_function(child, src, path, &ctx.class_stack) {
                     let qname = f.qualified_name.clone();
@@ -123,6 +139,23 @@ fn walk(node: Node<'_>, src: &[u8], path: &str, ctx: &Ctx, acc: &mut Acc) {
             }
             "import_from_statement" => {
                 extract_import_from(child, src, path, &mut acc.imports);
+            }
+            // A dict of `"key": obj.method` is a DISPATCH TABLE — the other way Python
+            // wires handlers, and the other thing a call graph cannot see. The registry
+            // holds a REFERENCE; the invocation happens later as `self._handlers[name](args)`,
+            // which names no callee at all. So every handler in the table looks like it
+            // is called by nobody.
+            //
+            // Measured on a real agent service: 34 tool handlers dispatched this way, all
+            // of them reported as dead code. An agent reading that graph concludes the
+            // feature is not implemented — the exact failure this is here to stop.
+            //
+            // We emit a reference edge from the function that BUILDS the table, which is
+            // what reachability actually needs: the handler is reachable from wherever
+            // the registry is constructed.
+            "dictionary" => {
+                extract_dispatch_table(child, src, path, ctx.caller.as_deref(), &mut acc.calls);
+                walk(child, src, path, ctx, acc);
             }
             "call" => {
                 if let Some(c) = extract_call(child, src, path, ctx.caller.as_deref()) {
@@ -429,4 +462,200 @@ fn extract_call(node: Node<'_>, src: &[u8], path: &str, caller: Option<&str>) ->
 
 fn node_text(node: Node<'_>, src: &[u8]) -> Option<String> {
     node.utf8_text(src).ok().map(|s| s.to_string())
+}
+
+// ──────────────────────────── routes / event wiring ────────────────────────────
+
+/// HTTP verbs a router/app decorator can carry (`@router.get`, `@app.post`, …).
+const HTTP_VERBS: &[&str] = &["get", "post", "put", "delete", "patch", "head", "options", "websocket"];
+
+/// Decorators that bind a handler to an EVENT rather than a URL: Discord
+/// (`@client.event`, `@bot.command`), pytest-style hooks, generic pub/sub. These are
+/// the "hooks/actions" of a codebase — invoked by a framework, never by a call — so
+/// they are exactly the handlers that look orphaned in a pure call graph.
+const EVENT_DECORATORS: &[&str] = &["event", "command", "on", "listen", "listener", "hook", "subscribe", "task", "step"];
+
+/// Read the wiring off a `decorated_definition`: the decorators attached to a
+/// function tell us what invokes it.
+///
+/// Handles the two shapes that actually occur:
+///   * `@router.post("/x")`      → METHOD=POST, route=/x
+///   * `@app.route("/x", methods=["POST"])` (Flask) → the `methods=` kwarg, else GET
+///   * `@client.event` / `@bot.command(...)` → METHOD=EVENT, route = the handler name
+///
+/// A decorator we do not recognise (`@property`, `@staticmethod`, `@dataclass`) is
+/// skipped: guessing would be worse than saying nothing.
+fn extract_routes(node: Node<'_>, src: &[u8], path: &str, out: &mut Vec<Route>) {
+    // The function this decorator stack is attached to.
+    let mut cursor = node.walk();
+    let def = node
+        .children(&mut cursor)
+        .find(|c| c.kind() == "function_definition");
+    let Some(def) = def else { return };
+    let Some(handler) = def.child_by_field_name("name").and_then(|n| node_text(n, src)) else {
+        return;
+    };
+
+    let mut cursor = node.walk();
+    for dec in node.children(&mut cursor) {
+        if dec.kind() != "decorator" {
+            continue;
+        }
+        let line = dec.start_position().row as u32 + 1;
+        // The decorator payload: either a bare `attribute` (`@client.event`) or a
+        // `call` whose function is an attribute (`@router.post("/x")`).
+        let mut inner = dec.walk();
+        let Some(payload) = dec.children(&mut inner).find(|c| c.kind() == "call" || c.kind() == "attribute") else {
+            continue;
+        };
+
+        let (attr_node, args) = match payload.kind() {
+            "call" => (payload.child_by_field_name("function"), payload.child_by_field_name("arguments")),
+            _ => (Some(payload), None),
+        };
+        let Some(attr) = attr_node else { continue };
+        if attr.kind() != "attribute" {
+            continue;
+        }
+        let Some(verb) = attr.child_by_field_name("attribute").and_then(|n| node_text(n, src)) else {
+            continue;
+        };
+        let verb_lc = verb.to_lowercase();
+
+        // ── HTTP verb decorator: `@router.get("/x")` ──
+        if HTTP_VERBS.contains(&verb_lc.as_str()) {
+            let route = args.and_then(|a| first_string_arg(a, src)).unwrap_or_default();
+            if route.is_empty() {
+                continue;
+            }
+            out.push(Route {
+                path: path.to_string(),
+                method: verb_lc.to_uppercase(),
+                route,
+                handler_class: None,
+                handler_method: Some(handler.clone()),
+                name: None,
+                line,
+            });
+            continue;
+        }
+
+        // ── Flask: `@app.route("/x", methods=["POST"])` ──
+        if verb_lc == "route" {
+            let route = args.and_then(|a| first_string_arg(a, src)).unwrap_or_default();
+            if route.is_empty() {
+                continue;
+            }
+            let methods = args
+                .and_then(|a| node_text(a, src))
+                .map(|t| {
+                    let t = t.to_uppercase();
+                    ["POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
+                        .iter()
+                        .filter(|m| t.contains(**m))
+                        .map(|m| m.to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let methods = if methods.is_empty() { vec!["GET".to_string()] } else { methods };
+            for m in methods {
+                out.push(Route {
+                    path: path.to_string(),
+                    method: m,
+                    route: route.clone(),
+                    handler_class: None,
+                    handler_method: Some(handler.clone()),
+                    name: None,
+                    line,
+                });
+            }
+            continue;
+        }
+
+        // ── Event/hook decorator: the framework calls this, nothing else does ──
+        if EVENT_DECORATORS.contains(&verb_lc.as_str()) {
+            // `@bot.command(name="x")` names the event; a bare `@client.event` uses
+            // the handler's own name (`on_message`).
+            let named = args.and_then(|a| first_string_arg(a, src));
+            out.push(Route {
+                path: path.to_string(),
+                method: "EVENT".to_string(),
+                route: named.unwrap_or_else(|| handler.clone()),
+                handler_class: None,
+                handler_method: Some(handler.clone()),
+                name: Some(verb_lc.clone()),
+                line,
+            });
+        }
+    }
+}
+
+/// The first STRING literal among a call's arguments (`("/x", tags=[...])` → `/x`).
+/// Quotes and any `f`/`r`/`b` prefix are stripped.
+fn first_string_arg(args: Node<'_>, src: &[u8]) -> Option<String> {
+    let mut cursor = args.walk();
+    for arg in args.children(&mut cursor) {
+        if arg.kind() != "string" {
+            continue;
+        }
+        let raw = node_text(arg, src)?;
+        let trimmed = raw
+            .trim_start_matches(|c: char| c.is_ascii_alphabetic())
+            .trim_matches(|c| c == '"' || c == '\'');
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
+/// A dict literal whose values are METHOD REFERENCES is a dispatch table:
+/// `{"list_tasks": h._list_tasks, ...}`. Emit a reference edge to each handler so the
+/// graph stops reporting it as uncalled.
+///
+/// Only `"string": obj.attr` pairs qualify. A value that is a call (`f()`), a literal,
+/// or a comprehension is not a handler reference and is ignored — a wrong edge is worse
+/// than a missing one, because every consumer trusts it.
+///
+/// The edge is attributed to the enclosing function (the one that builds the table).
+/// `is_method` is true: the value is `obj.attr`, so the free-function soundness rule in
+/// `get_callers` applies exactly as it does to a real method call.
+fn extract_dispatch_table(
+    node: Node<'_>,
+    src: &[u8],
+    path: &str,
+    caller: Option<&str>,
+    out: &mut Vec<Call>,
+) {
+    let Some(caller) = caller else { return };
+    let mut cursor = node.walk();
+    for pair in node.children(&mut cursor) {
+        if pair.kind() != "pair" {
+            continue;
+        }
+        // Key must be a string literal — that is what makes it a NAMED dispatch table
+        // rather than an arbitrary mapping.
+        let Some(key) = pair.child_by_field_name("key") else { continue };
+        if key.kind() != "string" {
+            continue;
+        }
+        let Some(value) = pair.child_by_field_name("value") else { continue };
+        if value.kind() != "attribute" {
+            continue;
+        }
+        let Some(callee) = value.child_by_field_name("attribute").and_then(|n| node_text(n, src))
+        else {
+            continue;
+        };
+        let receiver = value.child_by_field_name("object").and_then(|n| node_text(n, src));
+        out.push(Call {
+            path: path.to_string(),
+            caller: caller.to_string(),
+            callee,
+            receiver,
+            is_method: true,
+            line: value.start_position().row as u32 + 1,
+            ..Default::default()
+        });
+    }
 }

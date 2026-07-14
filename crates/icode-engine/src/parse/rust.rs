@@ -449,8 +449,35 @@ fn extract_call(node: Node<'_>, src: &[u8], path: &str, caller: Option<&str>) ->
             let callee = func.child_by_field_name("field").and_then(|n| node_text(n, src))?;
             (callee, receiver, true)
         }
-        // generic_function (turbofish) etc.: fall back to the raw function text.
-        _ => (node_text(func, src)?, None, false),
+        // Turbofish: `foo::<T>()`, `x.collect::<Vec<_>>()`, `Ok::<_, E>(v)`. tree-sitter
+        // wraps the real callee in a `generic_function` whose `function` field holds it,
+        // so recurse into that field rather than stringifying the whole expression.
+        //
+        // The old fallback took `node_text(func)` — the RAW SOURCE of the call
+        // expression — as the callee name. That put 132 junk rows in the call graph,
+        // 8 of them multi-line chunks of code sitting in a `callee` column, e.g.
+        // `"(0..hashes.len())\n    .map(|i| format!(\"?{}\", i + 2)"`. Every consumer
+        // (callers, impact, centrality, dead-code) had to carry that noise.
+        "generic_function" => {
+            let inner = func.child_by_field_name("function")?;
+            match inner.kind() {
+                "field_expression" => {
+                    let receiver = inner.child_by_field_name("value").and_then(|n| node_text(n, src));
+                    let callee = inner.child_by_field_name("field").and_then(|n| node_text(n, src))?;
+                    (callee, receiver, true)
+                }
+                "scoped_identifier" => {
+                    let receiver = inner.child_by_field_name("path").and_then(|n| node_text(n, src));
+                    let callee = inner.child_by_field_name("name").and_then(|n| node_text(n, src))?;
+                    (callee, receiver, false)
+                }
+                _ => (node_text(inner, src)?, None, false),
+            }
+        }
+        // Anything else (a call on a parenthesised expression, an index, …) has no
+        // nameable callee. Dropping it is correct: a bogus name is worse than a
+        // missing edge, because every downstream consumer trusts the name.
+        _ => return None,
     };
 
     Some(Call {
