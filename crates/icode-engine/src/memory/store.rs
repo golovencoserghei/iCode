@@ -1103,6 +1103,162 @@ fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+// ──────────────────────────── project rename ────────────────────────────
+
+/// What a project rename did (or, for a dry run, would do).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RenameReport {
+    /// Memory records moved to the new name.
+    pub memories: usize,
+    /// Records already under the new name (non-zero only with `merge`).
+    pub already_under_new: usize,
+    /// The `projects` registry row was moved (or merged into an existing one).
+    pub registry_moved: bool,
+}
+
+/// A project name that can be used as a rename target: non-empty, no path
+/// separators or whitespace, and not in the reserved `__*` namespace.
+pub fn validate_project_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.contains(['/', '\\'])
+        || name.chars().any(char::is_whitespace)
+        || is_reserved_project(name)
+    {
+        return Err(Error::Store(format!(
+            "invalid project name {name:?}: must be non-empty, without slashes or whitespace, \
+             and not start with `__`"
+        )));
+    }
+    Ok(())
+}
+
+impl SqliteMemoryStore {
+    /// Re-home every memory of project `old` under `new`.
+    ///
+    /// The project is stored in THREE places that must move together: the
+    /// `memories.project` column, the project suffix inside each id
+    /// (`mem_<ulid>__<project>` — `MemoryId::project()` routes by it), and the
+    /// `mem_rowid` bridge that keys the vec0/fts rows by that id. Vectors and the
+    /// fts index key on the integer rowid, so they need no rewrite. The registry
+    /// row follows, optionally with a new `root_path`.
+    ///
+    /// Refuses when `new` already holds memories unless `merge` is set (a merge
+    /// keeps both sets; ids cannot collide because the ulid part is unique).
+    /// With `apply == false` nothing is written. All-or-nothing: one transaction.
+    pub fn rename_project(
+        &self,
+        old: &str,
+        new: &str,
+        root_path: Option<&str>,
+        merge: bool,
+        apply: bool,
+    ) -> Result<RenameReport> {
+        validate_project_name(old)?;
+        validate_project_name(new)?;
+        if old == new {
+            return Err(Error::Store("old and new project names are the same".into()));
+        }
+        let mut conn = self.conn.lock().map_err(store_err)?;
+        let count = |c: &Connection, p: &str| -> Result<usize> {
+            c.query_row("SELECT COUNT(*) FROM memories WHERE project = ?1", [p], |r| {
+                r.get::<_, i64>(0)
+            })
+            .map(|n| n as usize)
+            .map_err(store_err)
+        };
+        let has_registry = |c: &Connection, p: &str| -> Result<bool> {
+            c.query_row("SELECT COUNT(*) FROM projects WHERE name = ?1", [p], |r| {
+                r.get::<_, i64>(0)
+            })
+            .map(|n| n > 0)
+            .map_err(store_err)
+        };
+
+        let memories = count(&conn, old)?;
+        let already_under_new = count(&conn, new)?;
+        let old_registered = has_registry(&conn, old)?;
+        if memories == 0 && !old_registered {
+            return Err(Error::Store(format!("project {old:?} has no memories and is not registered")));
+        }
+        if already_under_new > 0 && !merge {
+            return Err(Error::Store(format!(
+                "project {new:?} already holds {already_under_new} memories; pass merge to combine them"
+            )));
+        }
+        let report = RenameReport { memories, already_under_new, registry_moved: old_registered };
+        if !apply {
+            return Ok(report);
+        }
+
+        let suffix = format!("__{old}");
+        let tx = conn.transaction().map_err(store_err)?;
+        let ids: Vec<String> = {
+            let mut st = tx
+                .prepare("SELECT id FROM memories WHERE project = ?1")
+                .map_err(store_err)?;
+            let rows = st.query_map([old], |r| r.get::<_, String>(0)).map_err(store_err)?;
+            rows.collect::<std::result::Result<_, _>>().map_err(store_err)?
+        };
+        for id in &ids {
+            let new_id = match id.strip_suffix(&suffix) {
+                Some(stem) => format!("{stem}__{new}"),
+                // An id that does not carry the project suffix keeps its id.
+                None => id.clone(),
+            };
+            tx.execute(
+                "UPDATE memories SET project = ?1, id = ?2 WHERE id = ?3",
+                params![new, new_id, id],
+            )
+            .map_err(store_err)?;
+            if &new_id != id {
+                tx.execute(
+                    "UPDATE mem_rowid SET mem_id = ?1 WHERE mem_id = ?2",
+                    params![new_id, id],
+                )
+                .map_err(store_err)?;
+            }
+        }
+        if old_registered {
+            if has_registry(&tx, new)? {
+                // The new name was already touched by a session: keep its row, take
+                // the older created_at and the explicit/known root_path.
+                let (old_root, old_created): (Option<String>, Option<String>) = tx
+                    .query_row(
+                        "SELECT root_path, created_at FROM projects WHERE name = ?1",
+                        [old],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .map_err(store_err)?;
+                tx.execute(
+                    "UPDATE projects SET \
+                       root_path = COALESCE(?1, root_path, ?2), \
+                       created_at = COALESCE(MIN(created_at, ?3), created_at, ?3) \
+                     WHERE name = ?4",
+                    params![root_path, old_root, old_created, new],
+                )
+                .map_err(store_err)?;
+                tx.execute("DELETE FROM projects WHERE name = ?1", [old]).map_err(store_err)?;
+            } else {
+                tx.execute("UPDATE projects SET name = ?1 WHERE name = ?2", params![new, old])
+                    .map_err(store_err)?;
+                if let Some(rp) = root_path {
+                    tx.execute("UPDATE projects SET root_path = ?1 WHERE name = ?2", params![rp, new])
+                        .map_err(store_err)?;
+                }
+            }
+        } else if let Some(rp) = root_path {
+            tx.execute(
+                "INSERT INTO projects (name, root_path, created_at) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(name) DO UPDATE SET root_path = ?2",
+                params![new, rp, now_iso()],
+            )
+            .map_err(store_err)?;
+        }
+        tx.commit().map_err(store_err)?;
+        Ok(report)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

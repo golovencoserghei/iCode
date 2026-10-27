@@ -80,6 +80,26 @@ enum Command {
         #[arg(long, default_value_t = 0.8)]
         dup_similarity: f64,
     },
+    /// Re-home a project's memory under a new name after you renamed its directory
+    /// (memories, ids, project registry, verification ledger). Dry run unless
+    /// `--apply`. Works without Ollama.
+    RenameProject {
+        /// Current project name in memory (see `memory(op="projects")`).
+        old: String,
+        /// New project name — what the renamed directory / git repo is called.
+        new: String,
+        /// The renamed project directory: records its new location in the registry
+        /// and checks that the name sessions will derive from it matches <new>.
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// <new> already holds memories (a session ran under the new name): combine
+        /// both sets instead of refusing.
+        #[arg(long)]
+        merge: bool,
+        /// Actually rename. Without it, only report what would change.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Verification ledger: what has actually been PROVEN about a tree.
     Verify {
         #[command(subcommand)]
@@ -329,6 +349,13 @@ fn main() -> anyhow::Result<()> {
             stale_days,
             dup_similarity,
         } => run_curate(&project, apply, stale_days, dup_similarity),
+        Command::RenameProject {
+            old,
+            new,
+            path,
+            merge,
+            apply,
+        } => run_rename_project(&old, &new, path, merge, apply),
         Command::Verify { action } => run_verify(action),
         Command::Vault { file, action } => vault_cli::run(file, action),
         Command::Setup { project_path } => run_setup(project_path.as_deref()),
@@ -409,6 +436,63 @@ fn run_curate(
         println!("\narchived (reversible: memory search with include_resolved)");
     } else {
         println!("\nreport only — re-run with --apply to archive");
+    }
+    Ok(())
+}
+
+/// `icode rename-project <old> <new>` — follow a renamed directory with its memory.
+///
+/// Memory is keyed by project NAME (the git-repo basename), so renaming the folder
+/// silently orphans everything saved under the old name: the next session starts
+/// as an unknown project. This moves the central records, the registry row and the
+/// verification ledger to the new name in one step.
+fn run_rename_project(
+    old: &str,
+    new: &str,
+    path: Option<PathBuf>,
+    merge: bool,
+    apply: bool,
+) -> anyhow::Result<()> {
+    let root = path.map(existing_root).transpose()?;
+    if let Some(root) = &root {
+        let derived = hook_project(None, Some(root));
+        if derived != new {
+            eprintln!(
+                "warning: sessions opened in {} will use project {:?}, not {:?} — \
+                 rename the directory/repo to match, or memory will split again",
+                root.display(),
+                derived,
+                new
+            );
+        }
+    }
+    let store = icode_engine::SqliteMemoryStore::open_readonly(&central_db_path())
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let root_str = root.as_ref().map(|r| r.to_string_lossy().into_owned());
+    let report = store
+        .rename_project(old, new, root_str.as_deref(), merge, apply)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let verbs = if apply { "moved" } else { "would move" };
+    println!("{old} → {new}");
+    println!("  memories {verbs}: {}", report.memories);
+    if report.already_under_new > 0 {
+        println!("  already under {new} (merged with): {}", report.already_under_new);
+    }
+    if report.registry_moved {
+        println!("  project registry row {verbs}");
+    }
+    let log = icode_engine::VerifyLog::open_default().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    if apply {
+        let runs = log.rename_project(old, new).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        println!("  verification runs moved: {runs}");
+        println!("\ndone. If the directory moved, refresh its code index (paths are absolute):");
+        match &root {
+            Some(r) => println!("  icode index {}", r.display()),
+            None => println!("  icode index <new-dir>"),
+        }
+        println!("and re-open your MCP/session with project=\"{new}\".");
+    } else {
+        println!("\nreport only — re-run with --apply to rename");
     }
     Ok(())
 }

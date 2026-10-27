@@ -34,7 +34,7 @@ pub use index::{
 pub use memory::{
     auto_summary_content, curate, Archived, CurateConfig, CurateReport, DuplicatePair, digest_transcript, effective_score, is_l0, parse_stop_input, rank,
     redact_secrets, remove_auto_summary, Redaction, sanitize_fts5, sanitize_nl, session_end, session_start,
-    upsert_auto_summary, SessionEnd, SessionStart, SqliteMemoryStore, StopHookInput,
+    upsert_auto_summary, SessionEnd, SessionStart, RenameReport, SqliteMemoryStore, StopHookInput,
     TranscriptDigest, WalStore, DEFAULT_PROFILE_NOTES, DEFAULT_PROJECT_MEMORIES,
 };
 pub use recall::{code_to_memory, recall, why_this_exists};
