@@ -241,6 +241,14 @@ impl VerifyLog {
         Ok(Self { conn })
     }
 
+    /// Re-file every run of project `old` under `new` (a project rename). Returns
+    /// how many runs moved. Runs keep their ids, files and timestamps.
+    pub fn rename_project(&self, old: &str, new: &str) -> Result<usize> {
+        self.conn
+            .execute("UPDATE verify_runs SET project = ?1 WHERE project = ?2", [new, old])
+            .map_err(log_err)
+    }
+
     /// Record one run. Returns its id.
     ///
     /// Paths are stored exactly as given: the caller normalises them to the same

@@ -29,5 +29,5 @@ pub use stop_hook::{
     auto_summary_content, digest_transcript, parse_stop_input, remove_auto_summary,
     upsert_auto_summary, StopHookInput, TranscriptDigest,
 };
-pub use store::SqliteMemoryStore;
+pub use store::{validate_project_name, RenameReport, SqliteMemoryStore};
 pub use wal::WalStore;
