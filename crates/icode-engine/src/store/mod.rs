@@ -505,6 +505,129 @@ impl SqliteCodeStore {
     /// therefore weak evidence of "untested", not proof. `symbol op=references` still
     /// shows those lines (as mentions).
     pub fn find_tests_covering(&self, symbol: &str, max_depth: usize) -> Result<Vec<TestCoverage>> {
+        self.tests_reaching(&[symbol.to_string()], max_depth, &[])
+    }
+
+    /// Which tests exercise ANY symbol defined in `path`, transitively.
+    ///
+    /// The file-level counterpart of [`find_tests_covering`], and the half the
+    /// verification ledger needs: evidence is recorded per file (a test run
+    /// touched these paths), so "what should have been re-run after this edit"
+    /// is a question about a file, not a symbol.
+    ///
+    /// Two seeding details matter:
+    ///
+    ///  * Both the bare and qualified name of every symbol in the file seed the
+    ///    walk, because call edges key on whichever form the parser resolved.
+    ///  * Tests DEFINED in the file are returned directly at depth 0. Editing a
+    ///    test is exactly the case where that test needs re-running, and a
+    ///    reverse walk would never find it (nothing calls a test).
+    pub fn find_tests_covering_file(&self, path: &str, max_depth: usize) -> Result<Vec<TestCoverage>> {
+        let (seeds, own_tests) = {
+            let conn = self.conn.lock().map_err(store_err)?;
+            let mut seeds: Vec<String> = Vec::new();
+            let mut own_tests: Vec<TestCoverage> = Vec::new();
+
+            // A name is only seeded when it identifies THIS file's symbol uniquely
+            // across the project. The call graph is keyed by name, and for a free
+            // Rust function the qualified name IS the bare name — so `rank` in
+            // `pagerank.rs` and `rank` in `memory/ranking.rs` are one node. Seeding
+            // an ambiguous name pulls in the homonym's callers: touching
+            // `pagerank.rs` reported the memory-ranking tests, which is exactly the
+            // kind of wrong answer that makes a report stop being read. Ambiguous
+            // symbols are dropped instead; the file's own tests and its unambiguous
+            // symbols still carry the result.
+            let mut stmt = conn
+                .prepare(
+                    "SELECT f.qualified_name, f.name, f.is_test, \
+                            (SELECT COUNT(DISTINCT g.path) FROM functions g \
+                              WHERE g.qualified_name = f.qualified_name), \
+                            (SELECT COUNT(DISTINCT g.path) FROM functions g \
+                              WHERE g.name = f.name) \
+                     FROM functions f WHERE f.path = ?1",
+                )
+                .map_err(store_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![path], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)? != 0,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, i64>(4)?,
+                    ))
+                })
+                .map_err(store_err)?;
+            for row in rows {
+                let (qname, name, is_test, qname_files, name_files) = row.map_err(store_err)?;
+                if is_test {
+                    own_tests.push(TestCoverage {
+                        test: name.clone(),
+                        qualified_name: qname.clone(),
+                        path: path.to_string(),
+                        depth: 0,
+                    });
+                }
+                if qname_files <= 1 {
+                    seeds.push(qname);
+                }
+                if name_files <= 1 {
+                    seeds.push(name);
+                }
+            }
+            drop(stmt);
+
+            let mut stmt = conn
+                .prepare(
+                    "SELECT c.qualified_name, c.name, \
+                            (SELECT COUNT(DISTINCT d.path) FROM classes d \
+                              WHERE d.qualified_name = c.qualified_name), \
+                            (SELECT COUNT(DISTINCT d.path) FROM classes d \
+                              WHERE d.name = c.name) \
+                     FROM classes c WHERE c.path = ?1",
+                )
+                .map_err(store_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![path], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                })
+                .map_err(store_err)?;
+            for row in rows {
+                let (qname, name, qname_files, name_files) = row.map_err(store_err)?;
+                if qname_files <= 1 {
+                    seeds.push(qname);
+                }
+                if name_files <= 1 {
+                    seeds.push(name);
+                }
+            }
+            (seeds, own_tests)
+        };
+
+        if seeds.is_empty() {
+            return Ok(own_tests);
+        }
+        let mut out = self.tests_reaching(&seeds, max_depth, &own_tests)?;
+        out.extend(own_tests);
+        out.sort_by(|a, b| a.depth.cmp(&b.depth).then_with(|| a.test.cmp(&b.test)));
+        out.dedup_by(|a, b| a.qualified_name == b.qualified_name);
+        Ok(out)
+    }
+
+    /// Reverse-reachability core shared by the symbol- and file-level lookups:
+    /// walk the call graph BACKWARDS from every seed and collect the tests found.
+    /// `already` names tests the caller reports itself, so they are not repeated.
+    fn tests_reaching(
+        &self,
+        seeds: &[String],
+        max_depth: usize,
+        already: &[TestCoverage],
+    ) -> Result<Vec<TestCoverage>> {
         let max_depth = max_depth.clamp(1, 10);
         let conn = self.conn.lock().map_err(store_err)?;
 
@@ -568,11 +691,20 @@ impl SqliteCodeStore {
         drop(stmt);
         drop(conn);
 
-        // BFS backwards. `seen` guards cycles (recursion, mutual calls).
+        // BFS backwards. `seen` guards cycles (recursion, mutual calls) and starts
+        // holding every seed, so a seed that is itself a test is not reported as
+        // covering itself.
         let mut out: Vec<TestCoverage> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut frontier: Vec<String> = vec![symbol.to_string()];
-        seen.insert(symbol.to_string());
+        for t in already {
+            seen.insert(t.qualified_name.clone());
+        }
+        let mut frontier: Vec<String> = Vec::new();
+        for seed in seeds {
+            if seen.insert(seed.clone()) {
+                frontier.push(seed.clone());
+            }
+        }
 
         for depth in 1..=max_depth {
             let mut next: Vec<String> = Vec::new();
@@ -1399,6 +1531,61 @@ impl SqliteCodeStore {
         .map(|n| n as u64)
         .map_err(store_err)
     }
+
+    /// Read-only: GHOST chunks — `code_chunks` rows whose `path` is in no `files`
+    /// row. Each one is a searchable symbol from a file the index no longer knows,
+    /// so semantic search answers with code nobody can open. Must be 0; `doctor`
+    /// treats it as a hard signal, and [`Self::prune_ghost_chunks`] clears it.
+    pub fn ghost_chunks_count(&self) -> Result<u64> {
+        let conn = self.conn.lock().map_err(store_err)?;
+        conn.query_row(
+            "SELECT COUNT(*) FROM code_chunks c \
+             WHERE NOT EXISTS (SELECT 1 FROM files f WHERE f.path = c.path)",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n as u64)
+        .map_err(store_err)
+    }
+
+    /// Insert one chunk for a path that is in no `files` row — i.e. exactly what
+    /// an older binary's `delete_file` left behind. Tests only: the prune and the
+    /// `doctor` counter need a ghost to exist, and no supported code path creates
+    /// one any more.
+    #[doc(hidden)]
+    pub fn insert_ghost_chunk_for_test(&self, path: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(store_err)?;
+        conn.execute(
+            "INSERT INTO code_chunks \
+             (symbol_kind, symbol_id, qualified_name, path, line_start, line_end, \
+              chunk_text, content_hash, embed_model, embed_dim) \
+             VALUES ('function', NULL, 'ghost_symbol', ?1, 1, 2, 'fn ghost_symbol() {}', \
+                     'ghost-hash', NULL, NULL)",
+            rusqlite::params![path],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// Delete every ghost chunk (and, via the `code_chunks_ad` trigger, its
+    /// vector). Returns how many rows went.
+    ///
+    /// Two things need this. New drift cannot occur — `delete_file` now clears a
+    /// file's chunks — but an index built by an EARLIER binary carries whatever it
+    /// accumulated, and nothing else would ever clean it: a ghost's path is never
+    /// re-indexed, so `upsert_chunks` never runs for it. `index_path` calls this
+    /// once per pass, which heals an old database on the first run of the new
+    /// binary and costs one indexed SELECT afterwards.
+    pub fn prune_ghost_chunks(&self) -> Result<u64> {
+        let conn = self.conn.lock().map_err(store_err)?;
+        let n = conn
+            .execute(
+                "DELETE FROM code_chunks WHERE path NOT IN (SELECT path FROM files)",
+                [],
+            )
+            .map_err(store_err)?;
+        Ok(n as u64)
+    }
 }
 
 // ──────────────────────────── read side ────────────────────────────
@@ -1934,9 +2121,15 @@ impl CodeReadStore for SqliteCodeStore {
     fn find_dead_code(&self, lang: Option<Language>, limit: usize) -> Result<Vec<CodeHit>> {
         let conn = self.conn.lock().map_err(store_err)?;
         let entry = entry_point_names(&conn)?;
+        let dispatched = dispatched_method_names(&conn)?;
+        // `is_test = 0`: a test function has no caller BY DESIGN — the harness
+        // invokes it. On this repo's own index 240 of the 294 zero-in-degree
+        // functions were tests, so without this line the answer is 82% noise and
+        // the real dead code is buried under it.
         let mut sql = String::from(
             "SELECT name, qualified_name, path, line_start, line_end FROM functions f \
-             WHERE NOT EXISTS (SELECT 1 FROM calls c WHERE c.callee = f.name)",
+             WHERE f.is_test = 0 \
+               AND NOT EXISTS (SELECT 1 FROM calls c WHERE c.callee = f.name)",
         );
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         if let Some(l) = lang {
@@ -1952,7 +2145,15 @@ impl CodeReadStore for SqliteCodeStore {
         let mut out = Vec::new();
         for r in rows {
             let hit = r.map_err(store_err)?;
-            if entry.contains(&hit.name) {
+            if entry.contains(&hit.name) || dispatched.contains(&hit.name) {
+                continue;
+            }
+            // A call edge is not the only way a function is used. `.map_err(log_err)`
+            // passes it as a VALUE, and the parser records no call — on this repo
+            // that alone accounted for 14 of the 15 remaining candidates, every one
+            // of them live code. If the name appears anywhere in another symbol's
+            // text, the honest answer is "referenced", not "dead".
+            if mentioned_by_another_symbol(&conn, &hit.name)? {
                 continue;
             }
             out.push(hit);
@@ -1995,8 +2196,10 @@ impl CodeReadStore for SqliteCodeStore {
         }
 
         // Any function whose name is not reachable is reported.
+        let dispatched = dispatched_method_names(&conn)?;
         let mut sql = String::from(
-            "SELECT name, qualified_name, path, line_start, line_end FROM functions f WHERE 1=1",
+            "SELECT name, qualified_name, path, line_start, line_end FROM functions f \
+             WHERE f.is_test = 0",
         );
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         if let Some(l) = lang {
@@ -2012,7 +2215,7 @@ impl CodeReadStore for SqliteCodeStore {
         let mut out = Vec::new();
         for r in rows {
             let hit = r.map_err(store_err)?;
-            if reachable.contains(&hit.name) {
+            if reachable.contains(&hit.name) || dispatched.contains(&hit.name) {
                 continue;
             }
             out.push(hit);
@@ -2502,9 +2705,19 @@ impl CodeWriteStore for SqliteCodeStore {
     }
 
     fn delete_file(&self, path: &str) -> Result<()> {
-        let conn = self.conn.lock().map_err(store_err)?;
-        conn.execute("DELETE FROM files WHERE path = ?1", rusqlite::params![path])
+        let mut conn = self.conn.lock().map_err(store_err)?;
+        let tx = conn.transaction().map_err(store_err)?;
+        tx.execute("DELETE FROM files WHERE path = ?1", rusqlite::params![path])
             .map_err(store_err)?;
+        // `code_chunks` hangs off `path`, NOT off `files.id` — the FK cascade that
+        // clears functions/classes/calls/imports does NOT reach it. Without this
+        // delete, a file that vanished from disk keeps its chunks (and, via the
+        // absent delete, its vectors) forever, and `search mode=semantic` goes on
+        // returning symbols from a file nobody can open. The `code_chunks_ad`
+        // trigger mirrors the delete into `vec_code`.
+        tx.execute("DELETE FROM code_chunks WHERE path = ?1", rusqlite::params![path])
+            .map_err(store_err)?;
+        tx.commit().map_err(store_err)?;
         // ON DELETE CASCADE dropped the file's `calls` rows → invalidate the cache.
         self.bump_graph_epoch();
         Ok(())
@@ -2929,25 +3142,224 @@ fn query_importers_of(conn: &Connection, target: &str) -> Result<Vec<String>> {
     // Candidate module tokens that could name `target`: its full path and each
     // trailing path/segment suffix (with the extension stripped). We compare in
     // Rust to keep the suffix logic explicit.
+    //
+    // The suffix rule alone answers for Python/JS/Go, where an import names a
+    // path. It answers NOTHING for Rust, where `use icode_engine::stale_report`
+    // names a crate and a symbol and shares no token with
+    // `crates/icode-engine/src/verify/mod.rs` — which is why `impact` on a Rust
+    // tree used to return an empty list for every file, including ones imported
+    // everywhere. [`RustFileIdent`] resolves that second spelling.
+    let ident = RustFileIdent::load(conn, target)?;
     let mut stmt = conn
-        .prepare("SELECT DISTINCT path, module FROM imports")
+        .prepare(
+            "SELECT DISTINCT i.path, i.module, COALESCE(f.module, '') \
+             FROM imports i LEFT JOIN files f ON f.path = i.path",
+        )
         .map_err(store_err)?;
     let rows = stmt
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
         .map_err(store_err)?;
     let mut out = Vec::new();
     for r in rows {
-        let (path, module) = r.map_err(store_err)?;
+        let (path, module, importer_module) = r.map_err(store_err)?;
         if path == target {
             continue; // a file importing itself is not an external importer
         }
-        if module_matches_file(&module, target) {
+        if module_matches_file(&module, target)
+            || ident
+                .as_ref()
+                .is_some_and(|id| id.matches_import(&module, &importer_module))
+        {
             out.push(path);
         }
     }
     out.sort();
     out.dedup();
     Ok(out)
+}
+
+/// What a Rust `use` path could say about one file, so reverse dependencies can be
+/// resolved without a real name resolver.
+///
+/// A Rust import names modules and symbols, never paths: `crate::store::…`,
+/// `icode_engine::stale_report`, `super::RunKind`. Three things let us tie such a
+/// path back to a file, and we require enough of them that a homonym in a sibling
+/// crate does not fabricate an edge (the failure this project already paid for
+/// once, in the name-keyed call graph):
+///
+/// * the **crate** the path starts with, matched against the file's sub-project
+///   (`icode_engine` ↔ `crates/icode-engine`, underscores and dashes alike);
+/// * the **module names** that can stand for the file — its stem, or its directory
+///   when the file is `mod.rs`/`lib.rs`/`main.rs`;
+/// * the **symbols** it defines, since a `use` path's last segment is usually one.
+///
+/// A path with no crate prefix (`verify::hook::classify_command`, or one starting
+/// `crate`/`self`/`super`) is only considered for files in the SAME sub-project as
+/// the importer, and only when its first segment is not some other known crate.
+/// APPROXIMATE by construction: re-exports are followed no further than the file
+/// that declares them, and a module name that collides with an external crate's
+/// can still over-match.
+struct RustFileIdent {
+    /// Sub-project the file belongs to (`files.module`), '' for a plain repo.
+    module: String,
+    /// Crate-ish name: last segment of `module`, normalised.
+    crate_name: String,
+    /// Module names that can stand for this file.
+    keys: HashSet<String>,
+    /// Bare names of the symbols it defines.
+    symbols: HashSet<String>,
+    /// Every crate name in the index, so a path starting with a DIFFERENT crate is
+    /// rejected instead of falling through to the same-sub-project rule.
+    known_crates: HashSet<String>,
+}
+
+/// Compare two identifiers the way a crate name and a directory name compare:
+/// `icode_engine` == `icode-engine`, case-insensitively.
+fn same_ident(a: &str, b: &str) -> bool {
+    a.replace('-', "_").eq_ignore_ascii_case(&b.replace('-', "_"))
+}
+
+fn norm_ident(s: &str) -> String {
+    s.replace('-', "_").to_ascii_lowercase()
+}
+
+impl RustFileIdent {
+    /// `None` when the path is not a Rust file we know — the caller then relies on
+    /// the path-suffix rule alone, exactly as before.
+    fn load(conn: &Connection, target: &str) -> Result<Option<Self>> {
+        use rusqlite::OptionalExtension;
+        let row = conn
+            .query_row(
+                "SELECT module, language FROM files WHERE path = ?1",
+                rusqlite::params![target],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(store_err)?;
+        let Some((module, language)) = row else {
+            return Ok(None);
+        };
+        if !language.eq_ignore_ascii_case("rust") {
+            return Ok(None);
+        }
+
+        let crate_name = module.rsplit('/').next().unwrap_or(&module).to_string();
+
+        // Module names that can stand for this file.
+        let normalised = target.replace('\\', "/");
+        let file_name = normalised.rsplit('/').next().unwrap_or(&normalised);
+        let stem = file_name.rsplit_once('.').map(|(s, _)| s).unwrap_or(file_name);
+        let mut keys: HashSet<String> = HashSet::new();
+        if matches!(stem, "mod" | "lib" | "main") {
+            // `verify/mod.rs` is the module `verify`; `src/lib.rs` is the crate.
+            if let Some(parent) = normalised.rsplit('/').nth(1) {
+                keys.insert(norm_ident(parent));
+            }
+            if !crate_name.is_empty() {
+                keys.insert(norm_ident(&crate_name));
+            }
+        } else {
+            keys.insert(norm_ident(stem));
+        }
+
+        let mut symbols: HashSet<String> = HashSet::new();
+        for table in ["functions", "classes"] {
+            let sql = format!("SELECT name FROM {table} WHERE path = ?1");
+            let mut stmt = conn.prepare(&sql).map_err(store_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![target], |r| r.get::<_, String>(0))
+                .map_err(store_err)?;
+            for r in rows {
+                symbols.insert(norm_ident(&r.map_err(store_err)?));
+            }
+        }
+
+        let mut known_crates: HashSet<String> = HashSet::new();
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT module FROM files")
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(store_err)?;
+        for r in rows {
+            let m = r.map_err(store_err)?;
+            if let Some(last) = m.rsplit('/').next() {
+                if !last.is_empty() {
+                    known_crates.insert(norm_ident(last));
+                }
+            }
+        }
+
+        Ok(Some(Self { module, crate_name, keys, symbols, known_crates }))
+    }
+
+    /// Does this `use` path, written in a file belonging to `importer_module`,
+    /// name the file this ident describes?
+    fn matches_import(&self, import_module: &str, importer_module: &str) -> bool {
+        let segs: Vec<String> = import_module
+            .replace("::", "/")
+            .replace('.', "/")
+            .split('/')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(norm_ident)
+            .collect();
+        if segs.is_empty() {
+            return false;
+        }
+
+        // Strip the anchors that mean "this crate" — they carry no name.
+        let mut rest: &[String] = &segs;
+        let mut anchored_here = false;
+        while let Some(first) = rest.first() {
+            if matches!(first.as_str(), "crate" | "self" | "super" | "$crate") {
+                anchored_here = true;
+                rest = &rest[1..];
+            } else {
+                break;
+            }
+        }
+        if rest.is_empty() {
+            return false; // `use super;` names nothing we can resolve
+        }
+
+        if !anchored_here && same_ident(&rest[0], &self.crate_name) && !self.crate_name.is_empty() {
+            // `icode_engine::stale_report` — crate-qualified, so a file in ANY
+            // sub-project may be the importer.
+            rest = &rest[1..];
+            if rest.is_empty() {
+                return false; // `use icode_engine;` names the crate, not a file
+            }
+        } else {
+            // No crate prefix: this can only reach a file in the same sub-project…
+            if importer_module != self.module {
+                return false;
+            }
+            // …and its first segment must not be some OTHER crate (or the std
+            // family), which would make `icode_core::error::Result` match a local
+            // `error.rs` purely on the shared segment.
+            let head = &rest[0];
+            if matches!(head.as_str(), "std" | "core" | "alloc" | "proc_macro") {
+                return false;
+            }
+            if !anchored_here
+                && self.known_crates.contains(head)
+                && !same_ident(head, &self.crate_name)
+            {
+                return false;
+            }
+        }
+
+        // The last segment is usually a symbol; any segment may be the module.
+        let last = rest.last().expect("non-empty");
+        self.symbols.contains(last) || rest.iter().any(|s| self.keys.contains(s))
+    }
 }
 
 /// Routes whose `handler_method` equals `name`.
@@ -3031,6 +3443,88 @@ fn load_call_edges(conn: &Connection) -> Result<HashMap<String, Vec<String>>> {
 }
 
 /// Entry-point function names: `main` plus every distinct route `handler_method`.
+/// Does any OTHER symbol's indexed text contain this identifier?
+///
+/// The call graph records calls; it does not record a function handed over as a
+/// value (`stmt.query_map(params, map_symbol_hit_fn)`), reached through a macro,
+/// or named in a re-export. All three read as zero in-degree, and reporting them
+/// as dead code is how the audit loses the user's trust. The FTS index already
+/// holds each symbol's identifiers verbatim, so one MATCH answers "is this name
+/// written anywhere else" without a table scan.
+///
+/// Weaker evidence than a call edge, and deliberately so: it is used only to
+/// SUPPRESS a dead-code claim, never to make one.
+fn mentioned_by_another_symbol(conn: &Connection, name: &str) -> Result<bool> {
+    if name.trim().is_empty() {
+        return Ok(false);
+    }
+    // Quote the term: FTS5 treats bare punctuation as syntax, and a name is data.
+    let term = format!("\"{}\"", name.replace('"', ""));
+    for (fts, table) in [("fts_functions", "functions"), ("fts_classes", "classes")] {
+        let sql = format!(
+            "SELECT EXISTS( \
+               SELECT 1 FROM {fts} ft JOIN {table} t ON t.id = ft.rowid \
+               WHERE {fts} MATCH ?1 AND t.name != ?2 \
+             )"
+        );
+        let found: i64 = conn
+            .query_row(&sql, rusqlite::params![term, name], |r| r.get(0))
+            .map_err(store_err)?;
+        if found != 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Method names that are reached through DISPATCH rather than a written call, so
+/// the by-name call graph cannot see their callers.
+///
+/// `impl Display for MemoryId { fn fmt(…) }` is called by every `{}` in the
+/// codebase and by nothing the parser records as a call; the same holds for a
+/// trait method invoked through `dyn Trait`. Reporting those as dead code is not a
+/// near miss — it is the tool pointing at exactly the code that must not be
+/// deleted. Two sources, both grounded in what the index actually holds:
+///
+/// * methods declared inside a trait/interface in THIS tree (a function whose
+///   lines fall inside a class whose body declares a trait), and
+/// * the std traits every Rust codebase implements, which are not in the index
+///   because their declarations are not in the tree.
+///
+/// This trades recall for trust: a genuinely dead `fmt` is not reported. That is
+/// the right side to err on for a tool whose answer is "you can delete this".
+fn dispatched_method_names(conn: &Connection) -> Result<HashSet<String>> {
+    /// Std trait methods, declared outside any indexed tree.
+    const STD_TRAIT_METHODS: &[&str] = &[
+        "fmt", "clone", "default", "from", "into", "try_from", "try_into", "drop", "eq", "ne",
+        "hash", "cmp", "partial_cmp", "next", "deref", "deref_mut", "as_ref", "as_mut", "borrow",
+        "borrow_mut", "to_string", "serialize", "deserialize", "add", "sub", "mul", "div", "rem",
+        "neg", "not", "index", "index_mut", "poll", "call", "into_iter", "from_str", "source",
+        "description", "deserialize_with", "visit_str", "visit_map", "visit_seq",
+    ];
+
+    let mut set: HashSet<String> = STD_TRAIT_METHODS.iter().map(|s| s.to_string()).collect();
+
+    // Methods declared in a trait/interface defined in this tree. The declaration
+    // is a `classes` row whose body opens a trait; its methods are the functions
+    // whose lines fall inside it, in the same file.
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT f.name FROM functions f \
+             JOIN classes c ON c.path = f.path \
+              AND f.line_start >= c.line_start AND f.line_end <= c.line_end \
+             WHERE c.body LIKE '%trait %' OR c.body LIKE '%interface %'",
+        )
+        .map_err(store_err)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(store_err)?;
+    for r in rows {
+        set.insert(r.map_err(store_err)?);
+    }
+    Ok(set)
+}
+
 fn entry_point_names(conn: &Connection) -> Result<HashSet<String>> {
     let mut set: HashSet<String> = HashSet::new();
     // `main` is an entry point if it exists as a function.

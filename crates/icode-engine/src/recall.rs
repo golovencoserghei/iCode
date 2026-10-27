@@ -48,22 +48,46 @@ pub fn recall(
     query: &str,
     k: usize,
 ) -> Result<RecallResult> {
-    // ── code section (its own ranking space) ──
-    let relevant_code = match embedder {
-        Some(emb) => search::hybrid_search(code, emb, query, k)?,
-        None => code.search_code(&CodeQuery {
+    let lexical_only = |limit: usize| {
+        code.search_code(&CodeQuery {
             text: query.to_string(),
             kind: None,
             lang: None,
-            limit: k,
+            limit,
             mode: SearchMode::Lexical,
             with_body: false,
-        })?,
+        })
+    };
+
+    // ── code section (its own ranking space) ──
+    //
+    // An embedder that is present but momentarily unreachable (Ollama restarting,
+    // not yet started at login) must not turn recall into an error: the dense arm
+    // is dropped and the lexical arm answers. Recall is the tool the assistant
+    // calls FIRST in a session, so a hard failure here reads as "icode is broken".
+    let relevant_code = match embedder {
+        Some(emb) => match search::hybrid_search(code, emb, query, k) {
+            Ok(hits) => hits,
+            Err(e) => {
+                eprintln!("icode: recall code section degraded to lexical-only ({e})");
+                lexical_only(k)?
+            }
+        },
+        None => lexical_only(k)?,
     };
 
     // ── memory section (its own ranking space; empty when no store) ──
+    //
+    // Independent of the code section on purpose: a memory backend failure costs
+    // the memory hits, not the code hits the caller also asked for.
     let relevant_memory = match memory {
-        Some(mem) => mem.search(project, query, k, None, false)?,
+        Some(mem) => match mem.search(project, query, k, None, false) {
+            Ok(hits) => hits,
+            Err(e) => {
+                eprintln!("icode: recall memory section unavailable ({e})");
+                vec![]
+            }
+        },
         None => vec![],
     };
 

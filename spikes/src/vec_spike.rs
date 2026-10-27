@@ -20,9 +20,16 @@ fn f32_blob(v: &[f32]) -> Vec<u8> {
 fn main() -> anyhow::Result<()> {
     // Register vec0 for every connection opened after this point.
     unsafe {
-        sqlite3_auto_extension(Some(std::mem::transmute(
-            sqlite3_vec_init as *const (),
-        )));
+        // The target type is `sqlite3_auto_extension`'s own callback signature;
+        // spelling it out is what keeps this transmute checkable.
+        sqlite3_auto_extension(Some(std::mem::transmute::<
+            *const (),
+            unsafe extern "C" fn(
+                *mut rusqlite::ffi::sqlite3,
+                *mut *mut core::ffi::c_char,
+                *const rusqlite::ffi::sqlite3_api_routines,
+            ) -> core::ffi::c_int,
+        >(sqlite3_vec_init as *const ())));
     }
 
     let db = Connection::open_in_memory()?;

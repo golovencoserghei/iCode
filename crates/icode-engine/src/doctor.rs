@@ -30,7 +30,8 @@ const MAX_EXAMPLES: usize = 50;
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct DiagnosticReport {
     /// True iff there is NO drift (missing/outdated/stale all empty) and the
-    /// hard invariants hold (`orphan_vectors == 0` && `parse_errors == 0`).
+    /// hard invariants hold (`orphan_vectors == 0` && `ghost_chunks == 0` &&
+    /// `parse_errors == 0`).
     /// `pending_embeddings` deliberately does NOT affect this — an un-drained
     /// embed queue is a normal background state, not a fault.
     pub healthy: bool,
@@ -61,6 +62,12 @@ pub struct DiagnosticReport {
     /// `vec_code` rowids with no backing chunk. MUST be 0 (the delete-mirror
     /// trigger guarantees it); non-zero is a broken invariant.
     pub orphan_vectors: u64,
+    /// `code_chunks` rows whose file is in no `files` row. MUST be 0. Each one is
+    /// a symbol semantic search can still return from a file the index dropped —
+    /// which is why this counts against `healthy` rather than sitting in a note:
+    /// reporting a tree as healthy while it answers with deleted code is the one
+    /// thing a health check must not do. `icode index` clears them.
+    pub ghost_chunks: u64,
 }
 
 /// Run a full read-only diagnosis of `store` against the source tree at `root`.
@@ -140,11 +147,13 @@ pub fn diagnose(store: &SqliteCodeStore, root: &Path) -> Result<DiagnosticReport
     let stats = store.stats()?;
     let pending_embeddings = store.pending_embeddings_count()?;
     let orphan_vectors = store.orphan_vectors_count()?;
+    let ghost_chunks = store.ghost_chunks_count()?;
 
     let healthy = missing_count == 0
         && outdated_count == 0
         && stale_count == 0
         && orphan_vectors == 0
+        && ghost_chunks == 0
         && stats.parse_errors == 0;
 
     Ok(DiagnosticReport {
@@ -161,5 +170,6 @@ pub fn diagnose(store: &SqliteCodeStore, root: &Path) -> Result<DiagnosticReport
         embedded: stats.vec_rows,
         pending_embeddings,
         orphan_vectors,
+        ghost_chunks,
     })
 }

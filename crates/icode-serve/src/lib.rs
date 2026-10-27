@@ -8,5 +8,5 @@
 pub mod mcp;
 pub mod web;
 
-pub use mcp::{serve_stdio, CodeMcpServer};
+pub use mcp::{serve_stdio, sync_channel, CodeMcpServer, GraphSync, SyncHandle, SyncSignal};
 pub use web::{serve as serve_web, WebState};

@@ -11,6 +11,7 @@
 //!   `icode doctor <path>`  — read-only index health check (exit 1 on drift).
 //!   `icode setup [path]`   — friendly onboarding: probe Ollama, print MCP config.
 //!   `icode mcp-config [p]` — print only the Claude Code MCP registration JSON.
+//!   `icode vault …`        — passphrase-encrypted secrets you must be able to recover.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,6 +20,8 @@ use clap::{Parser, Subcommand};
 use icode_core::config::EmbedConfig;
 use icode_core::traits::CodeReadStore;
 use icode_engine::SqliteCodeStore;
+
+mod vault_cli;
 
 #[derive(Parser)]
 #[command(
@@ -61,6 +64,27 @@ enum Command {
         #[arg(long, default_value_t = 7420)]
         port: u16,
     },
+    /// Curate a project's memory: report (or archive) stale and near-duplicate
+    /// records. Never deletes — archiving is `resolve`, reversible and visible with
+    /// include_resolved. Works without Ollama.
+    Curate {
+        /// Project name whose memory is curated (the git-repo basename).
+        project: String,
+        /// Actually archive. Without it, the pass only reports.
+        #[arg(long)]
+        apply: bool,
+        /// Days idle before a low-importance record counts as stale.
+        #[arg(long, default_value_t = 90.0)]
+        stale_days: f64,
+        /// Word-overlap at which two records count as the same fact (0.3..1.0).
+        #[arg(long, default_value_t = 0.8)]
+        dup_similarity: f64,
+    },
+    /// Verification ledger: what has actually been PROVEN about a tree.
+    Verify {
+        #[command(subcommand)]
+        action: VerifyAction,
+    },
     /// Live daemon: watch a project and keep its index up to date as files change.
     Daemon {
         #[command(subcommand)]
@@ -102,6 +126,16 @@ enum Command {
         /// Optional project root to bake into the snippet (else a placeholder).
         project_path: Option<PathBuf>,
     },
+    /// Passphrase-encrypted vault for secrets you must recover after losing this
+    /// machine (break-glass SSH keys, recovery codes). A standard age file: `age -d`
+    /// opens it anywhere, even without iCode. Not exposed over MCP.
+    Vault {
+        /// Vault file (default: $ICODE_VAULT, else ~/.icode/vault.age).
+        #[arg(long, global = true)]
+        file: Option<PathBuf>,
+        #[command(subcommand)]
+        action: vault_cli::VaultAction,
+    },
     /// Claude Code lifecycle hooks. Claude Code runs these on session events and
     /// reads their stdout JSON to inject memory context. They are FAST, print
     /// valid `hookSpecificOutput` JSON, and NEVER fail (a down Ollama degrades to
@@ -109,6 +143,45 @@ enum Command {
     Hook {
         #[command(subcommand)]
         action: HookAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum VerifyAction {
+    /// Record a check that ran. With no --file, the run is taken to have exercised
+    /// the whole project — pass --narrow when it did not (a test filter, one package).
+    Record {
+        /// Project root the run belongs to.
+        path: PathBuf,
+        /// The command that ran, verbatim.
+        #[arg(long)]
+        command: String,
+        /// test|build|lint|typecheck|other.
+        #[arg(long, default_value = "test")]
+        kind: String,
+        /// The run failed (exit != 0).
+        #[arg(long)]
+        failed: bool,
+        /// A file the run exercised. Repeatable.
+        #[arg(long = "file")]
+        files: Vec<String>,
+        /// The run was narrowed (a filter/one package) but named no files: keep it
+        /// as history without crediting it with coverage.
+        #[arg(long)]
+        narrow: bool,
+    },
+    /// Show recent runs and how much of the tree is unproven.
+    Status {
+        /// Project root.
+        path: PathBuf,
+    },
+    /// List files changed since the last green run covering them.
+    Stale {
+        /// Project root.
+        path: PathBuf,
+        /// Max files to list.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
     },
 }
 
@@ -153,6 +226,17 @@ enum HookAction {
         #[arg(long)]
         cwd: Option<PathBuf>,
     },
+    /// PostToolUse hook: watch Bash calls for test/build/lint runs and file them in
+    /// the verification ledger. Silent (prints nothing); records only when the
+    /// command is recognised AND its output clearly says pass or fail. Always exits 0.
+    PostTool {
+        /// Project name (else derived like the other hooks).
+        #[arg(long)]
+        project: Option<String>,
+        /// Working directory the project/root is derived from.
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+    },
     /// Print a ready-to-paste `~/.claude/settings.json` hooks snippet wiring the
     /// SessionStart / PreCompact / Stop events to `icode hook …`, plus where to
     /// put it.
@@ -187,24 +271,66 @@ enum DaemonAction {
     },
 }
 
+/// Resolve a project path the user typed into the ONE form the index stores.
+///
+/// The index keys every file by an absolute path string. A path typed as `.` or
+/// `../iCode` walks to the same files and produces DIFFERENT strings, so the same
+/// tree gets indexed twice: `icode index .` on an already-indexed project doubled
+/// this repo's own index (87 files became 174, every chunk duplicated) and left
+/// `doctor` reporting 87 stale files that were all sitting on disk. Canonicalising
+/// at the edge is what keeps one tree to one set of keys.
+///
+/// A path that cannot be canonicalised (it does not exist yet) is passed through
+/// unchanged, so the error the command would give stays its own.
+fn canonical_root(path: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&path).unwrap_or(path)
+}
+
+/// Same, but the path must already be a directory.
+///
+/// Opening a store CREATES `<path>/.icode/index.db`, so a mistyped argument used
+/// to succeed quietly: `icode verify status iCode` (a project name where a path
+/// belongs) made a `./iCode/.icode/` and then reported "0 of 0 indexed files" —
+/// an empty index is indistinguishable from an empty project, which is exactly
+/// the confusion this tool exists to prevent. Every command that works on an
+/// ALREADY-indexed tree goes through here.
+fn existing_root(path: PathBuf) -> anyhow::Result<PathBuf> {
+    let root = canonical_root(path);
+    if !root.is_dir() {
+        anyhow::bail!(
+            "{} is not a directory — pass the project's PATH (`.` for the current one), not its name",
+            root.display()
+        );
+    }
+    Ok(root)
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Index { path } => run_index(&path),
-        Command::Embed { path } => run_embed(&path),
-        Command::Serve { path } => run_serve(path),
-        Command::Web { path, port } => run_web(path, port),
+        Command::Index { path } => run_index(&existing_root(path)?),
+        Command::Embed { path } => run_embed(&existing_root(path)?),
+        Command::Serve { path } => run_serve(path.map(canonical_root)),
+        Command::Web { path, port } => run_web(existing_root(path)?, port),
         Command::Daemon { action } => match action {
-            DaemonAction::Run { path } => run_daemon_cmd(&path),
-            DaemonAction::Start { path } => run_daemon_start(&path),
-            DaemonAction::Status { path } => run_daemon_status(&path),
-            DaemonAction::Stop { path } => run_daemon_stop(&path),
+            DaemonAction::Run { path } => run_daemon_cmd(&existing_root(path)?),
+            DaemonAction::Start { path } => run_daemon_start(&existing_root(path)?),
+            DaemonAction::Status { path } => run_daemon_status(&existing_root(path)?),
+            DaemonAction::Stop { path } => run_daemon_stop(&existing_root(path)?),
         },
-        Command::Stats { path } => run_stats(&path),
-        Command::Doctor { path } => run_doctor(&path),
+        Command::Stats { path } => run_stats(&existing_root(path)?),
+        Command::Doctor { path } => run_doctor(&existing_root(path)?),
         Command::CheckExists { path, query, kind } => {
-            run_check_exists(&path, &query, kind.as_deref())
+            run_check_exists(&existing_root(path)?, &query, kind.as_deref())
         }
+        Command::Curate {
+            project,
+            apply,
+            stale_days,
+            dup_similarity,
+        } => run_curate(&project, apply, stale_days, dup_similarity),
+        Command::Verify { action } => run_verify(action),
+        Command::Vault { file, action } => vault_cli::run(file, action),
         Command::Setup { project_path } => run_setup(project_path.as_deref()),
         Command::McpConfig { project_path } => run_mcp_config(project_path.as_deref()),
         Command::Hook { action } => match action {
@@ -220,12 +346,245 @@ fn main() -> anyhow::Result<()> {
                 run_hook_stop(project.as_deref(), cwd.as_deref());
                 Ok(())
             }
+            HookAction::PostTool { project, cwd } => {
+                run_hook_post_tool(project.as_deref(), cwd.as_deref());
+                Ok(())
+            }
             HookAction::Config => {
                 run_hook_config();
                 Ok(())
             }
         },
     }
+}
+
+/// `icode curate <project>` — memory hygiene.
+///
+/// Opens the central db WITHOUT an embedder: curation is lexical, so it must not
+/// require a running Ollama to tidy a base that is already on disk.
+fn run_curate(
+    project: &str,
+    apply: bool,
+    stale_days: f64,
+    dup_similarity: f64,
+) -> anyhow::Result<()> {
+    let store = icode_engine::SqliteMemoryStore::open_readonly(&central_db_path())
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let cfg = icode_engine::CurateConfig {
+        apply,
+        stale_days,
+        dup_similarity: dup_similarity.clamp(0.3, 1.0),
+        ..Default::default()
+    };
+    let report = icode_engine::curate(
+        &store,
+        project,
+        cfg,
+        &icode_core::config::RankingConfig::default(),
+    )
+    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    println!(
+        "{}: scanned {} active records ({} immune)",
+        project, report.scanned, report.immune
+    );
+    if !report.duplicates.is_empty() {
+        println!("\nnear-duplicates ({}):", report.duplicates.len());
+        for d in &report.duplicates {
+            println!("  {} ≈ {} ({:.2})  {}", d.archived, d.kept, d.similarity, d.preview);
+        }
+    }
+    if !report.stale.is_empty() {
+        println!("\nstale ({}):", report.stale.len());
+        for a in &report.stale {
+            println!(
+                "  {} [{}] idle {}d, importance {}  {}",
+                a.id, a.category, a.idle_days, a.importance, a.preview
+            );
+        }
+    }
+    if report.duplicates.is_empty() && report.stale.is_empty() {
+        println!("nothing to curate");
+    } else if apply {
+        println!("\narchived (reversible: memory search with include_resolved)");
+    } else {
+        println!("\nreport only — re-run with --apply to archive");
+    }
+    Ok(())
+}
+
+// ──────────────────────────── verification ledger ────────────────────────────
+
+/// The project key a ledger entry is filed under: the enclosing git repo's name,
+/// so a worktree and its main checkout share one ledger — the same rule the memory
+/// side uses, and the reason `verify status` in a worktree sees the runs made in
+/// the main tree.
+fn verify_project(root: &std::path::Path) -> String {
+    git_root_basename(root)
+        .or_else(|| {
+            root.file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "general".to_string())
+}
+
+/// Absolute path in the form the index stores, so recorded evidence lines up with
+/// the graph's rows (see the same conversion in `icode-serve`).
+fn verify_abs_path(root: &std::path::Path, path: &str) -> String {
+    let raw = path.trim().trim_start_matches("./");
+    let p = std::path::Path::new(raw);
+    if p.is_absolute() {
+        p.to_string_lossy().to_string()
+    } else {
+        root.join(p).to_string_lossy().to_string()
+    }
+}
+
+fn run_verify(action: VerifyAction) -> anyhow::Result<()> {
+    match action {
+        VerifyAction::Record {
+            path,
+            command,
+            kind,
+            failed,
+            files,
+            narrow,
+        } => {
+            let root = existing_root(path)?;
+            let project = verify_project(&root);
+            let log = icode_engine::VerifyLog::open_default()
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let files: Vec<String> = files.iter().map(|f| verify_abs_path(&root, f)).collect();
+            let run = icode_engine::NewRun {
+                project: project.clone(),
+                kind: icode_engine::RunKind::parse(&kind),
+                command,
+                ok: !failed,
+                wide: !narrow && files.is_empty(),
+                files,
+                scope: None,
+                summary: None,
+            };
+            log.record(&run).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            println!("recorded for {project}");
+            Ok(())
+        }
+        VerifyAction::Status { path } => {
+            let root = existing_root(path)?;
+            let project = verify_project(&root);
+            let log = icode_engine::VerifyLog::open_default()
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let runs = log
+                .recent(&project, 10)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            println!("project: {project}");
+            if runs.is_empty() {
+                println!("no runs recorded yet");
+            }
+            for r in &runs {
+                println!(
+                    "  {} {:<9} {} {}",
+                    if r.ok { "PASS" } else { "FAIL" },
+                    r.kind,
+                    if r.wide && r.files.is_empty() {
+                        "project-wide".to_string()
+                    } else if r.files.is_empty() {
+                        "narrowed".to_string()
+                    } else {
+                        format!("{} file(s)", r.files.len())
+                    },
+                    r.command
+                );
+            }
+            let store = SqliteCodeStore::open(&root).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let rep = icode_engine::stale_report(&log, &store, &root, &project, 5)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            println!(
+                "unproven: {} of {} indexed files",
+                rep.stale_count, rep.files_checked
+            );
+            Ok(())
+        }
+        VerifyAction::Stale { path, limit } => {
+            let root = existing_root(path)?;
+            let project = verify_project(&root);
+            let log = icode_engine::VerifyLog::open_default()
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let store = SqliteCodeStore::open(&root).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let rep = icode_engine::stale_report(&log, &store, &root, &project, limit)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            if rep.all_verified {
+                println!("nothing changed since the last green run");
+                return Ok(());
+            }
+            println!(
+                "{} of {} files changed since the last run covering them:",
+                rep.stale_count, rep.files_checked
+            );
+            for f in &rep.stale {
+                let tests = if f.covering_tests.is_empty() {
+                    "no test reaches it".to_string()
+                } else {
+                    format!("re-run: {}", f.covering_tests.join(", "))
+                };
+                println!("  {} — {tests}", f.path);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// PostToolUse hook: file a verification run the agent just executed.
+///
+/// Deliberately silent and always exit 0 — a hook that prints or fails would
+/// interrupt the session it is meant to observe. Records NOTHING unless the
+/// command is a recognised check and its output states pass or fail outright.
+fn run_hook_post_tool(project: Option<&str>, cwd: Option<&std::path::Path>) {
+    let _ = try_hook_post_tool(project, cwd);
+}
+
+fn try_hook_post_tool(project: Option<&str>, cwd: Option<&std::path::Path>) -> Option<()> {
+    use std::io::Read;
+
+    // Bounded read: a tool response can carry a lot of output, but the ledger only
+    // needs enough to classify it.
+    let mut raw = String::new();
+    std::io::stdin()
+        .take(4 << 20)
+        .read_to_string(&mut raw)
+        .ok()?;
+    let input = icode_engine::parse_post_tool_input(&raw)?;
+    let command = input.command()?;
+    let recognised = icode_engine::classify_command(command)?;
+    let output = input.output();
+    // No verdict in the output → record nothing. A guessed pass would clear files
+    // that were never verified, which is the one error this feature cannot make.
+    let ok = icode_engine::outcome_from_output(&output)?;
+
+    let root = cwd
+        .map(std::path::Path::to_path_buf)
+        .or_else(|| input.cwd.as_ref().map(PathBuf::from))
+        .or_else(|| std::env::current_dir().ok())?;
+    let root = find_repo_top(&root).unwrap_or(root);
+    let project = match project {
+        Some(p) if !p.trim().is_empty() => p.trim().to_string(),
+        _ => verify_project(&root),
+    };
+
+    let log = icode_engine::VerifyLog::open_default().ok()?;
+    log.record(&icode_engine::NewRun {
+        project,
+        kind: recognised.kind,
+        command: command.to_string(),
+        ok,
+        files: Vec::new(),
+        wide: recognised.wide,
+        scope: (!recognised.wide).then(|| command.to_string()),
+        summary: icode_engine::output_tail(&output, 12),
+    })
+    .ok()?;
+    Some(())
 }
 
 fn run_stats(path: &std::path::Path) -> anyhow::Result<()> {
@@ -258,6 +617,14 @@ fn run_doctor(path: &std::path::Path) -> anyhow::Result<()> {
     println!("embedded:           {}", r.embedded);
     println!("pending embeddings: {}", r.pending_embeddings);
     println!("orphan vectors:     {}", r.orphan_vectors);
+    println!("ghost chunks:       {}", r.ghost_chunks);
+    if r.ghost_chunks > 0 {
+        println!(
+            "  ↳ chunks from files the index no longer knows — semantic search can still\n     \
+             return them. `icode index {}` clears them.",
+            path.display()
+        );
+    }
 
     print_examples("missing", &r.missing, r.missing_count);
     print_examples("outdated", &r.outdated, r.outdated_count);
@@ -666,7 +1033,7 @@ fn run_serve(path: Option<PathBuf>) -> anyhow::Result<()> {
 
     // Serving is async (rmcp/tokio); the rest of the CLI stays sync.
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async move {
+    let served = runtime.block_on(async move {
         let store = Arc::new(open_store_with_shared_cache(&root)?);
 
         // Incremental graph sync so the served working tree is CURRENT before the
@@ -675,33 +1042,113 @@ fn run_serve(path: Option<PathBuf>) -> anyhow::Result<()> {
         // transport), and any failure degrades to serving the existing graph rather
         // than aborting serve. It is local + parallel (no network), so it does not
         // stall the handshake for a typical tree.
-        match icode_engine::index_path(&root, store.as_ref()) {
-            Ok(s) => eprintln!(
-                "icode serve: graph synced ({} indexed, {} skipped, {} errors)",
-                s.files_indexed, s.files_skipped, s.errors
-            ),
-            Err(e) => eprintln!("icode serve: graph sync skipped ({e}); serving existing index"),
-        }
-
-        // The startup sync is a SNAPSHOT: it makes the graph true at 0 s and steadily
-        // less true from then on, as the session edits files. A stale graph does not
-        // merely omit things — it asserts that code still exists, still calls what it
-        // used to, and is still reachable. An agent believes it.
         //
-        // So the watcher is started here rather than left as a chore the user has to
-        // remember: one detached daemon per project, flock'd so several editor windows
-        // cannot race, idle when nothing changes. `ICODE_NO_DAEMON=1` opts out.
-        let want_daemon = std::env::var("ICODE_NO_DAEMON")
-            .map(|v| !matches!(v.trim(), "1" | "true" | "yes" | "on"))
-            .unwrap_or(true);
-        if want_daemon {
-            match daemon_pid(&root) {
-                Some(pid) => eprintln!("icode serve: watcher already running (pid {pid})"),
-                None => match spawn_daemon(&root) {
-                    Ok(()) => eprintln!("icode serve: watcher started — the graph stays live"),
-                    // Never fatal: a served snapshot is still useful.
-                    Err(e) => eprintln!("icode serve: could not start the watcher ({e})"),
-                },
+        // ONE EXCEPTION: a root that is `$HOME` (or `/`) is never indexed. `serve`
+        // with no path falls back to the launch dir, and outside a repo that is
+        // frequently the home directory — which walked every project the user has
+        // ever touched into one 4.0 GB index (observed: 64k files, 827k functions,
+        // paths under `~/.cache/uv` and `~/.cache/JetBrains`). Excluding tool caches
+        // shrinks that, but the honest answer is that "$HOME" is not a project: the
+        // graph would answer questions about a codebase nobody is working on.
+        // The sync and the watcher both run OFF the handshake path.
+        //
+        // They used to run inline, so `initialize` was answered only once the whole
+        // tree had been walked. On a 16k-file checkout that pass measured 2m18s
+        // against an MCP client's 30s connect budget: the client killed the process
+        // at 30s, the partial pass was discarded, the next attempt started over, and
+        // the server never came up — `icode` was reported as failed, not slow. The
+        // pass is now a background task and the handshake completes in milliseconds;
+        // graph-reading tools wait on `sync` (bounded) and label answers computed
+        // from a graph that is not finished yet, so a cold start degrades to "late
+        // and honest" instead of "absent".
+        // Whether tools WAIT on the pass depends on what is already in the store.
+        //
+        // An empty store means this session is the tree's first index: every graph
+        // answer before the pass lands is a confident falsehood ("no such symbol",
+        // "unreferenced", "UNTESTED"), so tools block briefly and label what they
+        // return. A populated store is a RE-sync — the graph is already complete
+        // and the pass is only checking freshness — so tools must not queue behind
+        // it. That distinction is not academic: a re-sync of an unchanged 16k-file
+        // tree indexes 0 files and still takes 75s on a cold page cache, and making
+        // every session pay that to re-confirm what it already had is how the
+        // handshake got into trouble in the first place. The watcher, plus the next
+        // startup pass, is what keeps a re-syncing graph honest.
+        let already_indexed = store.stats().map(|s| s.files > 0).unwrap_or(false);
+        let (signal, sync_handle) = icode_serve::mcp::sync_channel();
+        let sync_handle = if already_indexed {
+            icode_serve::mcp::SyncHandle::ready()
+        } else {
+            sync_handle
+        };
+        match unindexable_root(&root) {
+            Some(reason) => {
+                eprintln!(
+                    "icode serve: NOT indexing {} ({reason}). Memory tools work as usual; \
+                     for code tools, launch from inside a project or pass a path.",
+                    root.display()
+                );
+                // Nothing will ever be indexed here, so tools must not wait for it.
+                signal.finish(icode_serve::mcp::GraphSync::Ready);
+            }
+            None => {
+                // The startup sync is a SNAPSHOT: it makes the graph true at 0 s and
+                // steadily less true from then on, as the session edits files. A stale
+                // graph does not merely omit things — it asserts that code still
+                // exists, still calls what it used to, and is still reachable. An agent
+                // believes it.
+                //
+                // So the watcher is started here rather than left as a chore the user
+                // has to remember: one detached daemon per project, flock'd so several
+                // editor windows cannot race, idle when nothing changes.
+                // `ICODE_NO_DAEMON=1` opts out.
+                let want_daemon = std::env::var("ICODE_NO_DAEMON")
+                    .map(|v| !matches!(v.trim(), "1" | "true" | "yes" | "on"))
+                    .unwrap_or(true);
+                let store_bg = store.clone();
+                let root_bg = root.clone();
+                tokio::task::spawn_blocking(move || {
+                    // Best-effort: hash-skips unchanged files, writes only to stderr
+                    // (stdout is the MCP transport), and any failure degrades to
+                    // serving the existing graph rather than aborting serve.
+                    let state = match icode_engine::index_path(&root_bg, store_bg.as_ref()) {
+                        Ok(s) => {
+                            eprintln!(
+                                "icode serve: graph synced ({} indexed, {} skipped, {} errors)",
+                                s.files_indexed, s.files_skipped, s.errors
+                            );
+                            icode_serve::mcp::GraphSync::Ready
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "icode serve: graph sync skipped ({e}); serving existing index"
+                            );
+                            icode_serve::mcp::GraphSync::Failed
+                        }
+                    };
+                    // Release the waiting tools BEFORE spawning the watcher: the
+                    // graph is already complete at this point, and daemon startup
+                    // is not something a tool call should queue behind.
+                    signal.finish(state);
+
+                    // Started after the pass, not alongside it: two writers on one
+                    // SQLite file is a contention the sequential order avoids.
+                    if want_daemon {
+                        match daemon_pid(&root_bg) {
+                            Some(pid) => {
+                                eprintln!("icode serve: watcher already running (pid {pid})")
+                            }
+                            None => match spawn_daemon(&root_bg) {
+                                Ok(()) => {
+                                    eprintln!("icode serve: watcher started — the graph stays live")
+                                }
+                                // Never fatal: a served snapshot is still useful.
+                                Err(e) => {
+                                    eprintln!("icode serve: could not start the watcher ({e})")
+                                }
+                            },
+                        }
+                    }
+                });
             }
         }
 
@@ -737,8 +1184,23 @@ fn run_serve(path: Option<PathBuf>) -> anyhow::Result<()> {
 
         // Pass the project root so the `doctor` MCP tool can reconcile the index
         // against the live source tree (it walks `root` like the indexer does).
-        icode_serve::serve_stdio(store, root, embedder, memory).await
-    })
+        icode_serve::serve_stdio(store, root, embedder, memory, sync_handle).await
+    });
+
+    // Once the transport is gone the process has nothing left to serve, so it
+    // must EXIT NOW. Dropping the runtime instead would wait for the startup
+    // sync (a `spawn_blocking` task that cannot be cancelled) — 67 s on a 16k-file
+    // tree with a cold page cache. An MCP client that closes a server during the
+    // handshake (Claude Code does, on a pre-init probe it cannot get an answer
+    // to) then waits for the exit to respawn it, gives up at 30 s, and reports the
+    // server as failed. Cutting the pass short cannot corrupt the index — every
+    // file is written in its own SQLite transaction — and the next launch
+    // re-syncs what is left. The one thing it can leave behind is a pass killed
+    // after its last file write but before edge resolution: those edges and
+    // ranks then wait for the next file change. The watcher is not started
+    // either; the next complete pass starts it.
+    runtime.shutdown_background();
+    served
 }
 
 /// `icode web <path> [--port N]` — open the store and serve the local web
@@ -770,7 +1232,23 @@ fn run_web(path: PathBuf, port: u16) -> anyhow::Result<()> {
 ///
 /// The lock file carries the holder's PID; the flock itself is what guarantees
 /// single-writer, so a stale PID in the file after a crash is harmless — we probe
-/// liveness with `kill(pid, 0)` rather than trusting the file.
+/// liveness rather than trusting the file.
+///
+/// `kill(pid, 0)` alone is NOT that probe, and believing it made `daemon status`
+/// lie twice over (both observed live):
+///
+///   * **Zombies.** A daemon whose watcher init failed (inotify instance limit)
+///     exits, but until the parent reaps it the pid still exists as `Z (defunct)`
+///     — and signal 0 succeeds against it. Status then reported RUNNING for a
+///     daemon that had indexed nothing for days, which is worse than reporting
+///     nothing: a stale graph does not merely omit, it asserts what is no longer true.
+///   * **PID reuse.** Pids wrap. An unrelated process that inherited the dead
+///     daemon's number answers signal 0 just as happily.
+///
+/// So liveness = signal 0 AND `/proc/<pid>` says the process is not a zombie AND
+/// its command is actually ours. On a system without `/proc` (not Linux) the two
+/// extra checks are skipped: they degrade to the old behaviour rather than
+/// pretending a daemon is dead.
 fn daemon_pid(root: &std::path::Path) -> Option<i32> {
     let pid: i32 = std::fs::read_to_string(root.join(".icode/daemon.lock"))
         .ok()?
@@ -778,11 +1256,58 @@ fn daemon_pid(root: &std::path::Path) -> Option<i32> {
         .parse()
         .ok()?;
     // Signal 0 = existence/permission probe, sends nothing.
-    if unsafe { libc::kill(pid, 0) } == 0 {
-        Some(pid)
-    } else {
-        None
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return None;
     }
+    if is_zombie(pid) || !is_icode_process(pid) {
+        return None;
+    }
+    Some(pid)
+}
+
+/// True when `/proc/<pid>/stat` reports state `Z` (exited, not yet reaped).
+///
+/// The state is the field after the comm field, and comm is an arbitrary string in
+/// parentheses that may itself contain spaces and `)` — so the parse anchors on the
+/// LAST `)` instead of splitting on whitespace from the left.
+fn is_zombie(pid: i32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false; // no /proc (or no permission): not evidence of a zombie
+    };
+    proc_state(&stat) == Some('Z')
+}
+
+/// The state character out of a `/proc/<pid>/stat` line, or `None` if it is not
+/// parseable. Split out from [`is_zombie`] so the parse is testable without a
+/// real zombie process.
+fn proc_state(stat: &str) -> Option<char> {
+    let (_, after_comm) = stat.rsplit_once(')')?;
+    after_comm.split_whitespace().next()?.chars().next()
+}
+
+/// True when pid's command looks like ours — guards against PID reuse handing us
+/// an unrelated process. Reads `/proc/<pid>/cmdline` (NUL-separated argv) and checks
+/// the executable name, so `/usr/bin/icode` and `./target/debug/icode` both match.
+/// Unreadable `/proc` (missing, or another user's process) counts as ours: this is a
+/// tie-breaker, not an authorisation check.
+fn is_icode_process(pid: i32) -> bool {
+    match std::fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(cmdline) => cmdline_is_icode(&cmdline),
+        Err(_) => true,
+    }
+}
+
+/// Whether a raw `/proc/<pid>/cmdline` (NUL-separated argv) belongs to an icode
+/// process. Empty input means "cannot tell" and answers true — this is a
+/// tie-breaker against pid reuse, never an authorisation check.
+fn cmdline_is_icode(cmdline: &[u8]) -> bool {
+    if cmdline.is_empty() {
+        return true;
+    }
+    let argv0 = cmdline.split(|b| *b == 0).next().unwrap_or_default();
+    let argv0 = String::from_utf8_lossy(argv0);
+    let exe = argv0.rsplit('/').next().unwrap_or(&argv0);
+    exe.starts_with("icode")
 }
 
 /// `icode daemon start <path>` — spawn the watcher DETACHED and return immediately.
@@ -940,9 +1465,13 @@ fn keep_model_resident_for_bulk() {
 }
 
 /// Build the cross-session memory store for `serve`, wrapped in the WAL audit
-/// decorator. Returns `None` (memory-less mode) when there is no embedder or the
-/// central db could not be opened — `serve` never fails here. A stderr note
-/// records the resulting mode (stdout is the MCP transport).
+/// decorator. Returns `None` (memory-less mode) when the embedder could not be
+/// built at all or the central db could not be opened — `serve` never fails here.
+/// A stderr note records the resulting mode (stdout is the MCP transport).
+///
+/// Opening the store needs the embedder's `dim()`, not a live backend, so a down
+/// Ollama no longer costs the session its memory: reads degrade to lexical and
+/// writes fail per call until the backend answers.
 fn build_serve_memory(
     embedder: Option<Arc<dyn icode_core::traits::Embedder>>,
 ) -> Option<Arc<dyn icode_core::traits::MemoryStore>> {
@@ -976,9 +1505,20 @@ fn build_serve_memory(
     Some(store)
 }
 
-/// Build the configured embedder for `serve`, probing its health, and report the
-/// resulting mode on stderr. Returns `Some(Arc<dyn Embedder>)` when ready, or
-/// `None` (lexical-only) on any build/health failure — `serve` never fails here.
+/// Build the configured embedder for `serve`, probe its health, and report the
+/// resulting mode on stderr. Returns `None` only when the embedder cannot be
+/// BUILT (an unsupported backend — a config error no retry fixes); `serve` never
+/// fails here.
+///
+/// A failed health probe deliberately still returns the embedder. The probe is one
+/// sample at process start, and Ollama is started by hand on many machines: latching
+/// "disabled" on that sample was the single largest source of icode behaving
+/// differently from one session to the next — a server launched a minute before
+/// Ollama ran the WHOLE session with no semantic search and, because the central
+/// memory store owns the embedder, no cross-session memory at all, while the next
+/// window had both. Every consumer already treats an embed error as a reason to
+/// degrade for that call, so keeping the embedder costs a failed HTTP request per
+/// call while Ollama is down and recovers by itself the moment it is up.
 fn build_serve_embedder() -> Option<Arc<dyn icode_core::traits::Embedder>> {
     use icode_core::traits::Embedder;
     let cfg = EmbedConfig::default();
@@ -989,11 +1529,12 @@ fn build_serve_embedder() -> Option<Arc<dyn icode_core::traits::Embedder>> {
             return None;
         }
     };
-    if let Err(e) = embedder.health() {
-        eprintln!("semantic search disabled: {e} (lexical only)");
-        return None;
+    match embedder.health() {
+        Ok(()) => eprintln!("semantic search enabled (model {})", embedder.model_id()),
+        Err(e) => eprintln!(
+            "semantic search degraded: {e} (lexical only for now; recovers automatically once the backend answers)"
+        ),
     }
-    eprintln!("semantic search enabled (model {})", embedder.model_id());
     // Box<dyn Embedder> → Arc<dyn Embedder>.
     let arc: Arc<dyn Embedder> = Arc::from(embedder);
     Some(arc)
@@ -1123,6 +1664,7 @@ fn is_throwaway_dir(dir: &std::path::Path) -> bool {
 ///   3. the cwd basename, UNLESS the cwd is a throwaway/container location
 ///      (`$HOME`, a `tmp`/`scratchpad`/… dir), which collapses to `general`;
 ///   4. `general`.
+///
 /// Never empty. Preferring the git root (2) and rejecting throwaway dirs (3) is what
 /// keeps one project in one bucket instead of fragmenting into `crates`, `Onyx` vs
 /// `onyx`, `worker`, `tmp`, or `scratchpad`.
@@ -1176,6 +1718,7 @@ fn find_repo_top(dir: &std::path::Path) -> Option<PathBuf> {
 ///      launch from any SUBDIRECTORY (or a git worktree) anchors the single
 ///      `.icode/index.db` at the tree root, never in a subdir;
 ///   3. else that launch dir as-is (not inside a repo).
+///
 /// This is what lets ONE path-free `.mcp.json` serve whichever checkout or worktree
 /// Claude Code opens; the memory side resolves to the shared canonical name, so the
 /// two together Just Work across worktrees.
@@ -1191,6 +1734,24 @@ fn resolve_serve_root(explicit: Option<PathBuf>) -> PathBuf {
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."));
     find_repo_top(&launch).unwrap_or(launch)
+}
+
+/// Why this root must not be indexed, or `None` when it is a normal project.
+///
+/// Only the two roots whose indexing is always a mistake are rejected: `$HOME`
+/// (what `serve` falls back to outside a repo) and the filesystem root. A `tmp`
+/// or scratch directory is NOT rejected — people do real work there, and unlike
+/// `$HOME` the cost is bounded.
+fn unindexable_root(root: &std::path::Path) -> Option<&'static str> {
+    if root.parent().is_none() {
+        return Some("the filesystem root");
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() && root == std::path::Path::new(&home) {
+            return Some("the home directory is not a project");
+        }
+    }
+    None
 }
 
 /// Full JSON string escaping for arbitrary memory content (which can carry quotes,
@@ -1470,9 +2031,10 @@ fn try_hook_stop(project: Option<&str>, cwd: Option<&std::path::Path>) -> Option
 fn run_hook_config() {
     eprintln!("# Add the `hooks` block below to ~/.claude/settings.json (merge into an");
     eprintln!("# existing \"hooks\" object if you already have one). Claude Code will then");
-    eprintln!("# run `icode hook …` on SessionStart / PreCompact / Stop to inject memory,");
-    eprintln!("# re-assert L0 rules across compaction, and auto-save a session summary");
-    eprintln!("# when the agent forgets `session_end`. (stdout below is the JSON snippet.)");
+    eprintln!("# run `icode hook …` on SessionStart / PreCompact / Stop / PostToolUse to");
+    eprintln!("# inject memory, re-assert L0 rules across compaction, auto-save a session");
+    eprintln!("# summary when the agent forgets `session_end`, and file every test/build");
+    eprintln!("# run in the verification ledger. (stdout below is the JSON snippet.)");
     eprintln!();
     println!("{}", hook_settings_json());
 }
@@ -1488,15 +2050,21 @@ fn hook_settings_json() -> String {
     let cmd_session = format!("{exe} hook session-start --cwd \\\"$CLAUDE_PROJECT_DIR\\\"");
     let cmd_precompact = format!("{exe} hook precompact --cwd \\\"$CLAUDE_PROJECT_DIR\\\"");
     let cmd_stop = format!("{exe} hook stop --cwd \\\"$CLAUDE_PROJECT_DIR\\\"");
+    let cmd_post = format!("{exe} hook post-tool --cwd \\\"$CLAUDE_PROJECT_DIR\\\"");
+    // PostToolUse is matched to Bash only: the ledger cares about commands that
+    // ran, and firing on every file read would be pure overhead.
     format!(
-        "{{\n  \"hooks\": {{\n    \"SessionStart\": [\n      {{\n        \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \"{cmd_session}\" }}\n        ]\n      }}\n    ],\n    \"PreCompact\": [\n      {{\n        \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \"{cmd_precompact}\" }}\n        ]\n      }}\n    ],\n    \"Stop\": [\n      {{\n        \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \"{cmd_stop}\" }}\n        ]\n      }}\n    ]\n  }}\n}}"
+        "{{\n  \"hooks\": {{\n    \"SessionStart\": [\n      {{\n        \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \"{cmd_session}\" }}\n        ]\n      }}\n    ],\n    \"PreCompact\": [\n      {{\n        \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \"{cmd_precompact}\" }}\n        ]\n      }}\n    ],\n    \"Stop\": [\n      {{\n        \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \"{cmd_stop}\" }}\n        ]\n      }}\n    ],\n    \"PostToolUse\": [\n      {{\n        \"matcher\": \"Bash\",\n        \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \"{cmd_post}\" }}\n        ]\n      }}\n    ]\n  }}\n}}"
     )
 }
 
 #[cfg(test)]
 mod derivation_tests {
-    use super::{find_repo_top, git_root_basename, hook_project, is_throwaway_dir, resolve_serve_root};
-    use std::path::Path;
+    use super::{
+        canonical_root, cmdline_is_icode, existing_root, find_repo_top, git_root_basename, hook_project,
+        is_throwaway_dir, proc_state, resolve_serve_root, unindexable_root,
+    };
+    use std::path::{Path, PathBuf};
 
     /// A tempdir whose `root/` holds a `.git` dir and a nested `a/b` subtree.
     fn repo_with_subdir() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
@@ -1599,5 +2167,93 @@ mod derivation_tests {
     fn resolve_serve_root_prefers_explicit_path() {
         let p = std::path::PathBuf::from("/explicit/project/root");
         assert_eq!(resolve_serve_root(Some(p.clone())), p);
+    }
+
+    #[test]
+    fn home_and_filesystem_root_are_never_indexed() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let home = td.path().join("home").join("u");
+        std::fs::create_dir_all(home.join("proj")).unwrap();
+        let prev = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+
+        assert!(unindexable_root(&home).is_some(), "$HOME must be rejected");
+        assert!(unindexable_root(Path::new("/")).is_some(), "/ must be rejected");
+        // A real project — including one inside the home tree — is fine.
+        assert!(unindexable_root(&home.join("proj")).is_none());
+
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn proc_state_reads_the_field_after_comm() {
+        // Real shape: pid (comm) state ppid ...
+        assert_eq!(proc_state("42 (icode) S 1 42 42 0 -1 4194560").unwrap(), 'S');
+        assert_eq!(proc_state("42 (icode) Z 1 42 42 0 -1 4194560").unwrap(), 'Z');
+        // comm is arbitrary: spaces and parens inside it must not shift the parse.
+        assert_eq!(proc_state("7 (i code (x)) Z 1 7").unwrap(), 'Z');
+        // Unparseable input is never read as a zombie.
+        assert_eq!(proc_state("nonsense"), None);
+        assert_eq!(proc_state("42 (icode)"), None);
+    }
+
+    /// Two spellings of the same tree must resolve to one key. `icode index .`
+    /// once doubled this repo's own index because they did not: the second pass
+    /// wrote `./crates/…` beside the existing `/abs/crates/…`, and every file,
+    /// symbol and chunk existed twice.
+    #[test]
+    fn a_path_and_its_spellings_canonicalise_to_one_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonical tempdir");
+        std::fs::create_dir(root.join("sub")).expect("mkdir");
+
+        let via_dot = canonical_root(root.join("sub").join("..").join("."));
+        let via_sub = canonical_root(root.join("sub"));
+
+        assert_eq!(via_dot, root, "`x/sub/../.` is the root itself");
+        assert_eq!(via_sub, root.join("sub"), "a real subdir stays itself");
+        assert!(via_dot.is_absolute(), "the stored key is always absolute");
+    }
+
+    /// Opening a store CREATES the database, so a mistyped path used to succeed
+    /// and leave a `./<typo>/.icode/` behind, reporting an empty tree as fact.
+    #[test]
+    fn a_path_that_is_not_a_directory_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("not-a-dir.txt");
+        std::fs::write(&file, "x").expect("write");
+
+        assert!(existing_root(PathBuf::from("iCode")).is_err(), "a bare name is not a path");
+        assert!(existing_root(file).is_err(), "a file is not a project root");
+        assert!(
+            existing_root(dir.path().to_path_buf()).is_ok(),
+            "a real directory still works"
+        );
+        assert!(
+            !dir.path().join("iCode").exists(),
+            "nothing was created on the way"
+        );
+    }
+
+    /// A path that does not exist cannot be canonicalised — it must pass through
+    /// untouched so the command's own error is what the user sees.
+    #[test]
+    fn a_missing_path_is_passed_through_unchanged() {
+        let missing = PathBuf::from("/definitely/not/here/12345");
+        assert_eq!(canonical_root(missing.clone()), missing);
+    }
+
+    #[test]
+    fn cmdline_is_icode_matches_our_binary_only() {
+        assert!(cmdline_is_icode(b"/home/u/.local/bin/icode\0daemon\0run\0."));
+        assert!(cmdline_is_icode(b"./target/debug/icode\0daemon\0run"));
+        // A pid recycled by an unrelated process must not read as our daemon.
+        assert!(!cmdline_is_icode(b"/usr/bin/python3\0script.py"));
+        assert!(!cmdline_is_icode(b"/usr/lib/firefox/firefox\0"));
+        // Unreadable/empty cmdline is "cannot tell" → treated as ours.
+        assert!(cmdline_is_icode(b""));
     }
 }

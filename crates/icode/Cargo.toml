@@ -19,6 +19,8 @@ anyhow = { workspace = true }
 # it by PID. The lock itself lives in icode-engine.
 libc = { workspace = true }
 clap = { workspace = true }
+# Passphrase prompts for `icode vault` read the terminal, never argv or stdin.
+rpassword = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
@@ -26,3 +28,5 @@ tokio = { workspace = true }
 # and drive the real `icode hook …` binary over it.
 rusqlite = { workspace = true }
 tempfile = "3"
+# `serve_probe` reads the JSON-RPC frames the real `icode serve` writes.
+serde_json = { workspace = true }

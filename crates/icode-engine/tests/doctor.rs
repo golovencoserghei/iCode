@@ -158,3 +158,69 @@ fn orphan_invariant_holds_and_embedding_counters_track() {
     assert_eq!(after.orphan_vectors, 0, "still no orphan vectors after embedding");
     assert!(after.healthy, "fully indexed + embedded tree is healthy, got {after:?}");
 }
+
+/// A file that leaves the tree takes its chunks with it.
+///
+/// This is the regression for the defect that made semantic search answer from
+/// deleted code: `delete_file` used to clear only the `files` row, and
+/// `code_chunks` hangs off `path`, not off `files.id`, so the FK cascade never
+/// reached it. The chunks (and their vectors) outlived the file forever, because
+/// a path that is never re-indexed never goes through `upsert_chunks`.
+#[test]
+fn a_deleted_file_leaves_no_chunks_behind() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    fs::write(root.join("alpha.rs"), SAMPLE).expect("write alpha");
+    fs::write(root.join("beta.rs"), SAMPLE).expect("write beta");
+
+    let store = SqliteCodeStore::open(root).expect("open store");
+    index_path(root, &store).expect("index");
+    let before = diagnose(&store, root).expect("diagnose");
+    assert_eq!(before.files_indexed, 2);
+    assert_eq!(before.ghost_chunks, 0, "nothing is a ghost yet");
+
+    fs::remove_file(root.join("beta.rs")).expect("remove beta");
+    index_path(root, &store).expect("re-index");
+
+    let after = diagnose(&store, root).expect("diagnose after delete");
+    assert_eq!(after.files_indexed, 1, "the deleted file left the index");
+    assert_eq!(
+        after.ghost_chunks, 0,
+        "its chunks left with it — otherwise semantic search still returns them"
+    );
+    assert!(after.chunks < before.chunks, "the chunk count actually dropped");
+    assert!(after.healthy, "healthy again after the delete: {after:?}");
+}
+
+/// An index written by an older binary carries ghosts nothing would ever clean:
+/// their path is not re-indexed, so `upsert_chunks` never runs for it. `doctor`
+/// must report them (and NOT call the tree healthy), and an index pass must clear
+/// them.
+#[test]
+fn ghosts_from_an_older_index_are_reported_then_pruned() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    fs::write(root.join("alpha.rs"), SAMPLE).expect("write alpha");
+
+    let store = SqliteCodeStore::open(root).expect("open store");
+    index_path(root, &store).expect("index");
+
+    // Forge exactly what the old `delete_file` left: a chunk whose file is gone.
+    store
+        .insert_ghost_chunk_for_test("/gone/from/disk/ancient.rs")
+        .expect("forge ghost");
+
+    let sick = diagnose(&store, root).expect("diagnose with ghost");
+    assert_eq!(sick.ghost_chunks, 1, "the ghost is counted");
+    assert!(
+        !sick.healthy,
+        "a tree that can answer with deleted code is not healthy: {sick:?}"
+    );
+
+    let stats = index_path(root, &store).expect("re-index");
+    assert_eq!(stats.ghost_chunks_pruned, 1, "the index pass swept it");
+
+    let healed = diagnose(&store, root).expect("diagnose after prune");
+    assert_eq!(healed.ghost_chunks, 0);
+    assert!(healed.healthy, "healthy once the ghost is gone: {healed:?}");
+}

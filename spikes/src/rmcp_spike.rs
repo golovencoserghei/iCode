@@ -13,6 +13,8 @@ use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 
 #[derive(Clone)]
 struct DemoServer {
+    // Read by the `#[tool_handler]` macro expansion, not by our own code.
+    #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
