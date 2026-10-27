@@ -1,5 +1,5 @@
 //! End-to-end LIVE test (requires a running Ollama with the configured embedding
-//! model). It is deliberately NOT `#[ignore]`: this is the proof the chunk+embed
+//! model). `#[ignore]`d for CI (no Ollama); this is the proof the chunk+embed
 //! phase closes the semantic pipeline symbols → chunks → embeddings → vec0.
 //!
 //! Flow: index a temp Rust project (real `index_path`) → assert chunks were
@@ -46,6 +46,7 @@ impl TreeWalker {
 "#;
 
 #[test]
+#[ignore = "needs a live Ollama (run: cargo test -- --ignored)"]
 fn embed_pipeline_indexes_embeds_and_knn_retrieves() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();

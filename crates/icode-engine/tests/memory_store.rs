@@ -63,6 +63,7 @@ fn assert_orphan_free(db_path: &str) {
 }
 
 #[test]
+#[ignore = "needs a live Ollama (run: cargo test -- --ignored)"]
 fn memory_store_full_lifecycle() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("icode.db");

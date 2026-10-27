@@ -53,6 +53,7 @@ fn add(store: &SqliteMemoryStore, project: &str, content: &str, cat: Category) -
 /// `session_start` returns the developer profile AND recent project context, and
 /// warms up the surfaced ids (access_count > 0 afterwards).
 #[test]
+#[ignore = "needs a live Ollama (run: cargo test -- --ignored)"]
 fn session_start_returns_profile_and_context() {
     let (_dir, store) = store();
     let project = "alpha";
@@ -96,6 +97,7 @@ fn session_start_returns_profile_and_context() {
 /// `session_end` saves the wrap-up (summary/decisions/completed/todos) and
 /// auto-resolves an OPEN bug that a completed item is clearly about.
 #[test]
+#[ignore = "needs a live Ollama (run: cargo test -- --ignored)"]
 fn session_end_saves_and_auto_resolves_open_bug() {
     let (_dir, store) = store();
     let project = "beta";

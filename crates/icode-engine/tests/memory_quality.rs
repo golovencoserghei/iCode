@@ -48,6 +48,7 @@ fn mem(project: &str, content: &str, importance: f32, tags: &[&str]) -> NewMemor
 // ──────────────────────────── A) dedup gate ────────────────────────────
 
 #[test]
+#[ignore = "needs a live Ollama (run: cargo test -- --ignored)"]
 fn dedup_gate_blocks_a_re_add_but_allows_distinct_content() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = dir.path().join("icode.db");
@@ -100,6 +101,7 @@ fn dedup_gate_blocks_a_re_add_but_allows_distinct_content() {
 // ──────────────────────────── B) usage-aware ranking ────────────────────────────
 
 #[test]
+#[ignore = "needs a live Ollama (run: cargo test -- --ignored)"]
 fn old_l0_record_outranks_a_fresh_low_importance_one() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = dir.path().join("icode.db");
@@ -155,6 +157,7 @@ fn old_l0_record_outranks_a_fresh_low_importance_one() {
 // ──────────────────────────── C) access warm-up ────────────────────────────
 
 #[test]
+#[ignore = "needs a live Ollama (run: cargo test -- --ignored)"]
 fn search_warms_up_access_count_on_returned_hits() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = dir.path().join("icode.db");
@@ -182,6 +185,7 @@ fn search_warms_up_access_count_on_returned_hits() {
 // ──────────────────────────── D) WAL audit ────────────────────────────
 
 #[test]
+#[ignore = "needs a live Ollama (run: cargo test -- --ignored)"]
 fn wal_store_appends_an_audit_line_on_add() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = dir.path().join("icode.db");
