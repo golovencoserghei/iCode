@@ -1,0 +1,16 @@
+# Every pull request (and every push to the main branch) must build, pass clippy and the tests.
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
