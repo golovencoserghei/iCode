@@ -1,12 +1,13 @@
 //! Live integration tests against a running Ollama daemon (default
-//! `http://127.0.0.1:11434`, model `qwen3-embedding:0.6b`). NOT `#[ignore]`:
-//! the M2 environment guarantees Ollama is up with the model pulled.
+//! `http://127.0.0.1:11434`, model `qwen3-embedding:0.6b`). `#[ignore]`d so CI
+//! (no Ollama) stays green; run locally with `cargo test -p icode-embed -- --ignored`.
 
 use icode_core::config::EmbedConfig;
 use icode_embed::build_embedder;
 
 /// Batch embed at the native dim (1024): two distinct vectors, all finite.
 #[test]
+#[ignore = "needs a live Ollama with qwen3-embedding:0.6b"]
 fn embed_batch_native_dim() {
     let cfg = EmbedConfig::default();
     let embedder = build_embedder(&cfg).expect("build_embedder(ollama)");
@@ -41,6 +42,7 @@ fn embed_batch_native_dim() {
 /// MRL path: request dim 256 -> backend native (1024) is truncated to 256 and
 /// L2-renormalised to unit norm.
 #[test]
+#[ignore = "needs a live Ollama with qwen3-embedding:0.6b"]
 fn embed_mrl_truncated_dim_is_unit_norm() {
     let cfg = EmbedConfig {
         dim: 256,
@@ -69,6 +71,7 @@ fn embed_mrl_truncated_dim_is_unit_norm() {
 
 /// Health probe: model present in `/api/tags` -> Ok.
 #[test]
+#[ignore = "needs a live Ollama with qwen3-embedding:0.6b"]
 fn health_ok() {
     let cfg = EmbedConfig::default();
     let embedder = build_embedder(&cfg).expect("build_embedder(ollama)");

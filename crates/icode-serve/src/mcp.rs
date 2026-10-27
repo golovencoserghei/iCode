@@ -13,7 +13,13 @@ use icode_core::traits::{CodeReadStore, Embedder, MemoryStore};
 use icode_engine::SqliteCodeStore;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{ServerCapabilities, ServerInfo};
+use rmcp::model::{
+    ClientJsonRpcMessage, ClientRequest, ErrorCode, ErrorData, JsonRpcError, ServerCapabilities,
+    ServerInfo, ServerJsonRpcMessage,
+};
+use rmcp::service::{RoleServer, ServerInitializeError};
+use rmcp::transport::async_rw::AsyncRwTransport;
+use rmcp::transport::Transport;
 use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 
 /// Error string returned by the semantic tools when no embedder was wired up
@@ -33,6 +39,99 @@ const DEFAULT_N_PROFILE_NOTES: usize = 5;
 /// Batch size for the on-demand embed pass run before a semantic query.
 const JIT_EMBED_BATCH: usize = 32;
 
+/// A path in the form the index stores it, so evidence recorded by a caller lines
+/// up with the graph's rows.
+///
+/// The indexer keys files on their ABSOLUTE path. A run recorded as `src/a.rs`
+/// while the graph holds `/home/u/proj/src/a.rs` matches nothing, and the file is
+/// then reported as never verified for ever — a false alarm is as corrosive here
+/// as a false all-clear, so this conversion is load-bearing, not cosmetic.
+fn normalise_indexed_path(root: &std::path::Path, path: &str) -> String {
+    let raw = path.trim().trim_start_matches("./");
+    let p = std::path::Path::new(raw);
+    if p.is_absolute() {
+        return p.to_string_lossy().to_string();
+    }
+    root.join(p).to_string_lossy().to_string()
+}
+
+/// Progress of the startup graph sync, shared between the background indexing
+/// task in the `icode` binary and the tools here that read the graph.
+///
+/// The sync used to run to completion BEFORE the server answered `initialize`.
+/// That is correct but not survivable: on a 16k-file tree the pass takes ~2m18s,
+/// and an MCP client gives the handshake 30s. The client then kills the process
+/// mid-pass, the next attempt restarts from nothing, and the server never comes
+/// up at all — observed on a 6.5 GB checkout, where `icode` was simply absent
+/// rather than slow. A server that answers late is worth strictly more than one
+/// that never answers, so the pass moved off the handshake path.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GraphSync {
+    /// The startup pass is still walking the tree; the graph is incomplete.
+    Indexing,
+    /// The graph is current as of server startup.
+    Ready,
+    /// The pass failed. The pre-existing graph (possibly stale, possibly empty)
+    /// is being served as-is.
+    Failed,
+}
+
+/// Write end of the sync signal, held by the indexing task.
+pub struct SyncSignal(tokio::sync::watch::Sender<GraphSync>);
+
+impl SyncSignal {
+    /// Publish the terminal state. Dropping without calling this leaves readers
+    /// on `Indexing` until the channel closes, which `await_graph` treats as
+    /// "stopped waiting" rather than "ready" — it never claims a graph is
+    /// complete on the strength of a task that vanished.
+    pub fn finish(self, state: GraphSync) {
+        let _ = self.0.send(state);
+    }
+}
+
+/// Read end of the sync signal, cloned into the server.
+#[derive(Clone)]
+pub struct SyncHandle(tokio::sync::watch::Receiver<GraphSync>);
+
+impl SyncHandle {
+    /// A handle for a graph that needs no startup pass (tests, in-memory
+    /// fixtures, an already-synced store).
+    pub fn ready() -> Self {
+        let (tx, rx) = tokio::sync::watch::channel(GraphSync::Ready);
+        // Keep the sender alive for the life of the receiver: a closed channel
+        // is indistinguishable from an abandoned indexer at the read end.
+        std::mem::forget(tx);
+        Self(rx)
+    }
+}
+
+/// Create a linked ([`SyncSignal`], [`SyncHandle`]) pair in the `Indexing` state.
+pub fn sync_channel() -> (SyncSignal, SyncHandle) {
+    let (tx, rx) = tokio::sync::watch::channel(GraphSync::Indexing);
+    (SyncSignal(tx), SyncHandle(rx))
+}
+
+/// How long a graph-reading tool waits for the startup sync before answering
+/// from the partial graph. Overridable with `ICODE_SYNC_WAIT` (seconds; `0`
+/// disables waiting entirely).
+const DEFAULT_SYNC_WAIT_SECS: u64 = 20;
+
+/// Note attached to a result computed while the graph was still being built.
+///
+/// This exists because the failure mode of a partial graph is not omission but
+/// assertion: `audit op=dead` calls a live symbol unreferenced, `symbol
+/// op=tests` reports UNTESTED, `check_exists` answers ABSENT — each a confident
+/// claim about code the indexer has not reached yet. An agent believes those.
+const PARTIAL_GRAPH_NOTE: &str =
+    "the startup index pass is STILL RUNNING: this answer is computed from a partial \
+     graph. Absence of a result here is not evidence of absence in the code — re-run \
+     this call once indexing finishes.";
+
+/// Note attached when the startup pass failed outright.
+const FAILED_GRAPH_NOTE: &str =
+    "the startup index pass FAILED: this answer comes from whatever graph already \
+     existed, which may be stale or empty. Run `icode index <path>` and retry.";
+
 #[derive(Clone)]
 pub struct CodeMcpServer {
     store: Arc<SqliteCodeStore>,
@@ -51,6 +150,9 @@ pub struct CodeMcpServer {
     /// the concrete `SqliteMemoryStore`/`WalStore` and passes it as `Arc<dyn
     /// MemoryStore>` — `icode-serve` stays decoupled from `icode-embed`.
     memory: Option<Arc<dyn MemoryStore>>,
+    /// Progress of the startup graph sync. Graph-reading tools wait on this
+    /// briefly and label their answer when the graph is not yet complete.
+    sync: SyncHandle,
     // Consumed by the `#[tool_handler]` macro expansion (routes tool calls);
     // dead-code analysis can't see that path, so the read is suppressed here.
     #[allow(dead_code)]
@@ -148,6 +250,26 @@ pub struct AuditArgs {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct VerifyArgs {
+    /// record | status | stale | tests.
+    pub op: String,
+    /// op=record: the command that ran, verbatim.
+    pub command: Option<String>,
+    /// op=record: did it exit 0? Defaults to true.
+    pub ok: Option<bool>,
+    /// op=record: test|build|lint|typecheck|other (default test).
+    pub kind: Option<String>,
+    /// op=record: files the run exercised. OMIT for a whole-project run.
+    pub files: Option<Vec<String>>,
+    /// op=record: short output tail (keep failures here).
+    pub summary: Option<String>,
+    /// op=tests: the file whose covering tests to list.
+    pub path: Option<String>,
+    /// Max rows.
+    pub limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
 pub struct MemoryArgs {
     /// add | search | list | update | delete | resolve | search_all | projects | for_symbol | why.
     pub op: String,
@@ -173,6 +295,12 @@ pub struct MemoryArgs {
     pub limit: Option<usize>,
     /// Include resolved memories.
     pub include_resolved: Option<bool>,
+    /// op=curate: actually archive (default false = report only).
+    pub apply: Option<bool>,
+    /// op=curate: days idle before a low-importance record is stale (default 90).
+    pub stale_days: Option<f64>,
+    /// op=curate: word-overlap at which two records count as the same fact (0..1, default 0.8).
+    pub dup_similarity: Option<f64>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -218,33 +346,11 @@ pub struct DeveloperArgs {
 // ──────────────────────────── arg structs (internal handlers) ────────────────────────────
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
-pub struct RepoMapArgs {
-    /// How many top entries to include per section (modules/complex/hotspots). Default 30.
-    pub top: Option<usize>,
-}
-
-#[derive(serde::Deserialize, schemars::JsonSchema)]
 pub struct SymbolContextArgs {
     /// Symbol name (bare function/class name) to gather context for.
     pub name: String,
     /// Optional file path to disambiguate a symbol that exists in several files.
     pub file_hint: Option<String>,
-}
-
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-pub struct SearchFunctionArgs {
-    /// Lexical query matched against function name / qualified name.
-    pub query: String,
-    /// Max hits to return (default 10).
-    pub limit: Option<usize>,
-}
-
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-pub struct SearchClassArgs {
-    /// Lexical query matched against class name / qualified name.
-    pub query: String,
-    /// Max hits to return (default 10).
-    pub limit: Option<usize>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -587,12 +693,73 @@ impl CodeMcpServer {
         embedder: Option<Arc<dyn Embedder>>,
         memory: Option<Arc<dyn MemoryStore>>,
     ) -> Self {
+        Self::with_sync(store, root, embedder, memory, SyncHandle::ready())
+    }
+
+    /// As [`Self::new`], but tied to a startup index pass still running in the
+    /// background. Graph-reading tools wait on `sync` before answering.
+    pub fn with_sync(
+        store: Arc<SqliteCodeStore>,
+        root: std::path::PathBuf,
+        embedder: Option<Arc<dyn Embedder>>,
+        memory: Option<Arc<dyn MemoryStore>>,
+        sync: SyncHandle,
+    ) -> Self {
         Self {
             store,
             root,
             embedder,
             memory,
+            sync,
             tool_router: Self::tool_router(),
+        }
+    }
+
+    /// Wait for the startup index pass, bounded, and report what the caller is
+    /// about to read.
+    ///
+    /// Returns `None` when the graph is complete, or `Some(note)` to be attached
+    /// to the answer when it is not. The bound matters in both directions: an
+    /// unbounded wait would trade a failed handshake for a hung tool call (the
+    /// 2m18s pass again), while not waiting at all would hand the first call of
+    /// every cold session an empty graph it cannot tell from a real answer.
+    async fn await_graph(&self) -> Option<&'static str> {
+        let wait = std::env::var("ICODE_SYNC_WAIT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_SYNC_WAIT_SECS);
+        self.await_graph_within(std::time::Duration::from_secs(wait)).await
+    }
+
+    /// [`Self::await_graph`] with the budget passed in, so tests do not have to
+    /// wait out the real one.
+    async fn await_graph_within(&self, wait: std::time::Duration) -> Option<&'static str> {
+        let mut rx = self.sync.0.clone();
+        if !wait.is_zero() {
+            let _ = tokio::time::timeout(wait, async {
+                loop {
+                    // Copy out before awaiting: the borrow guard must not be held
+                    // across a suspension point.
+                    if *rx.borrow_and_update() != GraphSync::Indexing {
+                        return;
+                    }
+                    // Sender gone: nobody will ever report completion, so stop
+                    // waiting and let the note say the graph is partial.
+                    if rx.changed().await.is_err() {
+                        return;
+                    }
+                }
+            })
+            .await;
+        }
+
+        // Copy out of the guard before matching: the borrow must not outlive the
+        // statement.
+        let state = *rx.borrow();
+        match state {
+            GraphSync::Ready => None,
+            GraphSync::Indexing => Some(PARTIAL_GRAPH_NOTE),
+            GraphSync::Failed => Some(FAILED_GRAPH_NOTE),
         }
     }
 
@@ -603,17 +770,6 @@ impl CodeMcpServer {
         let result = tokio::task::spawn_blocking(move || icode_engine::diagnose(&store, &root)).await;
         match result {
             Ok(Ok(report)) => to_json(&report),
-            Ok(Err(e)) => err_json(&e.to_string()),
-            Err(e) => err_json(&e.to_string()),
-        }
-    }
-
-    async fn get_repo_map(&self, Parameters(args): Parameters<RepoMapArgs>) -> String {
-        let store = self.store.clone();
-        let top = args.top.unwrap_or(30);
-        let result = tokio::task::spawn_blocking(move || store.repo_map(top)).await;
-        match result {
-            Ok(Ok(map)) => to_json(&map),
             Ok(Err(e)) => err_json(&e.to_string()),
             Err(e) => err_json(&e.to_string()),
         }
@@ -645,42 +801,6 @@ impl CodeMcpServer {
         }
     }
 
-    async fn search_function(&self, Parameters(args): Parameters<SearchFunctionArgs>) -> String {
-        let store = self.store.clone();
-        let query = CodeQuery {
-            text: args.query,
-            kind: Some(SymbolKind::Function),
-            lang: None,
-            limit: args.limit.unwrap_or(10),
-            mode: SearchMode::Hybrid,
-            with_body: false,
-        };
-        let result = tokio::task::spawn_blocking(move || store.search_code(&query)).await;
-        match result {
-            Ok(Ok(hits)) => to_json(&hits),
-            Ok(Err(e)) => err_json(&e.to_string()),
-            Err(e) => err_json(&e.to_string()),
-        }
-    }
-
-    async fn search_class(&self, Parameters(args): Parameters<SearchClassArgs>) -> String {
-        let store = self.store.clone();
-        let query = CodeQuery {
-            text: args.query,
-            kind: Some(SymbolKind::Class),
-            lang: None,
-            limit: args.limit.unwrap_or(10),
-            mode: SearchMode::Hybrid,
-            with_body: false,
-        };
-        let result = tokio::task::spawn_blocking(move || store.search_code(&query)).await;
-        match result {
-            Ok(Ok(hits)) => to_json(&hits),
-            Ok(Err(e)) => err_json(&e.to_string()),
-            Err(e) => err_json(&e.to_string()),
-        }
-    }
-
     async fn find_existing(&self, Parameters(args): Parameters<FindExistingArgs>) -> String {
         let kind = match args.kind.as_deref() {
             None | Some("") | Some("all") => Ok(None),
@@ -702,19 +822,32 @@ impl CodeMcpServer {
             // filter is honoured only on the lexical-only fallback path, where the
             // store applies it. (Kind-filtering a fused result would drop signal;
             // documented limitation — pass kind only when you need lexical-only.)
-            match embedder.as_deref() {
-                Some(emb) if kind.is_none() => {
-                    jit_embed(&store, emb);
-                    icode_engine::hybrid_search(&store, emb, &query, limit)
-                }
-                _ => store.search_code(&CodeQuery {
+            let lexical = |query: String| {
+                store.search_code(&CodeQuery {
                     text: query,
                     kind,
                     lang: None,
                     limit,
                     mode: SearchMode::Hybrid,
                     with_body: false,
-                }),
+                })
+            };
+            match embedder.as_deref() {
+                Some(emb) if kind.is_none() => {
+                    jit_embed(&store, emb);
+                    // `hybrid_search` propagates an embed failure and leaves the
+                    // degrade decision to us (see its doc comment). Search is the
+                    // most-called tool there is; when Ollama is down or restarting
+                    // it answers lexically instead of returning an error.
+                    match icode_engine::hybrid_search(&store, emb, &query, limit) {
+                        Ok(hits) => Ok(hits),
+                        Err(e) => {
+                            eprintln!("icode: search degraded to lexical-only ({e})");
+                            lexical(query)
+                        }
+                    }
+                }
+                _ => lexical(query),
             }
         })
         .await;
@@ -1483,6 +1616,11 @@ impl CodeMcpServer {
 
     #[tool(description = "Search code by words or identifier. Identifier-aware: `Handler` finds `HttpRequestHandler`. kind: function|class|any. mode: lexical (default, free, exact-name-first)|semantic|hybrid. scope: limit to one sub-project in a monorepo.")]
     async fn search(&self, Parameters(a): Parameters<SearchArgs>) -> String {
+        let note = self.await_graph().await;
+        tag_sync(note, self.search_on_graph(Parameters(a)).await)
+    }
+
+    async fn search_on_graph(&self, Parameters(a): Parameters<SearchArgs>) -> String {
         match a.mode.as_deref().unwrap_or("lexical") {
             "semantic" => {
                 self.semantic_search_code(Parameters(SemanticSearchArgs {
@@ -1507,6 +1645,11 @@ impl CodeMcpServer {
 
     #[tool(description = "Everything about a symbol. op: context (default: def+callers+callees) | def | callers | callees | references (every use, classified: definition/call/import/mention - precise, not grep) | tests (which tests reach it, transitively - empty means UNTESTED) | implementations | similar.")]
     async fn symbol(&self, Parameters(a): Parameters<SymbolArgs>) -> String {
+        let note = self.await_graph().await;
+        tag_sync(note, self.symbol_on_graph(Parameters(a)).await)
+    }
+
+    async fn symbol_on_graph(&self, Parameters(a): Parameters<SymbolArgs>) -> String {
         match a.op.as_deref().unwrap_or("context") {
             "def" => {
                 let f = self
@@ -1577,6 +1720,11 @@ impl CodeMcpServer {
 
     #[tool(description = "Call/import graph. op: chain (target->to) | impact (reverse deps of a file) | deps (a file's deps).")]
     async fn graph(&self, Parameters(a): Parameters<GraphArgs>) -> String {
+        let note = self.await_graph().await;
+        tag_sync(note, self.graph_on_graph(Parameters(a)).await)
+    }
+
+    async fn graph_on_graph(&self, Parameters(a): Parameters<GraphArgs>) -> String {
         match a.op.as_str() {
             "chain" => {
                 let to = match a.to {
@@ -1610,6 +1758,11 @@ impl CodeMcpServer {
 
     #[tool(description = "Architecture overview: stats, languages, hotspots, entry points, complex symbols. In a monorepo, call it WITHOUT scope first to list the sub-projects, then with scope=<member> to map one.")]
     async fn map(&self, Parameters(a): Parameters<MapArgs>) -> String {
+        let note = self.await_graph().await;
+        tag_sync(note, self.map_on_graph(Parameters(a)).await)
+    }
+
+    async fn map_on_graph(&self, Parameters(a): Parameters<MapArgs>) -> String {
         let store = self.store.clone();
         let top = a.top.unwrap_or(30);
         let scope = a.scope.clone();
@@ -1652,6 +1805,11 @@ impl CodeMcpServer {
 
     #[tool(description = "Files. op: outline (symbols in a file) | list | stat | read (needs start/end).")]
     async fn file(&self, Parameters(a): Parameters<FileArgs>) -> String {
+        let note = self.await_graph().await;
+        tag_sync(note, self.file_on_graph(Parameters(a)).await)
+    }
+
+    async fn file_on_graph(&self, Parameters(a): Parameters<FileArgs>) -> String {
         match a.op.as_str() {
             "outline" => match a.path {
                 Some(path) => {
@@ -1693,11 +1851,21 @@ impl CodeMcpServer {
 
     #[tool(description = "Regex search over stored symbol bodies. JSON array of GrepHit (path/line/snippet).")]
     async fn grep(&self, Parameters(a): Parameters<GrepCodeArgs>) -> String {
+        let note = self.await_graph().await;
+        tag_sync(note, self.grep_on_graph(Parameters(a)).await)
+    }
+
+    async fn grep_on_graph(&self, Parameters(a): Parameters<GrepCodeArgs>) -> String {
         self.grep_code(Parameters(a)).await
     }
 
     #[tool(description = "Codebase audit. op: dead (unreferenced) | unreachable (from entrypoints) | complex | routes | health (index drift).")]
     async fn audit(&self, Parameters(a): Parameters<AuditArgs>) -> String {
+        let note = self.await_graph().await;
+        tag_sync(note, self.audit_on_graph(Parameters(a)).await)
+    }
+
+    async fn audit_on_graph(&self, Parameters(a): Parameters<AuditArgs>) -> String {
         let analysis = AnalysisArgs {
             language: a.language,
             limit: a.limit,
@@ -1722,17 +1890,123 @@ impl CodeMcpServer {
         }
     }
 
+    /// The project key the verification ledger is filed under: the served root's
+    /// directory name. `serve` already anchors the root at the working-tree top,
+    /// so this matches the name the memory tools use for the same checkout.
+    fn project_name(&self) -> String {
+        self.root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|n| !n.is_empty())
+            .unwrap_or("general")
+            .to_string()
+    }
+
+    #[tool(description = "Verification ledger: what has actually been PROVEN about this tree. op: record (log a test/build run) | status (recent runs + how much is unproven) | stale (files changed since the last green run covering them, with the tests to re-run) | tests (tests covering one file). Answers \"did the tests covering what I just changed actually run?\".")]
+    async fn verify(&self, Parameters(a): Parameters<VerifyArgs>) -> String {
+        let project = self.project_name();
+        let root = self.root.clone();
+        let store = self.store.clone();
+        let limit = a.limit.unwrap_or(20).clamp(1, 200);
+
+        let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
+            let log = icode_engine::VerifyLog::open_default().map_err(|e| e.to_string())?;
+            match a.op.as_str() {
+                "record" => {
+                    let Some(command) = a.command.clone() else {
+                        return Err("verify op=record needs `command`".to_string());
+                    };
+                    let files = a
+                        .files
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|f| normalise_indexed_path(&root, f))
+                        .collect::<Vec<_>>();
+                    let run = icode_engine::NewRun {
+                        project: project.clone(),
+                        kind: icode_engine::RunKind::parse(a.kind.as_deref().unwrap_or("test")),
+                        command,
+                        ok: a.ok.unwrap_or(true),
+                        // A caller that names no files is stating a whole-project run.
+                        // The hook path decides this by parsing the command instead.
+                        wide: files.is_empty(),
+                        files,
+                        scope: None,
+                        summary: a.summary,
+                    };
+                    let id = log.record(&run).map_err(|e| e.to_string())?;
+                    Ok(to_json(&serde_json::json!({
+                        "recorded": id,
+                        "project": project,
+                        "scope": if run.files.is_empty() { "project-wide" } else { "targeted" },
+                    })))
+                }
+                "status" => {
+                    let recent = log.recent(&project, limit).map_err(|e| e.to_string())?;
+                    let report =
+                        icode_engine::stale_report(&log, store.as_ref(), &root, &project, 5)
+                            .map_err(|e| e.to_string())?;
+                    Ok(to_json(&serde_json::json!({
+                        "project": project,
+                        "recent_runs": recent,
+                        "unverified_files": report.stale_count,
+                        "files_checked": report.files_checked,
+                        "all_verified": report.all_verified,
+                        "last_green_run": report.last_green_run,
+                        "worst_offenders": report.stale,
+                    })))
+                }
+                "stale" => {
+                    let report =
+                        icode_engine::stale_report(&log, store.as_ref(), &root, &project, limit)
+                            .map_err(|e| e.to_string())?;
+                    Ok(to_json(&report))
+                }
+                "tests" => {
+                    let Some(path) = a.path.clone() else {
+                        return Err("verify op=tests needs `path`".to_string());
+                    };
+                    let path = normalise_indexed_path(&root, &path);
+                    let tests = store
+                        .find_tests_covering_file(&path, 5)
+                        .map_err(|e| e.to_string())?;
+                    Ok(to_json(&serde_json::json!({ "path": path, "tests": tests })))
+                }
+                other => Err(format!(
+                    "unknown verify op `{other}` (record|status|stale|tests)"
+                )),
+            }
+        })
+        .await;
+
+        match result {
+            Ok(Ok(json)) => json,
+            Ok(Err(e)) => err_json(&e),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }
+
     #[tool(description = "Grounded existence oracle: does a feature matching this description ACTUALLY exist? Returns VERDICT (EXISTS/WEAK/ABSENT) + evidence. Use before claiming something is missing.")]
     async fn check_exists(&self, Parameters(a): Parameters<CheckExistsArgs>) -> String {
+        let note = self.await_graph().await;
+        tag_sync(note, self.check_exists_on_graph(Parameters(a)).await)
+    }
+
+    async fn check_exists_on_graph(&self, Parameters(a): Parameters<CheckExistsArgs>) -> String {
         self.check_exists_impl(Parameters(a)).await
     }
 
     #[tool(description = "Flagship recall: one query -> relevant CODE and relevant MEMORY, ranked separately.")]
     async fn recall(&self, Parameters(a): Parameters<RecallArgs>) -> String {
+        let note = self.await_graph().await;
+        tag_sync(note, self.recall_on_graph(Parameters(a)).await)
+    }
+
+    async fn recall_on_graph(&self, Parameters(a): Parameters<RecallArgs>) -> String {
         self.recall_impl(Parameters(a)).await
     }
 
-    #[tool(description = "Cross-session memory. op: add | search | list | update | delete | resolve | search_all (all projects) | projects | for_symbol | why (decisions behind a symbol).")]
+    #[tool(description = "Cross-session memory. op: add | search | list | update | delete | resolve | search_all (all projects) | projects | for_symbol | why (decisions behind a symbol) | curate (report stale + near-duplicate records; archives them only with apply=true, never deletes).")]
     async fn memory(&self, Parameters(a): Parameters<MemoryArgs>) -> String {
         let need = |v: Option<String>, what: &str| -> Result<String, String> {
             v.ok_or_else(|| err_json(&format!("memory op={} needs `{}`", a.op, what)))
@@ -1751,6 +2025,39 @@ impl CodeMcpServer {
                     importance: a.importance,
                 }))
                 .await
+            }
+            "curate" => {
+                let Some(project) = a.project.clone() else {
+                    return err_json("memory op=curate needs `project`");
+                };
+                let Some(memory) = self.memory.clone() else {
+                    return err_json(NO_MEMORY_ERR);
+                };
+                let cfg = icode_engine::CurateConfig {
+                    apply: a.apply.unwrap_or(false),
+                    stale_days: a
+                        .stale_days
+                        .unwrap_or_else(|| icode_engine::CurateConfig::default().stale_days),
+                    dup_similarity: a
+                        .dup_similarity
+                        .unwrap_or_else(|| icode_engine::CurateConfig::default().dup_similarity)
+                        .clamp(0.3, 1.0),
+                    ..icode_engine::CurateConfig::default()
+                };
+                let result = tokio::task::spawn_blocking(move || {
+                    icode_engine::curate(
+                        memory.as_ref(),
+                        &project,
+                        cfg,
+                        &icode_core::config::RankingConfig::default(),
+                    )
+                })
+                .await;
+                match result {
+                    Ok(Ok(report)) => to_json(&report),
+                    Ok(Err(e)) => err_json(&e.to_string()),
+                    Err(e) => err_json(&e.to_string()),
+                }
             }
             "search" => {
                 let (project, query) = match (a.project.clone(), a.query.clone()) {
@@ -1921,12 +2228,125 @@ pub async fn serve_stdio(
     root: std::path::PathBuf,
     embedder: Option<Arc<dyn Embedder>>,
     memory: Option<Arc<dyn MemoryStore>>,
+    sync: SyncHandle,
 ) -> anyhow::Result<()> {
-    let service = CodeMcpServer::new(store, root, embedder, memory)
-        .serve((tokio::io::stdin(), tokio::io::stdout()))
-        .await?;
+    let transport = PreInitTolerant::new(AsyncRwTransport::<RoleServer, _, _>::new(
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+    ));
+    let service = match CodeMcpServer::with_sync(store, root, embedder, memory, sync)
+        .serve(transport)
+        .await
+    {
+        Ok(service) => service,
+        // The client went away before `initialize` (it is shutting down, or it
+        // gave up on the handshake). Nothing was served and nothing failed on
+        // this side, so this is a quiet, successful exit — not an error for the
+        // client's log to flag.
+        Err(ServerInitializeError::ConnectionClosed(_)) => {
+            eprintln!("icode serve: client closed the connection before initialize; exiting");
+            return Ok(());
+        }
+        Err(e) => return Err(anyhow::Error::new(e).context("MCP handshake failed")),
+    };
     service.waiting().await?;
     Ok(())
+}
+
+/// A transport that answers a request sent BEFORE `initialize` with a JSON-RPC
+/// "method not found" error instead of letting the handshake abort.
+///
+/// rmcp 1.8 tears the connection down on any pre-init request other than `ping`
+/// (`ServerInitializeError::ExpectedInitializeRequest`). Claude Code opens every
+/// stdio server with a version-negotiation probe — a `server/discover` request
+/// with id `server-discover-probe-N` — BEFORE it sends `initialize`. The probe
+/// killed every server; the client then waited for the process to EXIT and
+/// respawned it in its legacy mode. That recovery only works when the exit is
+/// prompt, and on a 16k-file tree the exit trailed the startup sync by over a
+/// minute, so the client hit its 30 s connect budget and reported `icode` as
+/// failed (observed on a 2 GB index: "CONNECT_TIMEOUT" twice in a row).
+///
+/// An error reply that echoes the request id is what the client reads as "this
+/// server predates the probe": it proceeds to `initialize` on the same
+/// connection, no respawn, no second startup sync. That is also what JSON-RPC
+/// prescribes for an unknown method, so a client that never probes sees nothing
+/// different.
+///
+/// Only requests are answered; a pre-init notification or response still reaches
+/// rmcp and is rejected there as before.
+pub struct PreInitTolerant<T> {
+    inner: T,
+    initialized: bool,
+}
+
+impl<T> PreInitTolerant<T> {
+    pub fn new(inner: T) -> Self {
+        Self {
+            inner,
+            initialized: false,
+        }
+    }
+}
+
+impl<T: Transport<RoleServer>> Transport<RoleServer> for PreInitTolerant<T> {
+    type Error = T::Error;
+
+    fn send(
+        &mut self,
+        item: ServerJsonRpcMessage,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + 'static {
+        self.inner.send(item)
+    }
+
+    async fn receive(&mut self) -> Option<ClientJsonRpcMessage> {
+        loop {
+            let msg = self.inner.receive().await?;
+            if self.initialized {
+                return Some(msg);
+            }
+            match msg {
+                ClientJsonRpcMessage::Request(req)
+                    if matches!(req.request, ClientRequest::InitializeRequest(_)) =>
+                {
+                    self.initialized = true;
+                    return Some(ClientJsonRpcMessage::Request(req));
+                }
+                // rmcp answers a pre-init ping itself (the spec allows it).
+                ClientJsonRpcMessage::Request(req)
+                    if matches!(req.request, ClientRequest::PingRequest(_)) =>
+                {
+                    return Some(ClientJsonRpcMessage::Request(req));
+                }
+                ClientJsonRpcMessage::Request(req) => {
+                    let method = req.request.method();
+                    // An unknown method (the probe) is exactly what -32601 is for.
+                    // A real MCP method sent too early is not unknown, it is early:
+                    // -32002 is the conventional "server not initialized" code.
+                    let error = match &req.request {
+                        ClientRequest::CustomRequest(_) => ErrorData::new(
+                            ErrorCode::METHOD_NOT_FOUND,
+                            format!("method '{method}' not found"),
+                            None,
+                        ),
+                        _ => ErrorData::new(
+                            ErrorCode(-32002),
+                            format!("server not initialized: '{method}' must follow initialize"),
+                            None,
+                        ),
+                    };
+                    let reply = ServerJsonRpcMessage::Error(JsonRpcError::new(Some(req.id), error));
+                    if self.inner.send(reply).await.is_err() {
+                        return None;
+                    }
+                }
+                other => return Some(other),
+            }
+        }
+    }
+
+    fn close(&mut self) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+        self.inner.close()
+    }
 }
 
 /// Parse a `category` argument string into a `Category`. The mapping mirrors
@@ -2008,6 +2428,28 @@ enum MapReply {
 
 fn err_json(msg: &str) -> String {
     serde_json::json!({ "error": msg }).to_string()
+}
+
+/// Attach an [`await_graph`] note to a tool's JSON answer.
+///
+/// `None` is the hot path and returns the payload untouched — no reparse, no
+/// shape change, nothing for the model to read. Only a partial or failed graph
+/// pays: an object gains an `index_sync` field, and any other shape (the tools
+/// that answer with a bare array) is wrapped so the warning cannot be missed. A
+/// changed shape in the degraded case is the point: silently returning a
+/// well-formed empty array is what makes an agent conclude the code is not there.
+fn tag_sync(note: Option<&'static str>, json: String) -> String {
+    let Some(note) = note else { return json };
+    match serde_json::from_str::<serde_json::Value>(&json) {
+        Ok(serde_json::Value::Object(mut map)) => {
+            map.insert("index_sync".into(), serde_json::Value::String(note.into()));
+            serde_json::Value::Object(map).to_string()
+        }
+        Ok(other) => serde_json::json!({ "index_sync": note, "result": other }).to_string(),
+        // Not JSON (a few tools answer with rendered text): prefix the warning
+        // rather than dropping it.
+        Err(_) => format!("[index_sync] {note}\n\n{json}"),
+    }
 }
 
 /// Per-memory content cap in the compacted session-start block.
@@ -2256,6 +2698,71 @@ mod tests {
         }
     }
 
+    /// An embedder that is WIRED UP but unreachable — what a server holds whenever
+    /// Ollama is down, restarting, or simply not started yet at login. Since the
+    /// startup health probe no longer latches the embedder away, this is the normal
+    /// degraded state, not an exotic one.
+    struct DownEmbedder;
+
+    impl Embedder for DownEmbedder {
+        fn model_id(&self) -> &str {
+            "down"
+        }
+        fn dim(&self) -> usize {
+            1024
+        }
+        fn backend(&self) -> &str {
+            "ollama"
+        }
+        fn embed(&self, _texts: &[&str]) -> icode_core::error::Result<Vec<Vec<f32>>> {
+            Err(icode_core::error::Error::Embed(
+                "is ollama running at http://127.0.0.1:11434?".into(),
+            ))
+        }
+        fn health(&self) -> icode_core::error::Result<()> {
+            Err(icode_core::error::Error::Embed("backend down".into()))
+        }
+    }
+
+    /// The regression: with an embedder present but failing, `search` propagated the
+    /// embed error and the tool answered with an error instead of the lexical hits it
+    /// could still compute. Same for `recall`, which an agent calls at session start —
+    /// an error there reads as "icode is broken".
+    #[tokio::test]
+    async fn search_and_recall_degrade_when_the_embedder_is_down() {
+        let store = Arc::new(SqliteCodeStore::open_in_memory().expect("store"));
+        let embedder: Option<Arc<dyn Embedder>> = Some(Arc::new(DownEmbedder));
+        let server =
+            CodeMcpServer::new(store, std::path::PathBuf::from("."), embedder, None);
+
+        let out = server
+            .search(Parameters(SearchArgs {
+                query: "read a file".into(),
+                kind: None,
+                limit: Some(5),
+                with_body: None,
+                mode: None,
+                scope: None,
+            }))
+            .await;
+        assert_eq!(out, "[]", "search falls back to lexical (empty db → []), got {out}");
+
+        let rec = server
+            .recall(Parameters(RecallArgs {
+                project: "demo".into(),
+                query: "read a file from disk".into(),
+                limit: Some(5),
+            }))
+            .await;
+        let v: serde_json::Value = serde_json::from_str(&rec).expect("recall json");
+        for key in ["relevant_code", "relevant_memory", "facts"] {
+            assert!(
+                v.get(key).and_then(|x| x.as_array()).map(|a| a.is_empty()).unwrap_or(false),
+                "recall section '{key}' present and empty with a down embedder, got {rec}"
+            );
+        }
+    }
+
     /// `parse_category_arg` maps the wire strings and falls back to General.
     #[test]
     fn category_arg_parsing() {
@@ -2264,5 +2771,223 @@ mod tests {
         assert_eq!(parse_category_arg(" todo "), Category::Todo);
         assert_eq!(parse_category_arg("nonsense"), Category::General);
         assert_eq!(parse_category_arg(""), Category::General);
+    }
+    /// The startup index pass no longer gates the handshake, so a tool CAN be
+    /// called while the graph is still being built. What must not happen is the
+    /// tool answering as if the graph were complete: an empty result from a
+    /// half-built index is indistinguishable from "this code does not exist",
+    /// and that is the reading an agent acts on.
+    #[tokio::test]
+    async fn tools_label_answers_computed_from_a_partial_graph() {
+        let (signal, handle) = sync_channel();
+        let store = Arc::new(SqliteCodeStore::open_in_memory().expect("store"));
+        let server = CodeMcpServer::with_sync(
+            store,
+            std::path::PathBuf::from("."),
+            None,
+            None,
+            handle,
+        );
+
+        // Still indexing: the wait expires and the answer carries the warning.
+        let note = server
+            .await_graph_within(std::time::Duration::from_millis(20))
+            .await;
+        assert_eq!(note, Some(PARTIAL_GRAPH_NOTE));
+
+        // An empty hit list is the dangerous case — it must not go out bare.
+        let tagged = tag_sync(note, "[]".to_string());
+        let v: serde_json::Value = serde_json::from_str(&tagged).expect("json");
+        assert_eq!(v["index_sync"], serde_json::json!(PARTIAL_GRAPH_NOTE));
+        assert_eq!(v["result"], serde_json::json!([]));
+
+        // Once the pass reports in, the same call is clean and unlabelled.
+        signal.finish(GraphSync::Ready);
+        let note = server
+            .await_graph_within(std::time::Duration::from_secs(5))
+            .await;
+        assert_eq!(note, None);
+        assert_eq!(tag_sync(note, "[]".to_string()), "[]", "no reshaping once ready");
+    }
+
+    /// A failed pass is not the same as a slow one: the graph on disk may be
+    /// stale or empty and will never improve on its own, so the note has to say
+    /// so rather than implying the caller should just retry in a moment.
+    #[tokio::test]
+    async fn a_failed_pass_is_reported_as_failed_not_pending() {
+        let (signal, handle) = sync_channel();
+        let store = Arc::new(SqliteCodeStore::open_in_memory().expect("store"));
+        let server =
+            CodeMcpServer::with_sync(store, std::path::PathBuf::from("."), None, None, handle);
+        signal.finish(GraphSync::Failed);
+
+        let note = server
+            .await_graph_within(std::time::Duration::from_secs(5))
+            .await;
+        assert_eq!(note, Some(FAILED_GRAPH_NOTE));
+
+        // Object payloads keep their shape and gain one field.
+        let tagged = tag_sync(note, r#"{"hits":3}"#.to_string());
+        let v: serde_json::Value = serde_json::from_str(&tagged).expect("json");
+        assert_eq!(v["hits"], serde_json::json!(3));
+        assert_eq!(v["index_sync"], serde_json::json!(FAILED_GRAPH_NOTE));
+    }
+
+    /// Dropping the indexing task without reporting (a panic in the pass) must not
+    /// park tools until the budget expires on every single call, and must never be
+    /// mistaken for success.
+    #[tokio::test]
+    async fn an_abandoned_pass_does_not_read_as_ready() {
+        let (signal, handle) = sync_channel();
+        let store = Arc::new(SqliteCodeStore::open_in_memory().expect("store"));
+        let server =
+            CodeMcpServer::with_sync(store, std::path::PathBuf::from("."), None, None, handle);
+        drop(signal);
+
+        let started = std::time::Instant::now();
+        let note = server
+            .await_graph_within(std::time::Duration::from_secs(30))
+            .await;
+        assert_eq!(note, Some(PARTIAL_GRAPH_NOTE));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "a closed channel returns at once instead of burning the whole budget"
+        );
+    }
+
+    /// `CodeMcpServer::new` is used where no startup pass exists (tests, the web
+    /// dashboard). It must not make every graph tool wait on a signal that will
+    /// never arrive.
+    #[tokio::test]
+    async fn a_server_without_a_startup_pass_never_waits() {
+        let store = Arc::new(SqliteCodeStore::open_in_memory().expect("store"));
+        let server = CodeMcpServer::new(store, std::path::PathBuf::from("."), None, None);
+        assert_eq!(
+            server
+                .await_graph_within(std::time::Duration::from_secs(30))
+                .await,
+            None
+        );
+    }
+
+    /// A server behind `PreInitTolerant` on an in-memory pipe, plus the client's
+    /// line reader and writer. The handshake task resolves once `initialize`
+    /// completes (or the handshake fails).
+    type PipeClient = (
+        tokio::io::Lines<tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+        tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        tokio::task::JoinHandle<
+            Result<rmcp::service::RunningService<RoleServer, CodeMcpServer>, ServerInitializeError>,
+        >,
+    );
+
+    fn pipe_server() -> PipeClient {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (srv_r, srv_w) = tokio::io::split(server);
+        let transport =
+            PreInitTolerant::new(AsyncRwTransport::<RoleServer, _, _>::new(srv_r, srv_w));
+        let store = Arc::new(SqliteCodeStore::open_in_memory().expect("store"));
+        let server = CodeMcpServer::new(store, std::path::PathBuf::from("."), None, None);
+        let running = tokio::spawn(async move { server.serve(transport).await });
+        let (cli_r, cli_w) = tokio::io::split(client);
+        (BufReader::new(cli_r).lines(), cli_w, running)
+    }
+
+    async fn exchange(
+        client: &mut PipeClient,
+        frame: &str,
+        what: &str,
+    ) -> serde_json::Value {
+        use tokio::io::AsyncWriteExt;
+        client.1.write_all(frame.as_bytes()).await.unwrap();
+        client.1.write_all(b"\n").await.unwrap();
+        let line = tokio::time::timeout(std::time::Duration::from_secs(5), client.0.next_line())
+            .await
+            .unwrap_or_else(|_| panic!("no {what} within 5s"))
+            .unwrap()
+            .unwrap_or_else(|| panic!("pipe closed before the {what}"));
+        serde_json::from_str(&line).unwrap()
+    }
+
+    async fn finish(client: PipeClient) {
+        let service = tokio::time::timeout(std::time::Duration::from_secs(5), client.2)
+            .await
+            .expect("serve() returned")
+            .expect("task")
+            .expect("handshake ok");
+        service.cancel().await.expect("cancel");
+    }
+
+    const PROBE: &str = r#"{"jsonrpc":"2.0","id":"server-discover-probe-1","method":"server/discover","params":{}}"#;
+    const INITIALIZE: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#;
+
+    /// Claude Code's version-negotiation probe arrives BEFORE `initialize`. It
+    /// must get a "method not found" error that echoes its id, and the same
+    /// connection must then initialize normally — no teardown, no respawn.
+    #[tokio::test]
+    async fn a_pre_init_probe_is_answered_and_the_handshake_proceeds() {
+        let mut client = pipe_server();
+
+        let reply = exchange(&mut client, PROBE, "probe reply").await;
+        assert_eq!(reply["id"], serde_json::json!("server-discover-probe-1"));
+        assert_eq!(reply["error"]["code"], serde_json::json!(-32601));
+        assert!(reply.get("result").is_none());
+
+        let reply = exchange(&mut client, INITIALIZE, "initialize reply").await;
+        assert_eq!(reply["id"], serde_json::json!(1));
+        assert!(
+            reply["result"]["protocolVersion"].is_string(),
+            "initialize succeeded on the same connection: {reply}"
+        );
+        finish(client).await;
+    }
+
+    /// A known MCP method sent too early is "not initialized", not "not found".
+    #[tokio::test]
+    async fn a_known_method_before_initialize_is_rejected_as_not_initialized() {
+        let mut client = pipe_server();
+        let reply = exchange(
+            &mut client,
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/list","params":{}}"#,
+            "early tools/list reply",
+        )
+        .await;
+        assert_eq!(reply["id"], serde_json::json!(7));
+        assert_eq!(reply["error"]["code"], serde_json::json!(-32002));
+
+        let reply = exchange(&mut client, INITIALIZE, "initialize reply").await;
+        assert!(reply["result"]["protocolVersion"].is_string(), "{reply}");
+        finish(client).await;
+    }
+
+    /// The spec allows `ping` before `initialize`; rmcp answers it itself and the
+    /// wrapper must stay out of the way.
+    #[tokio::test]
+    async fn a_pre_init_ping_still_gets_its_empty_result() {
+        let mut client = pipe_server();
+        let reply = exchange(
+            &mut client,
+            r#"{"jsonrpc":"2.0","id":"p","method":"ping"}"#,
+            "ping reply",
+        )
+        .await;
+        assert_eq!(reply["id"], serde_json::json!("p"));
+        assert!(reply.get("error").is_none(), "{reply}");
+        assert!(reply.get("result").is_some(), "{reply}");
+
+        let reply = exchange(&mut client, INITIALIZE, "initialize reply").await;
+        assert!(reply["result"]["protocolVersion"].is_string(), "{reply}");
+        finish(client).await;
+    }
+
+    /// A client that never probes sees the wrapper do nothing at all.
+    #[tokio::test]
+    async fn a_client_that_initializes_first_is_untouched() {
+        let mut client = pipe_server();
+        let reply = exchange(&mut client, INITIALIZE, "initialize reply").await;
+        assert_eq!(reply["id"], serde_json::json!(1));
+        assert!(reply["result"]["protocolVersion"].is_string(), "{reply}");
+        finish(client).await;
     }
 }

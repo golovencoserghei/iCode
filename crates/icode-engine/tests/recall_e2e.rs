@@ -40,6 +40,7 @@ pub fn http_get(url: &str) -> String {
 "#;
 
 #[test]
+#[ignore = "needs a live Ollama (run: cargo test -- --ignored)"]
 fn recall_returns_separate_code_and_memory_sections() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();

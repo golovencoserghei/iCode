@@ -1,0 +1,86 @@
+# Every push to the main branch (a merged PR) bumps the version from the commit
+# messages (fix -> patch, feat: -> minor, type!: / BREAKING CHANGE -> major),
+# builds the icode binary for Linux and macOS and publishes a GitHub release.
+name: release
+
+on:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  # Picks the level from commit messages, bumps the version files, commits and pushes the bump.
+  version:
+    if: ${{ !startsWith(github.event.head_commit.message, 'chore(release)') }}
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      sha: ${{ steps.bump.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - id: bump
+        run: |
+          v=$(node scripts/bump-version.mjs auto)
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore(release): v$v [skip ci]"
+          git push origin "HEAD:${{ github.ref_name }}"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-latest, name: linux-x64}
+          - {os: macos-latest, name: macos-arm64}
+          - {os: macos-15-intel, name: macos-x64}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p icode
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/icode "dist/icode-${{ matrix.name }}"
+          tar -C dist -czf "dist/icode-${{ matrix.name }}.tar.gz" "icode-${{ matrix.name }}"
+          rm "dist/icode-${{ matrix.name }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.name }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "v${{ needs.version.outputs.version }}"
+          dist/* --repo "${{ github.repository }}" --target "${{ needs.version.outputs.sha }}"
+          --title "iCode ${{ needs.version.outputs.version }}"
+          --generate-notes --latest

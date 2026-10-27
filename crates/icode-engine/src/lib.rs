@@ -20,6 +20,8 @@ pub mod recall;
 pub mod search;
 pub mod store;
 pub mod verdict;
+pub mod vault;
+pub mod verify;
 
 pub use chunk::{chunks_for_file, rel_display_path, CHUNK_BUDGET_BYTES};
 pub use daemon::{run_daemon, DaemonLock};
@@ -30,8 +32,8 @@ pub use index::{
     IndexStats,
 };
 pub use memory::{
-    auto_summary_content, digest_transcript, effective_score, is_l0, parse_stop_input, rank,
-    remove_auto_summary, sanitize_fts5, sanitize_nl, session_end, session_start,
+    auto_summary_content, curate, Archived, CurateConfig, CurateReport, DuplicatePair, digest_transcript, effective_score, is_l0, parse_stop_input, rank,
+    redact_secrets, remove_auto_summary, Redaction, sanitize_fts5, sanitize_nl, session_end, session_start,
     upsert_auto_summary, SessionEnd, SessionStart, SqliteMemoryStore, StopHookInput,
     TranscriptDigest, WalStore, DEFAULT_PROFILE_NOTES, DEFAULT_PROJECT_MEMORIES,
 };
@@ -39,3 +41,9 @@ pub use recall::{code_to_memory, recall, why_this_exists};
 pub use search::{find_similar, hybrid_search, rrf_fuse, semantic_search, RRF_K};
 pub use store::{SqliteCodeStore, Vec0Index};
 pub use verdict::{check_exists, ExistScope};
+pub use vault::{Vault, VaultEntry};
+pub use verify::hook::{
+    classify_command, outcome_from_output, output_tail, parse_post_tool_input, PostToolInput,
+    Recognised,
+};
+pub use verify::{stale_report, NewRun, Run, RunKind, StaleFile, StaleReport, VerifyLog};

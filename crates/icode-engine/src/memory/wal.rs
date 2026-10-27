@@ -28,6 +28,8 @@ use icode_core::model::*;
 use icode_core::traits::{MemoryStore, ReadableMemoryStore, WritableMemoryStore};
 use serde_json::json;
 
+use super::redact::redact_secrets;
+
 /// Max chars of an added memory's content recorded in the audit line (enough to
 /// recognise the entry without copying large bodies into the log).
 const CONTENT_PREVIEW_CHARS: usize = 120;
@@ -74,9 +76,15 @@ impl WalStore {
     }
 }
 
-/// First `CONTENT_PREVIEW_CHARS` chars of `content` (char-boundary safe).
+/// First `CONTENT_PREVIEW_CHARS` chars of `content` (char-boundary safe), with
+/// secrets redacted first: the audit log is a plain file, and cutting the preview
+/// mid-secret would leave a prefix no pattern recognises any more.
 fn content_preview(content: &str) -> String {
-    content.chars().take(CONTENT_PREVIEW_CHARS).collect()
+    redact_secrets(content)
+        .text
+        .chars()
+        .take(CONTENT_PREVIEW_CHARS)
+        .collect()
 }
 
 // ── reads: pure delegation, NEVER logged ──

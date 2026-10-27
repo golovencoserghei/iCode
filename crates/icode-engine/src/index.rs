@@ -74,6 +74,9 @@ pub struct IndexStats {
     /// Files removed from the index this run because they vanished from disk (or
     /// grew past the size cap and became un-indexable).
     pub files_deleted: u64,
+    /// Chunks deleted because their file was no longer in the index — leftovers
+    /// from a binary whose `delete_file` did not clear them. Normally 0.
+    pub ghost_chunks_pruned: u64,
 }
 
 /// Directory names (path components) skipped wholesale by the walk: build
@@ -102,6 +105,38 @@ const EXCLUDED_DIRS: &[&str] = &[
     ".tox",
     // editor metadata
     ".idea",
+    // Per-user tool caches. These matter because a walk rooted at `$HOME` (which
+    // is what `serve` fell back to outside a repo) otherwise pulls in every
+    // dependency of every project the user has ever built: an observed 4.0 GB
+    // index over 64k files whose paths were `~/.cache/uv/...` and
+    // `~/.cache/JetBrains/...`. None of it is the user's code, and all of it
+    // dilutes search and inflates the graph.
+    ".cache",
+    ".local",
+    ".cargo",
+    ".rustup",
+    ".npm",
+    ".nvm",
+    ".yarn",
+    ".pnpm-store",
+    ".bun",
+    ".deno",
+    ".gradle",
+    ".m2",
+    ".conda",
+    ".pyenv",
+    ".rbenv",
+    ".gem",
+    // Framework / infra build caches
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    ".turbo",
+    ".parcel-cache",
+    ".terraform",
+    ".direnv",
+    // Our own per-project data (index.db, daemon lock/log) — never source.
+    ".icode",
 ];
 
 /// Walk `root` recursively and yield every *supported* source file path (the same
@@ -234,6 +269,18 @@ pub fn index_path(root: &Path, store: &SqliteCodeStore) -> Result<IndexStats> {
         store.delete_file(path)?;
         any_change = true;
         stats.files_deleted += 1;
+    }
+
+    // Ghost sweep: chunks whose file left the index without taking them along.
+    // `delete_file` handles that from now on, so this only ever fires on a database
+    // an older binary wrote — but it must fire, because nothing else would: a ghost
+    // path is never re-indexed, so `upsert_chunks` never runs for it, and until it
+    // goes `search mode=semantic` keeps answering with code that is not on disk.
+    let ghosts = store.prune_ghost_chunks()?;
+    if ghosts > 0 {
+        tracing::info!("index: pruned {ghosts} chunk(s) left behind by files no longer indexed");
+        stats.ghost_chunks_pruned = ghosts;
+        any_change = true;
     }
 
     // Receiver-aware call resolution: validate each edge's qualified guess and grade
@@ -455,12 +502,12 @@ pub fn is_supported_source(path: &Path) -> bool {
 /// — build artefacts, VCS metadata, dependency caches. Exposed so the daemon's
 /// watch loop can drop events under any excluded directory using the *same* set the
 /// indexer walks with (a divergence would make the daemon index files `index_path`
-/// never sees). Includes `.icode` so the daemon never reacts to its own db writes.
+/// never sees). `.icode` is in the set, so the daemon never reacts to its own db writes.
 pub fn is_in_excluded_dir(path: &Path) -> bool {
     path.components().any(|c| match c {
         std::path::Component::Normal(name) => name
             .to_str()
-            .map(|n| EXCLUDED_DIRS.contains(&n) || n == ".icode")
+            .map(|n| EXCLUDED_DIRS.contains(&n))
             .unwrap_or(false),
         _ => false,
     })
@@ -612,4 +659,47 @@ fn is_excluded_dir(path: &Path) -> bool {
         .and_then(|n| n.to_str())
         .map(|n| EXCLUDED_DIRS.contains(&n))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod exclude_tests {
+    use super::{is_excluded_dir, is_in_excluded_dir};
+    use std::path::Path;
+
+    #[test]
+    fn user_tool_caches_are_excluded() {
+        // The 4.0 GB `$HOME` index was built out of exactly these paths.
+        for p in [
+            "/home/u/.cache/uv/archive-v0/pkg/mod.py",
+            "/home/u/.cache/JetBrains/IntelliJ/index/x.java",
+            "/home/u/.local/lib/python3.11/site-packages/x.py",
+            "/home/u/.cargo/registry/src/crate-1.0/src/lib.rs",
+            "/home/u/.rustup/toolchains/stable/lib/x.rs",
+            "/home/u/.npm/_cacache/index-v5/a.js",
+            "/home/u/proj/.next/server/pages/index.js",
+            "/home/u/proj/.icode/index.db",
+        ] {
+            assert!(is_in_excluded_dir(Path::new(p)), "should be excluded: {p}");
+        }
+    }
+
+    #[test]
+    fn real_source_is_not_excluded() {
+        for p in [
+            "/home/u/proj/src/main.rs",
+            "/home/u/proj/crates/icode-engine/src/index.rs",
+            // A file merely NAMED like a cache dir is still source.
+            "/home/u/proj/src/cache.rs",
+            "/home/u/proj/src/local_state.rs",
+        ] {
+            assert!(!is_in_excluded_dir(Path::new(p)), "should be kept: {p}");
+        }
+    }
+
+    #[test]
+    fn excluded_dir_matches_the_directory_itself() {
+        assert!(is_excluded_dir(Path::new("/home/u/.cache")));
+        assert!(is_excluded_dir(Path::new("/home/u/proj/target")));
+        assert!(!is_excluded_dir(Path::new("/home/u/proj/src")));
+    }
 }

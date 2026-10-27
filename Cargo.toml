@@ -47,6 +47,10 @@ tree-sitter-typescript = "0.23"
 tree-sitter-go = "0.25"
 tree-sitter-java = "0.23"
 tree-sitter-html = "0.23"
+# vault: passphrase-encrypted secrets in the standard age format, so a vault can be
+# opened with the stock `age -d` on a machine that has no iCode at all.
+age = { version = "0.12", features = ["armor"] }
+rpassword = "7"
 # cli
 clap = { version = "4", features = ["derive"] }
 # parallelism / fs

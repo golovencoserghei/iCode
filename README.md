@@ -70,8 +70,16 @@ icode stats  /path/to/project   # code-graph statistics
 icode doctor /path/to/project   # read-only health check (index drift vs disk, exit 1 on drift)
 ```
 
+### Keep it honest
+
+```sh
+icode verify status /path/to/project   # recent test/build runs + how much is unproven
+icode verify stale  /path/to/project   # files changed since the last run covering them
+icode curate <project-name>            # report stale + duplicate memory (--apply to archive)
+```
+
 The index lives at `<project>/.icode/index.db`; cross-session memory lives in the
-central `~/.icode/icode.db`.
+central `~/.icode/icode.db`; the verification ledger in `~/.icode/verify.db`.
 
 ### Connect to Claude Code (MCP)
 
@@ -98,23 +106,98 @@ icode mcp-config /path/to/project > .mcp.json
 
 ### MCP tools
 
-The server exposes 41 tools, grouped roughly as:
+The server exposes **13 tools**. Most take an `op` argument — the surface was
+consolidated from 41 separate tools because their schemas cost ~6.7k tokens of
+context on every single request.
 
-- **Code navigation** — `get_function` / `get_class` / `list_file_symbols`,
-  `get_callers` / `get_callees` / `call_path`, `get_dependencies` /
-  `get_dependents`, `find_routes`, `find_implementations`, `find_dead_code`,
-  `find_unreachable`, `complex_functions`, `grep_symbols`, `overview`,
-  `symbol_context`, `stats`, `doctor`.
-- **Semantic code search** — `search_semantic`, `find_similar`, `find_existing`
-  (semantic + lexical RRF fusion to surface "this already exists, don't rewrite
-  it"). These require an embedder; they error clearly when Ollama is unavailable.
-- **Memory** — `session_start` / `session_end`, `add_memory`, `search_memory`,
-  `search_all`, `list_memories`, `list_projects`, `update_memory`,
-  `delete_memory`, `resolve_memory`, `add_developer_note`,
-  `get_developer_profile`.
-- **Recall (synergy)** — `recall` (code + memory in one call), `code_to_memory`
-  ("what do we remember about this symbol?"), `why_this_exists` (the DECISION
-  memory behind a symbol).
+| Tool | What it answers |
+|------|-----------------|
+| `search` | Find code by words or identifier. Identifier-aware (`Handler` finds `HttpRequestHandler`); `mode=lexical` (default) needs no model. |
+| `symbol` | Everything about one symbol: `context` / `def` / `callers` / `callees` / `references` (classified, not grep) / `tests` (which tests reach it, transitively) / `implementations` / `similar`. |
+| `graph` | `chain` (does A reach B?), `impact` (reverse deps of a file), `deps`. |
+| `map` | Architecture overview; in a monorepo, call it without `scope` first to list members. |
+| `file` | `outline` / `list` / `stat` / `read`. |
+| `grep` | Regex over stored symbol bodies. |
+| `audit` | `dead` / `unreachable` / `complex` / `routes` / `health` (index drift). |
+| `verify` | The verification ledger: `record` a run, `status`, `stale` (files changed since the last green run covering them, with the tests to re-run), `tests` (tests covering one file). |
+| `check_exists` | Existence oracle: EXISTS / WEAK / ABSENT **with evidence**. Run it before claiming a feature is missing. |
+| `recall` | One query → relevant CODE and relevant MEMORY, ranked separately. |
+| `memory` | `add` / `search` / `list` / `update` / `delete` / `resolve` / `search_all` / `projects` / `for_symbol` / `why` / `curate`. |
+| `session` | `start` (developer profile + project context) / `end` (persist the session). |
+| `developer` | Cross-project profile: `note` / `profile`. |
+
+Semantic modes (`mode=semantic|hybrid`) and every memory tool need an embedder;
+they degrade with a clear error when Ollama is unavailable. The lexical and
+structural surface — including `verify` and `memory op=curate` — works without one.
+
+### Verification ledger
+
+`verify` answers the question an agent cannot answer about itself: **were the
+tests covering what I just changed actually run?**
+
+iCode already knows which tests reach a symbol and what the tree looks like on
+disk. The ledger adds the missing half — which checks actually ran, when, and
+how wide — and joins the three:
+
+```sh
+icode verify stale .
+# 2 of 83 files changed since the last run covering them:
+#   crates/icode-engine/src/recall.rs — re-run: recall_returns_separate_code_and_memory_sections, …
+```
+
+Runs are filed automatically by the `PostToolUse` hook (see `icode hook config`),
+which watches Bash calls for test/build/lint commands. Three rules keep it honest:
+
+- A **narrowed** run (`cargo test one_case`, `pytest -k auth`) never counts as
+  project-wide coverage.
+- A **failing** run is kept as history but never counts as verification.
+- When the output does not clearly say pass or fail, **nothing is recorded** — a
+  guessed pass is worse than a missing entry.
+
+### Memory curation
+
+Memory only ever grew: stale records and near-duplicates kept competing for the
+slots `session_start` injects. `memory op=curate` (or `icode curate <project>`)
+reports records nobody has read in months and pairs that say the same thing.
+
+It reports by default and writes only with `apply` / `--apply`; it **never
+deletes** (archiving is `resolve`, reversible and visible with
+`include_resolved`); and always-on (L0) rules plus anything at importance ≥ 4 are
+immune regardless of age. Duplicate detection is lexical, so it needs no model.
+
+### Secrets: kept out of memory, kept in the vault
+
+Memory is the wrong place for a secret — every record can come back into a
+model's context, and `~/.icode/icode.db` is not encrypted. So every memory write
+(`add`, `update`, the Stop-hook auto-summary, the WAL audit preview) replaces
+recognised secrets with `[REDACTED:<kind>]`: private-key blocks, `age` secret
+keys, GitHub / Anthropic / OpenAI / AWS / Slack / Google / Stripe tokens, JWTs,
+URL passwords, and `password=…`-style assignments whose value looks generated.
+There is no generic entropy rule (it would eat commit SHAs and ids), so a secret
+with no recognisable shape still gets through — it is a seatbelt, not a vault.
+
+The vault is `icode vault`: a place for the secrets you must get back after
+losing this machine — a server's break-glass SSH key, recovery codes.
+
+```sh
+icode vault init                                   # new passphrase, asked twice
+icode vault add prod-breakglass --note "web1, db1" < ~/.ssh/id_breakglass
+icode vault list                                   # names + fingerprints, never values
+icode vault get prod-breakglass --out ~/.ssh/id_breakglass   # mode 0600, never overwrites
+icode vault check                                  # proves it opens, prints recovery steps
+```
+
+The file (default `~/.icode/vault.age`; `--file` or `$ICODE_VAULT` to move it) is
+a standard passphrase-encrypted **age** file in ASCII armour. Recovery needs only
+the file and the passphrase — on a machine without iCode, the stock
+`age -d vault.age` prints every entry as JSON. Being text, it can be copied to a
+private repo, a cloud folder, a USB stick or paper; keep at least one copy off
+this machine, or it dies with it.
+
+The passphrase is read from the terminal only — never argv, never stdin — so an
+agent's non-interactive shell cannot open the vault, and the vault is **not**
+exposed over MCP. Saves are atomic (temp file, fsync, rename), re-read before
+they replace anything, and keep the previous version as `vault.age.bak`.
 
 ---
 
@@ -162,6 +245,8 @@ rather than failing.
 
 Everything is local. The single external call is to **localhost Ollama** for
 embeddings. No telemetry, no cloud, no code or memory leaving the machine.
+The vault file is the one thing meant to leave it — and only as ciphertext you
+copy yourself.
 
 ---
 

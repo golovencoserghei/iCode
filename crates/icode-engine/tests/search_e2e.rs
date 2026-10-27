@@ -75,6 +75,7 @@ fn setup() -> (tempfile::TempDir, SqliteCodeStore, OllamaEmbedder) {
 }
 
 #[test]
+#[ignore = "needs a live Ollama (run: cargo test -- --ignored)"]
 fn semantic_search_finds_read_file() {
     let (_dir, store, embedder) = setup();
 
@@ -97,6 +98,7 @@ fn semantic_search_finds_read_file() {
 }
 
 #[test]
+#[ignore = "needs a live Ollama (run: cargo test -- --ignored)"]
 fn hybrid_search_finds_read_file() {
     let (_dir, store, embedder) = setup();
 
@@ -118,6 +120,7 @@ fn hybrid_search_finds_read_file() {
 }
 
 #[test]
+#[ignore = "needs a live Ollama (run: cargo test -- --ignored)"]
 fn find_similar_excludes_self_and_returns_neighbours() {
     let (_dir, store, _embedder) = setup();
 

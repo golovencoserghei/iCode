@@ -29,6 +29,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
 use super::ranking::effective_score;
+use super::redact::redact_secrets;
 use super::sanitizer::{sanitize_fts5, sanitize_nl};
 use super::schema;
 use crate::store::register_sqlite_vec;
@@ -320,6 +321,28 @@ impl SqliteMemoryStore {
         Ok(v)
     }
 
+    /// Embed a SEARCH query, degrading instead of failing when the backend is
+    /// unreachable.
+    ///
+    /// A read must not die because Ollama is down. Memory search fuses a dense arm
+    /// and an FTS arm; only the dense arm needs a vector, and the lexical arm alone
+    /// still answers most "what did we decide about X" questions. Returning `None`
+    /// here drops the dense arm and leaves the caller with lexical-only recall --
+    /// noted on stderr, because silently worse results are their own bug.
+    ///
+    /// Writes deliberately keep using [`Self::embed_one`]: a memory stored without a
+    /// vector would be invisible to every later dense recall, so an `add` fails
+    /// loudly rather than half-succeeding.
+    fn embed_query_or_degrade(&self, text: &str) -> Option<Vec<f32>> {
+        match self.embed_one(text) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                eprintln!("icode: memory search degraded to lexical-only ({e})");
+                None
+            }
+        }
+    }
+
     /// Best-effort access warm-up after a search: bump access_count /
     /// last_accessed_at for the returned ids so usage-aware ranking actually
     /// moves (without this, access_count stays 0 and the access boost is dead).
@@ -347,7 +370,9 @@ impl SqliteMemoryStore {
 // ──────────────────────────── write side ────────────────────────────
 
 impl WritableMemoryStore for SqliteMemoryStore {
-    fn add(&self, mem: NewMemory) -> Result<AddOutcome> {
+    fn add(&self, mut mem: NewMemory) -> Result<AddOutcome> {
+        // A secret never reaches the row, the fts index or the embedder.
+        mem.content = redact_secrets(&mem.content).text;
         // Embed OUTSIDE the lock (network call) so the write transaction is short.
         let vector = self.embed_one(&mem.content)?;
         let id = MemoryId::generate(&mem.project);
@@ -418,7 +443,8 @@ impl WritableMemoryStore for SqliteMemoryStore {
     fn update(&self, id: &MemoryId, content: Option<&str>, tags: Option<&[String]>) -> Result<()> {
         // Re-embed only when the content actually changed (hash gate); compute the
         // new vector outside the lock.
-        let new_content = match content {
+        let redacted = content.map(|c| redact_secrets(c).text);
+        let new_content = match redacted.as_deref() {
             Some(c) => {
                 let new_hash = content_hash(c);
                 let old_hash: Option<String> = {
@@ -589,7 +615,8 @@ impl ReadableMemoryStore for SqliteMemoryStore {
         // BEFORE embedding (a 2000-char system prompt otherwise swamps the dense
         // vector). The lexical arm sanitizes FTS5 syntax separately (in `fts_records`).
         let clean = sanitize_nl(query);
-        let qvec = self.embed_one(&clean)?;
+        // A down embedder drops the dense arm; the lexical arm still answers.
+        let qvec = self.embed_query_or_degrade(&clean);
         let over = oversample(n);
         let conn = self.conn.lock().map_err(store_err)?;
 
@@ -599,8 +626,10 @@ impl ReadableMemoryStore for SqliteMemoryStore {
         // projects' vectors — starving this project's true-nearest rows even though
         // they sit just past the cutoff. Scanning only this project's vectors makes
         // recall independent of how large the cross-project db grows.
-        let semantic =
-            knn_records_in_project(&conn, &qvec, over, project, category, include_resolved)?;
+        let semantic = match qvec.as_deref() {
+            Some(q) => knn_records_in_project(&conn, q, over, project, category, include_resolved)?,
+            None => vec![],
+        };
         // The lexical arm is project-scoped IN SQL (the project filter is pushed
         // below the bm25 LIMIT), immune to the same starvation — see `fts_records`.
         let lexical = fts_records(&conn, &clean, over, Some(project), category, include_resolved)?;
@@ -616,13 +645,17 @@ impl ReadableMemoryStore for SqliteMemoryStore {
             return Ok(vec![]);
         }
         let clean = sanitize_nl(query);
-        let qvec = self.embed_one(&clean)?;
+        // Same degradation as `search`: no embedder, no dense arm, still an answer.
+        let qvec = self.embed_query_or_degrade(&clean);
         let over = oversample(n);
         let conn = self.conn.lock().map_err(store_err)?;
 
         // No project filter — one KNN over the whole space — but reserved
         // (`__*`) projects are excluded from cross-project recall.
-        let semantic = knn_records(&conn, &qvec, over, None, None, include_resolved)?;
+        let semantic = match qvec.as_deref() {
+            Some(q) => knn_records(&conn, q, over, None, None, include_resolved)?,
+            None => vec![],
+        };
         let lexical = fts_records(&conn, &clean, over, None, None, include_resolved)?;
         drop(conn);
 
@@ -723,7 +756,7 @@ fn nearest_same_project(
     let mut best: Option<(MemoryId, f32)> = None;
     for (rec, v) in project_vectors(conn, project, None, true)? {
         let dist = cosine_distance(vector, &v);
-        if best.as_ref().map_or(true, |(_, d)| dist < *d) {
+        if best.as_ref().is_none_or(|(_, d)| dist < *d) {
             best = Some((rec.id, dist));
         }
     }
@@ -1231,6 +1264,37 @@ mod tests {
     }
 
     #[test]
+    fn a_secret_never_reaches_the_row_or_the_fts_index() {
+        let (store, _dir) = open_fake_store();
+        let id = match add_mem(
+            &store,
+            "P",
+            "deploy uses PASSWORD=Xk9-mQ2!zzLp on the box #a0.3",
+        ) {
+            AddOutcome::Added { id } => id,
+            other => panic!("expected Added, got {other:?}"),
+        };
+        let rec = store.get(&id).unwrap().expect("row");
+        assert_eq!(rec.content, "deploy uses PASSWORD=[REDACTED:assigned-secret] on the box #a0.3");
+
+        store
+            .update(&id, Some("rotated: ghp_abcdefghijklmnopqrstuvwxyz0123456789"), None)
+            .unwrap();
+        let rec = store.get(&id).unwrap().expect("row");
+        assert_eq!(rec.content, "rotated: [REDACTED:github-token]");
+
+        let conn = store.conn.lock().unwrap();
+        let leaked: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM fts_memory WHERE content LIKE '%Xk9-mQ2%' OR content LIKE '%ghp_%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(leaked, 0, "the lexical index must not hold the secret either");
+    }
+
+    #[test]
     fn per_project_search_survives_a_large_foreign_db() {
         let (store, _dir) = open_fake_store();
 
@@ -1350,5 +1414,136 @@ mod tests {
             }
             other => panic!("expected Duplicate, got {other:?}"),
         }
+    }
+
+    // ─────────────── degradation when the embedding backend is down ───────────────
+
+    /// An embedder that can be switched off mid-test, standing in for an Ollama
+    /// that dies (or has not started yet) while a server holds the store. Up, it
+    /// behaves like [`AngleEmbedder`]; down, every `embed` errors the way a
+    /// connection-refused does.
+    struct FlakyEmbedder {
+        down: std::sync::atomic::AtomicBool,
+    }
+
+    impl FlakyEmbedder {
+        fn new() -> Arc<Self> {
+            Arc::new(Self { down: std::sync::atomic::AtomicBool::new(false) })
+        }
+        fn take_down(&self) {
+            self.down.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl Embedder for FlakyEmbedder {
+        fn model_id(&self) -> &str {
+            "flaky-fake"
+        }
+        fn dim(&self) -> usize {
+            schema::VEC_DIM
+        }
+        fn backend(&self) -> &str {
+            "fake"
+        }
+        fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(Error::Embed("is ollama running at http://127.0.0.1:11434?".into()));
+            }
+            AngleEmbedder.embed(texts)
+        }
+        fn health(&self) -> Result<()> {
+            if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(Error::Embed("backend down".into()));
+            }
+            Ok(())
+        }
+    }
+
+    fn open_flaky_store() -> (SqliteMemoryStore, Arc<FlakyEmbedder>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("icode.db");
+        let emb = FlakyEmbedder::new();
+        let store = SqliteMemoryStore::open(db.to_str().unwrap(), emb.clone())
+            .expect("open flaky store");
+        (store, emb, dir)
+    }
+
+    /// The regression this guards: a search used to propagate the embed error, so a
+    /// down Ollama turned every `recall` / `memory op=search` into a tool error even
+    /// though the FTS arm could answer from rows already stored.
+    #[test]
+    fn search_still_answers_from_fts_when_the_backend_is_down() {
+        let (store, emb, _dir) = open_flaky_store();
+        let id = match add_mem(&store, "P", "the retry budget for webhooks is three attempts") {
+            AddOutcome::Added { id } => id,
+            other => panic!("expected Added, got {other:?}"),
+        };
+
+        emb.take_down();
+
+        let hits = store.search("P", "retry budget webhooks", 5, None, false)
+            .expect("a down backend must not fail the search");
+        assert!(
+            hits.iter().any(|h| h.record.id == id),
+            "the lexical arm still finds the record with no embedder, got {hits:?}"
+        );
+
+        let all = store.search_all("retry budget webhooks", 5, false)
+            .expect("search_all degrades too");
+        assert!(all.iter().any(|h| h.record.id == id), "search_all keeps its FTS arm");
+    }
+
+    /// A write is NOT degraded: a memory stored without a vector would be invisible
+    /// to every later dense recall, so `add` fails loudly instead.
+    #[test]
+    fn add_still_fails_loudly_when_the_backend_is_down() {
+        let (store, emb, _dir) = open_flaky_store();
+        emb.take_down();
+
+        let err = store.add(NewMemory {
+            project: "P".into(),
+            content: "written while ollama was down".into(),
+            category: Category::General,
+            tags: vec![],
+            importance: 0.0,
+            session_id: None,
+        });
+        assert!(matches!(err, Err(Error::Embed(_))), "add must not half-succeed, got {err:?}");
+    }
+
+    /// Recovery is the whole point: once the backend answers again the dense arm
+    /// comes back without reopening the store.
+    #[test]
+    fn dense_recall_returns_after_the_backend_comes_back() {
+        let (store, emb, _dir) = open_flaky_store();
+
+        // `lexical` shares words with the query but sits at the far end of the
+        // angle space; `semantic` is the reverse — only the dense arm can find it.
+        let lexical = match add_mem(&store, "P", "retry budget note #a3.14159") {
+            AddOutcome::Added { id } => id,
+            other => panic!("expected Added, got {other:?}"),
+        };
+        let semantic = match add_mem(&store, "P", "wholly different wording #a0.0") {
+            AddOutcome::Added { id } => id,
+            other => panic!("expected Added, got {other:?}"),
+        };
+        let query = "retry budget";
+
+        emb.take_down();
+        let down = store.search("P", query, 5, None, false).expect("search while down");
+        let down_ids: Vec<_> = down.iter().map(|h| h.record.id.clone()).collect();
+        assert!(down_ids.contains(&lexical), "the FTS arm still answers, got {down_ids:?}");
+        assert!(
+            !down_ids.contains(&semantic),
+            "the dense-only record is unreachable while the backend is down, got {down_ids:?}"
+        );
+
+        emb.down.store(false, std::sync::atomic::Ordering::SeqCst);
+        let up = store.search("P", query, 5, None, false).expect("search after recovery");
+        let up_ids: Vec<_> = up.iter().map(|h| h.record.id.clone()).collect();
+        assert!(
+            up_ids.contains(&semantic),
+            "dense recall works again with no reopen, got {up_ids:?}"
+        );
     }
 }

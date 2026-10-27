@@ -37,6 +37,7 @@ pub fn unrelated_thing() -> u32 { 1 }
 "#;
 
 #[test]
+#[ignore = "needs a live Ollama (run: cargo test -- --ignored)"]
 fn exists_when_a_symbol_is_actually_named_the_query() {
     let (_d, store) = store_with(HAS_CALENDAR_FN);
 
@@ -58,6 +59,7 @@ pub fn compute_tax(amount: f64) -> f64 { amount * 0.2 }
 "#;
 
 #[test]
+#[ignore = "needs a live Ollama (run: cargo test -- --ignored)"]
 fn exists_when_two_query_terms_land_on_a_compound_name() {
     let (_d, store) = store_with(USER_FETCH);
 
@@ -81,6 +83,7 @@ pub fn unrelated() -> u32 { 0 }
 "#;
 
 #[test]
+#[ignore = "needs a live Ollama (run: cargo test -- --ignored)"]
 fn generic_two_term_overlap_without_the_distinctive_word_is_not_exists() {
     let (_d, store) = store_with(GET_FILE_OUTLINE);
 
@@ -115,6 +118,7 @@ pub fn something_else() -> u32 { 7 }
 "#;
 
 #[test]
+#[ignore = "needs a live Ollama (run: cargo test -- --ignored)"]
 fn weak_when_the_term_is_only_a_string_literal() {
     let (_d, store) = store_with(CALENDAR_ONLY_IN_A_LITERAL);
 
@@ -141,6 +145,7 @@ pub fn greet(name: &str) -> String { format!("hi {name}") }
 "#;
 
 #[test]
+#[ignore = "needs a live Ollama (run: cargo test -- --ignored)"]
 fn incidental_single_token_in_multiword_query_is_weak() {
     let (_d, store) = store_with(HAS_ADD_FN);
 
@@ -169,6 +174,7 @@ pub fn multiply(a: u32, b: u32) -> u32 { a * b }
 "#;
 
 #[test]
+#[ignore = "needs a live Ollama (run: cargo test -- --ignored)"]
 fn absent_when_the_term_is_nowhere() {
     let (_d, store) = store_with(NO_CALENDAR_ANYWHERE);
 
@@ -180,6 +186,7 @@ fn absent_when_the_term_is_nowhere() {
 // ───────────── test files must NOT satisfy "does this feature exist" ─────────────
 
 #[test]
+#[ignore = "needs a live Ollama (run: cargo test -- --ignored)"]
 fn a_symbol_defined_only_in_a_test_file_is_not_exists() {
     // The ONLY `calendar` lives under tests/ → excluded from the symbol space.
     let (_d, store) = store_at("tests/fixtures.rs", HAS_CALENDAR_FN);
@@ -227,6 +234,7 @@ fn live_store() -> (tempfile::TempDir, SqliteCodeStore, icode_embed::OllamaEmbed
 /// must stay WEAK EVEN WITH the embedder live — proving the verdict does not lean on
 /// vectors (the gap review finding #3 flagged). Intent is "add a user", not arithmetic.
 #[test]
+#[ignore = "needs a live Ollama (run: cargo test -- --ignored)"]
 fn common_verb_multiword_stays_weak_with_live_embedder() {
     let (_d, store, embedder) = live_store();
 
@@ -248,6 +256,7 @@ fn common_verb_multiword_stays_weak_with_live_embedder() {
 /// invent an EXISTS from vectors — it stays ABSENT but hands back the nearest symbol
 /// as a clearly-labelled LEAD.
 #[test]
+#[ignore = "needs a live Ollama (run: cargo test -- --ignored)"]
 fn pure_semantic_only_is_absent_with_a_lead() {
     let (_d, store, embedder) = live_store();
 

@@ -7,7 +7,9 @@
 //! bridges vec0's INTEGER rowid to the TEXT memory id via `mem_rowid`, and keeps a
 //! STANDALONE fts5 index (not external-content) since the owning id is textual.
 
+pub mod curate;
 pub mod ranking;
+pub mod redact;
 pub mod sanitizer;
 mod schema;
 pub mod session;
@@ -15,7 +17,9 @@ pub mod stop_hook;
 mod store;
 mod wal;
 
+pub use curate::{curate, Archived, CurateConfig, CurateReport, DuplicatePair};
 pub use ranking::{effective_score, is_l0, rank};
+pub use redact::{redact_secrets, Redaction};
 pub use sanitizer::{sanitize_fts5, sanitize_nl};
 pub use session::{
     session_end, session_start, SessionEnd, SessionStart, DEFAULT_PROFILE_NOTES,
