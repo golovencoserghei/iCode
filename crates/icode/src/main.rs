@@ -474,6 +474,9 @@ fn run_rename_project(
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let verbs = if apply { "moved" } else { "would move" };
     println!("{old} → {new}");
+    if report.memories == 0 && !report.registry_moved {
+        println!("  nothing stored under {old:?} — nothing to move");
+    }
     println!("  memories {verbs}: {}", report.memories);
     if report.already_under_new > 0 {
         println!("  already under {new} (merged with): {}", report.already_under_new);
