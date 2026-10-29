@@ -1144,7 +1144,10 @@ impl SqliteMemoryStore {
     ///
     /// Refuses when `new` already holds memories unless `merge` is set (a merge
     /// keeps both sets; ids cannot collide because the ulid part is unique).
-    /// With `apply == false` nothing is written. All-or-nothing: one transaction.
+    /// A project with nothing stored under `old` is NOT an error: callers such as
+    /// FlowCode rename every folder, most of which never saved a memory, so the
+    /// report simply counts zero. With `apply == false` nothing is written.
+    /// All-or-nothing: one transaction.
     pub fn rename_project(
         &self,
         old: &str,
@@ -1177,9 +1180,6 @@ impl SqliteMemoryStore {
         let memories = count(&conn, old)?;
         let already_under_new = count(&conn, new)?;
         let old_registered = has_registry(&conn, old)?;
-        if memories == 0 && !old_registered {
-            return Err(Error::Store(format!("project {old:?} has no memories and is not registered")));
-        }
         if already_under_new > 0 && !merge {
             return Err(Error::Store(format!(
                 "project {new:?} already holds {already_under_new} memories; pass merge to combine them"

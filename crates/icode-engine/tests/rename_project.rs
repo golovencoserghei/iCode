@@ -125,12 +125,19 @@ fn rename_refuses_existing_target_unless_merge() {
 }
 
 #[test]
-fn rename_rejects_bad_names_and_unknown_projects() {
+fn rename_rejects_bad_names() {
     let dir = tempfile::tempdir().unwrap();
     let (store, _) = open(&dir);
     add(&store, "a", "some fact");
     for bad in ["", "has space", "a/b", "__reserved", "a"] {
         assert!(store.rename_project("a", bad, None, false, true).is_err(), "{bad:?}");
     }
-    assert!(store.rename_project("ghost", "x", None, false, true).is_err());
+}
+
+#[test]
+fn renaming_a_project_with_no_memories_is_a_noop_not_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _) = open(&dir);
+    let r = store.rename_project("ghost", "x", None, true, true).unwrap();
+    assert_eq!((r.memories, r.already_under_new, r.registry_moved), (0, 0, false));
 }
