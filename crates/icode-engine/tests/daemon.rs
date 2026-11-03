@@ -154,3 +154,37 @@ fn pid_lock_file_survives_drop_and_reacquires() {
     drop(again);
     assert!(lock_path.exists(), "lock file still present after the second drop");
 }
+
+/// (3) A daemon whose root disappears exits on its own instead of watching a
+/// deleted tree forever (deleted worktrees and scratch dirs used to leave one
+/// orphaned `icode daemon run` each).
+#[test]
+fn daemon_exits_when_its_root_disappears() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = std::fs::canonicalize(dir.path()).expect("canon root").join("proj");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("lib.rs"), V1).unwrap();
+    // The store lives OUTSIDE the root so removing the tree does not pull the db
+    // out from under the test's own assertions.
+    let store_dir = tempfile::tempdir().expect("store dir");
+    let store = SqliteCodeStore::open(store_dir.path()).expect("open store");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let watched = root.clone();
+    std::thread::spawn(move || {
+        let r = icode_engine::run_daemon(&watched, store);
+        let _ = tx.send(r.is_ok());
+    });
+    // Wait until the daemon holds its lock (it is watching), then delete the tree.
+    let lock = root.join(".icode/daemon.lock");
+    for _ in 0..100 {
+        if fs::read_to_string(&lock).map(|s| !s.trim().is_empty()).unwrap_or(false) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    fs::remove_dir_all(&root).unwrap();
+    let exited = rx.recv_timeout(std::time::Duration::from_secs(10));
+    assert_eq!(exited, Ok(true), "daemon must exit cleanly once its root is gone");
+}

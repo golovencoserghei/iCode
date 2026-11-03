@@ -28,7 +28,8 @@ pub use daemon::{run_daemon, DaemonLock};
 pub use doctor::{diagnose, DiagnosticReport};
 pub use embed::{embed_pending, embed_pending_capped, EmbedStats};
 pub use index::{
-    index_one_file, index_path, is_in_excluded_dir, is_supported_source, walk_source_files,
+    index_one_file, index_path, is_in_excluded_dir, is_in_linked_worktree, is_linked_worktree_below,
+    is_supported_source, walk_source_files,
     IndexStats,
 };
 pub use memory::{

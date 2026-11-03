@@ -38,7 +38,9 @@ use icode_core::traits::CodeWriteStore;
 use notify::RecursiveMode;
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 
-use crate::index::{index_one_file, index_path, is_in_excluded_dir, is_supported_source};
+use crate::index::{
+    index_one_file, index_path, is_in_excluded_dir, is_in_linked_worktree, is_supported_source,
+};
 use crate::store::SqliteCodeStore;
 
 /// Debounce window: collapse a burst of FS events (editor save dance, git
@@ -105,6 +107,12 @@ pub fn run_daemon(root: &Path, store: SqliteCodeStore) -> Result<()> {
     // Main loop: pull debounced batches; poll the stop flag on each timeout tick so
     // Ctrl-C is responsive even with no FS activity.
     while running.load(Ordering::Relaxed) {
+        // A daemon whose tree is gone (a deleted worktree, a cleaned-up scratch
+        // dir) has nothing left to watch: exit instead of lingering forever.
+        if !root.is_dir() {
+            log(&format!("daemon: root {} disappeared — exiting", root.display()));
+            break;
+        }
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(paths) => process_batch(&root, &store, paths),
             Err(RecvTimeoutError::Timeout) => continue,
@@ -135,7 +143,9 @@ fn process_batch(root: &Path, store: &SqliteCodeStore, mut paths: Vec<PathBuf>) 
 
         // Skip anything the indexer itself would skip — excluded dirs (incl.
         // `.icode`, so our own db writes never feed back) and non-source files.
-        if is_in_excluded_dir(&path) || !is_supported_source(&path) {
+        // Linked worktrees below the root are other checkouts, not this tree's
+        // source — the same rule the indexer walk applies.
+        if is_in_excluded_dir(&path) || !is_supported_source(&path) || is_in_linked_worktree(root, &path) {
             continue;
         }
 

@@ -151,7 +151,10 @@ const EXCLUDED_DIRS: &[&str] = &[
 pub fn walk_source_files(root: &Path) -> Vec<std::path::PathBuf> {
     WalkDir::new(root)
         .into_iter()
-        .filter_entry(|e| !is_excluded_dir(e.path()))
+        .filter_entry(|e| {
+            !is_excluded_dir(e.path())
+                && !(e.depth() > 0 && e.file_type().is_dir() && is_linked_worktree_below(root, e.path()))
+        })
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .map(|e| e.into_path())
@@ -513,6 +516,63 @@ pub fn is_in_excluded_dir(path: &Path) -> bool {
     })
 }
 
+/// Whether `dir`, a directory BELOW the walk root `root`, is a linked git worktree
+/// that must not be indexed as part of `root`: its `.git` is a FILE pointing at
+/// `…/worktrees/<name>`, or its path relative to `root` runs through
+/// `.claude/worktrees` (agent worktrees, which may not even have their `.git`
+/// yet). A worktree is a second checkout of the same repo — indexing it under the
+/// main tree doubles every symbol and pins the daemon on someone else's branch.
+///
+/// The root itself is NEVER excluded (`dir == root` → false), even when it is a
+/// worktree: indexing a worktree on purpose is legitimate. Submodules (`gitdir:
+/// …/modules/<name>`, also inside a worktree: `…/worktrees/<wt>/modules/<name>`)
+/// and nested ordinary repos (`.git` directory) are not worktrees and stay in.
+///
+/// The ONE exclusion rule shared by the indexer walk and the daemon's event filter
+/// ([`is_in_linked_worktree`]).
+pub fn is_linked_worktree_below(root: &Path, dir: &Path) -> bool {
+    let Ok(rel) = dir.strip_prefix(root) else {
+        return false;
+    };
+    if rel.as_os_str().is_empty() {
+        return false;
+    }
+    let names: Vec<_> = rel.components().map(|c| c.as_os_str()).collect();
+    names.windows(2).any(|w| w[0] == ".claude" && w[1] == "worktrees") || is_linked_worktree_dir(dir)
+}
+
+/// `dir/.git` is a file whose `gitdir:` points straight at `…/worktrees/<name>`.
+fn is_linked_worktree_dir(dir: &Path) -> bool {
+    let dot_git = dir.join(".git");
+    match std::fs::symlink_metadata(&dot_git) {
+        Ok(m) if m.is_file() && m.len() < 4096 => {}
+        _ => return false,
+    }
+    let Ok(text) = std::fs::read_to_string(&dot_git) else {
+        return false;
+    };
+    let Some(gitdir) = text.lines().find_map(|l| l.trim().strip_prefix("gitdir:")) else {
+        return false;
+    };
+    let gitdir = Path::new(gitdir.trim());
+    gitdir.file_name().is_some()
+        && gitdir
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|n| n == "worktrees")
+}
+
+/// Whether the changed `path` lies inside a linked worktree below `root` — the
+/// daemon's form of [`is_linked_worktree_below`], checked on every ancestor
+/// directory between the path and the root (the root itself excluded). Works for
+/// a path that no longer exists (a deletion event): a vanished directory simply
+/// has no `.git` to read, and the `.claude/worktrees` rule is purely lexical.
+pub fn is_in_linked_worktree(root: &Path, path: &Path) -> bool {
+    path.ancestors()
+        .take_while(|a| *a != root && a.starts_with(root))
+        .any(|dir| is_linked_worktree_below(root, dir))
+}
+
 /// Per-file node counts (rolled up into `IndexStats`).
 #[derive(Clone, Copy, Default)]
 struct FileCounts {
@@ -663,8 +723,69 @@ fn is_excluded_dir(path: &Path) -> bool {
 
 #[cfg(test)]
 mod exclude_tests {
-    use super::{is_excluded_dir, is_in_excluded_dir};
+    use super::{is_excluded_dir, is_in_excluded_dir, is_in_linked_worktree, walk_source_files};
     use std::path::Path;
+
+    /// `dir/.git` as a FILE pointing at `gitdir`.
+    fn git_file(dir: &Path, gitdir: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(".git"), format!("gitdir: {gitdir}\n")).unwrap();
+    }
+
+    fn src(dir: &Path, name: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(name), "pub fn f() {}\n").unwrap();
+    }
+
+    fn walked(root: &Path) -> Vec<String> {
+        let mut v: Vec<String> = walk_source_files(root)
+            .iter()
+            .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn linked_worktrees_below_the_root_are_skipped_submodules_and_nested_repos_kept() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path();
+        std::fs::create_dir_all(root.join(".git/worktrees/wt")).unwrap();
+        src(root, "main.rs");
+        // A linked worktree checked out inside the tree.
+        git_file(&root.join("wt"), &root.join(".git/worktrees/wt").to_string_lossy());
+        src(&root.join("wt"), "dup.rs");
+        // An agent worktree under .claude/worktrees (no .git yet).
+        src(&root.join(".claude/worktrees/agent-1/src"), "agent.rs");
+        // A submodule (relative gitdir into .git/modules) and a nested plain repo.
+        git_file(&root.join("vendored"), "../.git/modules/vendored");
+        src(&root.join("vendored"), "sub.rs");
+        std::fs::create_dir_all(root.join("nested/.git")).unwrap();
+        src(&root.join("nested"), "inner.rs");
+        // A submodule of a worktree points into …/worktrees/<wt>/modules/<name>.
+        git_file(&root.join("lib2"), "/repo/.git/worktrees/wt/modules/lib2");
+        src(&root.join("lib2"), "lib2.rs");
+
+        assert_eq!(walked(root), vec!["lib2/lib2.rs", "main.rs", "nested/inner.rs", "vendored/sub.rs"]);
+
+        // The daemon's per-event form agrees, including for a deleted path.
+        assert!(is_in_linked_worktree(root, &root.join("wt/dup.rs")));
+        assert!(is_in_linked_worktree(root, &root.join(".claude/worktrees/agent-1/src/gone.rs")));
+        assert!(!is_in_linked_worktree(root, &root.join("vendored/sub.rs")));
+        assert!(!is_in_linked_worktree(root, &root.join("nested/inner.rs")));
+        assert!(!is_in_linked_worktree(root, &root.join("main.rs")));
+    }
+
+    #[test]
+    fn a_worktree_used_as_the_root_is_indexed() {
+        let td = tempfile::tempdir().unwrap();
+        // The walk root itself is a linked worktree under .claude/worktrees.
+        let root = td.path().join("repo/.claude/worktrees/agent-7");
+        git_file(&root, "/repo/.git/worktrees/agent-7");
+        src(&root.join("src"), "lib.rs");
+        assert_eq!(walked(&root), vec!["src/lib.rs"]);
+        assert!(!is_in_linked_worktree(&root, &root.join("src/lib.rs")));
+    }
 
     #[test]
     fn user_tool_caches_are_excluded() {
