@@ -215,8 +215,10 @@ pub fn to_blob(sig: &[u32]) -> Vec<u8> {
 
 /// Decode a signature blob written by [`to_blob`]. A trailing partial word is ignored.
 pub fn from_blob(blob: &[u8]) -> Vec<u32> {
-    blob.chunks_exact(4)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    blob.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| u32::from_le_bytes(*b))
         .collect()
 }
 
