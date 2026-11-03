@@ -2005,7 +2005,7 @@ fn build_session_start_context(project: &str) -> String {
         Err(_) => return hook_session_fallback(project),
     };
 
-    let Ok(prime) = session_prime(&store, project, false) else {
+    let Ok(prime) = session_prime(&store, project, true) else {
         return hook_session_fallback(project);
     };
     if prime.count == 0 {
@@ -2096,8 +2096,12 @@ fn session_prime(
 
 /// A Stop-hook auto-summary draft (`sid:*` tag) of low importance: a turn-by-turn
 /// safety net, not a curated fact, so it is kept out of the session-start prime.
+/// Todo / bug / decision records are never treated as drafts, whatever their tags.
 fn is_draft_auto_summary(rec: &icode_core::model::MemoryRecord) -> bool {
-    rec.importance < 2.0 && rec.tags.iter().any(|t| t.starts_with("sid:"))
+    use icode_core::model::Category;
+    rec.importance < 2.0
+        && rec.tags.iter().any(|t| t.starts_with("sid:"))
+        && !matches!(rec.category, Category::Todo | Category::Bug | Category::Decision)
 }
 
 /// `icode hook precompact` — re-inject the L0 "always-on" rules before/after
@@ -2173,6 +2177,14 @@ fn precompact_prime(store: &dyn icode_core::traits::ReadableMemoryStore, project
 /// exits 0 — any failure (no stdin, unreadable transcript, Ollama down, …) is a
 /// silent no-op, never a stall.
 fn run_hook_stop(project: Option<&str>, cwd: Option<&std::path::Path>) {
+    // Under an IDE host that writes its own session summary through `icode host
+    // session-end` (FlowCode sets FLOWCODE_ICODE_HOST=1 on the agent's env), the
+    // per-turn Stop draft would only duplicate it. Drain the payload and leave.
+    if std::env::var("FLOWCODE_ICODE_HOST").is_ok_and(|v| v.trim() == "1") {
+        use std::io::Read;
+        let _ = std::io::copy(&mut std::io::stdin().take(1 << 20), &mut std::io::sink());
+        return;
+    }
     let _ = try_hook_stop(project, cwd);
 }
 
