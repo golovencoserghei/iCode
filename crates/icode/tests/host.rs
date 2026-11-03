@@ -558,3 +558,85 @@ fn a_reserved_marker_is_not_a_bucket() {
     assert_eq!(data["name"], "Beta");
     assert_eq!(data["source"], "basename");
 }
+
+// ──────────────────────────── session-end ────────────────────────────
+
+fn session_end(home: &Path, backend: &str, args: Value) -> Value {
+    host_with(home, backend, "session-end", args)
+}
+
+#[test]
+fn session_end_upserts_one_record_per_chat_and_drops_the_stop_draft() {
+    let (home, db) = seeded_home();
+    let h = home.path();
+    seed(&db, Seed { id: "mem_DRAFT__demo", content: "Авто-сводка сессии: черновик", category: "general", importance: 1.0, tags: &["auto-session", "sid:9a896bc9"], ..Default::default() });
+    // Same sid tag but NOT an auto-summary: must survive.
+    seed(&db, Seed { id: "mem_KEEP__demo", content: "a curated note tagged with a sid", tags: &["sid:9a896bc9"], ..Default::default() });
+
+    let args = json!({
+        "project": "demo", "sessionKey": "chat-42", "title": "Memory chip",
+        "files": ["web/src/components/MemoryChip.tsx"], "summary": "added the chip",
+        "nativeSessionId": "9a896bc9-7184-43d2-0000",
+    });
+    let data = ok_data(session_end(h, "fake", args));
+    assert_eq!(data["action"], "created");
+    assert_eq!(data["draftsRemoved"], 1);
+    let id = data["id"].as_str().unwrap().to_string();
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM memories WHERE id='mem_DRAFT__demo'"), 0);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM memories WHERE id='mem_KEEP__demo'"), 1);
+    let (content, importance, category): (String, f64, String) = {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.query_row("SELECT content, importance, category FROM memories WHERE id = ?1", params![id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .unwrap()
+    };
+    assert_eq!(content, "Чат FlowCode «Memory chip». Итог: added the chip Файлы: web/src/components/MemoryChip.tsx.");
+    assert_eq!(importance, 1.0);
+    assert_eq!(category, "progress");
+
+    // 250 newer records later the same chat is still found by its tag (SQL, not a
+    // recent window) and updated in place.
+    {
+        let mut conn = rusqlite::Connection::open(&db).unwrap();
+        let tx = conn.transaction().unwrap();
+        for i in 0..250 {
+            tx.execute(
+                "INSERT INTO memories (id, project, content, category, tags, importance, status, access_count, created_at, last_accessed_at, content_hash) \
+                 VALUES (?1,'demo',?2,'context','[]',2,'active',0,'2027-01-01T00:00:00+00:00','2027-01-01T00:00:00+00:00','n')",
+                params![format!("mem_NEW{i}__demo"), format!("newer note {i}")],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    let data = ok_data(session_end(
+        h,
+        "fake",
+        json!({"project": "demo", "sessionKey": "chat-42", "title": "Memory chip", "files": [], "summary": "chip done, tests green"}),
+    ));
+    assert_eq!(data["action"], "updated");
+    assert_eq!(data["id"], id.as_str());
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM memories m WHERE EXISTS (SELECT 1 FROM json_each(m.tags) WHERE value = 'chat:chat-42')"), 1);
+    let content: String = row(&db, "SELECT content FROM memories WHERE id = ?1", &id);
+    assert!(content.contains("chip done, tests green"), "{content}");
+}
+
+#[test]
+fn session_end_without_an_embedder_changes_nothing() {
+    let (home, db) = seeded_home();
+    seed(&db, Seed { id: "mem_DRAFT__demo", content: "draft", category: "general", importance: 1.0, tags: &["auto-session", "sid:abcdef12"], ..Default::default() });
+    let before = count(&db, "SELECT COUNT(*) FROM memories");
+    let reply = session_end(
+        home.path(),
+        "none",
+        json!({"project": "demo", "sessionKey": "k", "title": "t", "files": ["a.rs"], "summary": "s", "nativeSessionId": "abcdef12-x"}),
+    );
+    assert_eq!(err_code(&reply), "no_embedder");
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM memories"), before);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM memories WHERE id='mem_DRAFT__demo'"), 1);
+    assert_eq!(
+        err_code(&session_end(home.path(), "fake", json!({"project": "demo", "sessionKey": "k"}))),
+        "bad_args"
+    );
+}

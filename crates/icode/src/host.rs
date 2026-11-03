@@ -55,6 +55,7 @@ const OPS: &[&str] = &[
     "memory.resolve",
     "memory.delete",
     "memory.curate",
+    "session-end",
     "impact",
 ];
 
@@ -142,6 +143,7 @@ fn dispatch(op: &str, args: &Map<String, Value>) -> HostResult {
         "memory.resolve" => op_memory_resolve(args),
         "memory.delete" => op_memory_delete(args),
         "memory.curate" => op_memory_curate(args),
+        "session-end" => op_session_end(args),
         "impact" => op_impact(args),
         other => Err(fail("unknown_op", format!("unknown op `{other}`"))),
     }
@@ -605,6 +607,128 @@ fn op_memory_curate(args: &Map<String, Value>) -> HostResult {
     serde_json::to_value(report).map_err(|e| fail("internal", e.to_string()))
 }
 
+// ──────────────────────────── session-end ────────────────────────────
+
+/// Tag every host session summary carries, next to its `chat:<sessionKey>` key.
+const SESSION_TAG: &str = "flowcode-session";
+
+/// `session-end {project, sessionKey, title, files[], summary, nativeSessionId?}` —
+/// ONE summary record per host chat, upserted by its `chat:<sessionKey>` tag (found
+/// in SQL, however many newer records the project has). Importance 1, category
+/// progress. With `nativeSessionId`, the Stop hook's draft for that native session
+/// (`sid:<first 8>` + `auto-session`) is deleted: the host's summary supersedes it.
+/// Needs an embedder (`no_embedder` otherwise — and then nothing is changed).
+fn op_session_end(args: &Map<String, Value>) -> HostResult {
+    let project = project_arg(args)?;
+    let key = req_str(args, "sessionKey")?.trim();
+    if key.chars().count() > 200 || key.chars().any(char::is_control) {
+        return Err(fail("bad_args", "`sessionKey`: at most 200 characters, no control characters"));
+    }
+    let title = opt_str(args, "title")?.unwrap_or_default();
+    let summary = opt_str(args, "summary")?.unwrap_or_default();
+    let files = opt_str_list(args, "files")?.unwrap_or_default();
+    let native = opt_str(args, "nativeSessionId")?.map(str::trim).filter(|s| !s.is_empty());
+    let content = session_content(title, &files, summary)
+        .ok_or_else(|| fail("bad_args", "nothing to save: `title`, `summary` and `files` are all empty"))?;
+
+    let base = open_write_embedding()?;
+    let store = audited(&base);
+    let chat_tag = format!("chat:{key}");
+    let tags = vec![SESSION_TAG.to_string(), chat_tag.clone()];
+
+    let existing = base.find_by_tag(Some(&project), &chat_tag, true).map_err(db_error)?;
+    let (id, action) = match existing.first() {
+        Some(rec) => {
+            let mut keep = rec.tags.clone();
+            for t in &tags {
+                if !keep.contains(t) {
+                    keep.push(t.clone());
+                }
+            }
+            store.update(&rec.id, Some(&content), Some(&keep)).map_err(write_error)?;
+            (rec.id.clone(), "updated")
+        }
+        None => {
+            let outcome = store
+                .add(icode_core::model::NewMemory {
+                    project: project.clone(),
+                    content,
+                    category: Category::Progress,
+                    tags,
+                    importance: 1.0,
+                    session_id: native.map(str::to_string),
+                })
+                .map_err(write_error)?;
+            match outcome {
+                icode_core::model::AddOutcome::Added { id } => (id, "created"),
+                // The dedup gate found the same fact already stored: nothing new.
+                icode_core::model::AddOutcome::Duplicate { existing, .. } => (existing, "duplicate"),
+            }
+        }
+    };
+
+    let mut drafts_removed = 0;
+    if let Some(native) = native {
+        let sid = icode_engine::memory::stop_hook::sid_tag(native);
+        for draft in base.find_by_tag(Some(&project), &sid, true).map_err(db_error)? {
+            if draft.tags.iter().any(|t| t == icode_engine::memory::stop_hook::AUTO_TAG) {
+                store.delete(&draft.id).map_err(write_error)?;
+                drafts_removed += 1;
+            }
+        }
+    }
+    Ok(json!({ "id": id.as_str(), "action": action, "draftsRemoved": drafts_removed }))
+}
+
+/// The deterministic summary text: `Чат FlowCode «title». Итог: … Файлы: …`, with
+/// the host's prompt markers stripped and every part capped. `None` when there is
+/// nothing to say.
+fn session_content(title: &str, files: &[String], summary: &str) -> Option<String> {
+    let title = cap_chars(&strip_host_markers(title), 160);
+    let summary = cap_chars(&strip_host_markers(summary), 600);
+    let files: Vec<String> = files
+        .iter()
+        .map(|f| cap_chars(&strip_host_markers(f), 160))
+        .filter(|f| !f.is_empty())
+        .collect();
+    if title.is_empty() && summary.is_empty() && files.is_empty() {
+        return None;
+    }
+    let mut out = if title.is_empty() { "Чат FlowCode.".to_string() } else { format!("Чат FlowCode «{title}».") };
+    if !summary.is_empty() {
+        out.push_str(&format!(" Итог: {summary}"));
+    }
+    if !files.is_empty() {
+        const SHOWN: usize = 12;
+        out.push_str(&format!(" Файлы: {}", files.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", ")));
+        if files.len() > SHOWN {
+            out.push_str(&format!(" (+{})", files.len() - SHOWN));
+        }
+        out.push('.');
+    }
+    Some(out)
+}
+
+/// Remove the host's own prompt plumbing (`[FlowCode: …]` blocks and the resume
+/// preamble) so it never becomes "knowledge"; whitespace collapsed.
+fn strip_host_markers(s: &str) -> String {
+    let mut text = s.replace("Continue the conversation below", " ");
+    while let Some(start) = text.find("[FlowCode:") {
+        let end = text[start..].find(']').map(|e| start + e + 1).unwrap_or(text.len());
+        text.replace_range(start..end, " ");
+    }
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn cap_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
 // ──────────────────────────── recall ────────────────────────────
 
 /// A recalled record must share at least this many significant tokens with the
@@ -989,6 +1113,20 @@ mod tests {
         assert_eq!(t, vec!["daemon", "doing", "index"]);
         assert_eq!(query_tokens("Ёлка елка", true), vec!["ёлка"]);
         assert_eq!(fts_expr(&["ёлка".into()]), "\"ёлка\" OR \"елка\"");
+    }
+
+    #[test]
+    fn session_content_strips_markers_and_caps() {
+        let c = session_content(
+            "Fix [FlowCode: Work mode] the chip",
+            &["lib/runs.mjs".into(), "  ".into()],
+            "Continue the conversation below: done [FlowCode: Project memory] x",
+        )
+        .unwrap();
+        assert_eq!(c, "Чат FlowCode «Fix the chip». Итог: : done x Файлы: lib/runs.mjs.");
+        assert!(session_content("", &[], "  ").is_none());
+        let long = session_content("t", &[], &"я".repeat(2000)).unwrap();
+        assert!(long.chars().count() < 700);
     }
 
     #[test]
