@@ -1253,6 +1253,7 @@ name = "icode"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "icode-core",
  "icode-embed",

@@ -22,11 +22,12 @@ clap = { workspace = true }
 # Passphrase prompts for `icode vault` read the terminal, never argv or stdin.
 rpassword = { workspace = true }
 tokio = { workspace = true }
+# `icode host`: the one-shot JSON API an IDE host drives over stdin/stdout.
+serde_json = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 # Bin-level hook integration test: seed a temp central db row directly (no Ollama)
 # and drive the real `icode hook …` binary over it.
 rusqlite = { workspace = true }
 tempfile = "3"
-# `serve_probe` reads the JSON-RPC frames the real `icode serve` writes.
-serde_json = { workspace = true }

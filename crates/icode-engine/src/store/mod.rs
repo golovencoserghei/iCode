@@ -165,6 +165,40 @@ impl SqliteCodeStore {
         Self::from_conn(conn)
     }
 
+    /// Open an EXISTING index read-only: no `.icode` dir creation, no deletion of
+    /// an incompatible file, no DDL and no PRAGMA writes. `Ok(None)` when there is
+    /// no index at `<root>/.icode/index.db` or its schema generation is not the
+    /// current one (the caller reports "not indexed"). Used by the one-shot
+    /// `icode host` reads, which must never mutate a project's tree.
+    pub fn open_existing_readonly(root: &Path, busy_ms: u64) -> Result<Option<Self>> {
+        use rusqlite::OpenFlags;
+        register_sqlite_vec();
+        let db_path = root.join(".icode").join("index.db");
+        if !db_path.is_file() {
+            return Ok(None);
+        }
+        let conn = Connection::open_with_flags(
+            &db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(store_err)?;
+        conn.busy_timeout(std::time::Duration::from_millis(busy_ms)).map_err(store_err)?;
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .map_err(store_err)?;
+        if version != SCHEMA_VERSION {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            cache_conn: None,
+            graph_epoch: AtomicU64::new(0),
+            adjacency_cache: Mutex::new(None),
+            #[cfg(test)]
+            rebuild_count: AtomicU64::new(0),
+        }))
+    }
+
     /// Open an in-memory store (tests / ephemeral use). Always fresh.
     pub fn open_in_memory() -> Result<Self> {
         // Register vec0 BEFORE opening the connection (auto-extensions only apply

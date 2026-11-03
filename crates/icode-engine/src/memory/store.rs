@@ -213,6 +213,17 @@ impl SqliteMemoryStore {
     /// applies the schema. A db with an INCOMPATIBLE `user_version` is a hard
     /// error — the central db holds the only copy of memories and is never wiped.
     pub fn open(central_db_path: &str, embedder: Arc<dyn Embedder>) -> Result<Self> {
+        Self::open_with_busy_timeout(central_db_path, embedder, 5000)
+    }
+
+    /// [`Self::open`] with an explicit `busy_timeout` (ms). The one-shot `icode
+    /// host` writes use a short wait (≈2 s) so a host call can never stall a chat
+    /// turn behind a long-running writer.
+    pub fn open_with_busy_timeout(
+        central_db_path: &str,
+        embedder: Arc<dyn Embedder>,
+        busy_ms: u64,
+    ) -> Result<Self> {
         // vec0 must be registered BEFORE opening any connection that sees
         // `vec_memory`. Shared with the code store (registered once per process).
         register_sqlite_vec();
@@ -231,7 +242,7 @@ impl SqliteMemoryStore {
         // up to 5s for it instead of failing fast with SQLITE_BUSY. (In-process
         // the `Mutex<Connection>` already serializes; this is the cross-process
         // belt-and-braces.)
-        conn.pragma_update(None, "busy_timeout", 5000_i64).map_err(store_err)?;
+        conn.pragma_update(None, "busy_timeout", busy_ms as i64).map_err(store_err)?;
 
         // Guard the schema generation. A FRESH db reports user_version 0 → stamp
         // it. A db at the current version is fine. Any OTHER version is an
@@ -1258,6 +1269,236 @@ impl SqliteMemoryStore {
         }
         tx.commit().map_err(store_err)?;
         Ok(report)
+    }
+}
+
+// ──────────────────────────── host access (`icode host`) ────────────────────────────
+//
+// The one-shot `icode host` subcommand is called by an IDE host on the hot path of a
+// chat turn. Its reads must be side-effect free (no DDL, no `user_version` stamp, no
+// access warm-up) and must never wait long on a lock, so it gets its own open mode
+// and a few primitives that expose RAW retrieval scores instead of fused ones.
+
+/// The literal SQL column list every `memories` read above uses (14 columns, the
+/// order [`map_record`] expects).
+const RECORD_COLUMNS: &str = "m.id, m.project, m.content, m.category, m.tags, m.importance, m.status, \
+     m.resolved_at, m.resolve_reason, m.session_id, m.access_count, \
+     m.created_at, m.last_accessed_at, m.updated_at";
+
+impl SqliteMemoryStore {
+    /// Open the central db with `SQLITE_OPEN_READ_ONLY`: no file/dir creation, no
+    /// schema DDL, no `PRAGMA user_version` read or write, and `busy_timeout` set
+    /// to `busy_ms`. `Error::NotFound` when the db file does not exist (a host
+    /// treats that as an empty store). Every write method on the result fails
+    /// with SQLite's read-only error; the search methods here never warm up.
+    pub fn open_strict_readonly(central_db_path: &str, busy_ms: u64) -> Result<Self> {
+        use rusqlite::OpenFlags;
+        register_sqlite_vec();
+        let path = expand_tilde(central_db_path);
+        if !path.is_file() {
+            return Err(Error::NotFound(format!("central memory db {}", path.display())));
+        }
+        let conn = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(store_err)?;
+        conn.busy_timeout(std::time::Duration::from_millis(busy_ms))
+            .map_err(store_err)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            embedder: Arc::new(NoEmbedder),
+            dim: schema::VEC_DIM,
+            dedup_distance: icode_core::config::IndexConfig::default().dedup_distance,
+            ranking: icode_core::config::RankingConfig::default(),
+        })
+    }
+
+    /// Open the central db for embed-free writes (`resolve` / `delete` / field
+    /// updates) with `busy_timeout` = `busy_ms`. Content writes fail with
+    /// `Error::Embed`, exactly like [`Self::open_readonly`].
+    pub fn open_write_no_embedder(central_db_path: &str, busy_ms: u64) -> Result<Self> {
+        Self::open_with_busy_timeout(central_db_path, Arc::new(NoEmbedder), busy_ms)
+    }
+
+    /// Lexical retrieval with the RAW fts5 `bm25()` value of every hit (more
+    /// negative = more relevant), best-first, scoped to `project` in SQL.
+    /// `match_expr` is passed to `MATCH` verbatim — the caller builds it from
+    /// sanitised tokens. A malformed expression is a soft miss (empty list).
+    pub fn lexical_scored(
+        &self,
+        project: &str,
+        match_expr: &str,
+        k: usize,
+        include_resolved: bool,
+    ) -> Result<Vec<(MemoryRecord, f64)>> {
+        if k == 0 || match_expr.trim().is_empty() {
+            return Ok(vec![]);
+        }
+        let status = if include_resolved { "" } else { " AND m.status = 'active'" };
+        let sql = format!(
+            "SELECT {RECORD_COLUMNS}, bm25(fts_memory) AS rank \
+             FROM fts_memory f \
+             JOIN mem_rowid b ON b.rowid = f.rowid \
+             JOIN memories m ON m.id = b.mem_id \
+             WHERE fts_memory MATCH ?1 AND m.project = ?2{status} \
+             ORDER BY rank LIMIT ?3"
+        );
+        let conn = self.conn.lock().map_err(store_err)?;
+        let mut stmt = conn.prepare(&sql).map_err(store_err)?;
+        let rows = match stmt.query_map(params![match_expr, project, k as i64], |row| {
+            Ok((map_record(row)?, row.get::<_, f64>(14)?))
+        }) {
+            Ok(rows) => rows,
+            Err(_) => return Ok(vec![]),
+        };
+        let mut out = Vec::new();
+        for r in rows {
+            match r {
+                Ok(hit) => out.push(hit),
+                Err(_) => return Ok(out),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Embed `text` with the store's embedder WITHOUT any stderr note; `None` when
+    /// the backend is unavailable. (The host's stderr must stay empty, so the
+    /// noisy [`Self::embed_query_or_degrade`] is not used.)
+    pub fn embed_quiet(&self, text: &str) -> Option<Vec<f32>> {
+        self.embed_one(text).ok()
+    }
+
+    /// Project-scoped dense retrieval with the RAW cosine distance of every hit
+    /// (lower = closer), best-first, at most `k`.
+    pub fn dense_scored(
+        &self,
+        project: &str,
+        qvec: &[f32],
+        k: usize,
+        include_resolved: bool,
+    ) -> Result<Vec<(MemoryRecord, f32)>> {
+        let conn = self.conn.lock().map_err(store_err)?;
+        let mut scored: Vec<(MemoryRecord, f32)> =
+            project_vectors(&conn, project, None, include_resolved)?
+                .into_iter()
+                .map(|(rec, v)| {
+                    let d = cosine_distance(qvec, &v);
+                    (rec, d)
+                })
+                .collect();
+        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(k);
+        Ok(scored)
+    }
+
+    /// Records carrying the exact tag `tag`, found in SQL (`json_each` over the
+    /// tags array) rather than by scanning a recent window — a session's record
+    /// must be found however many newer records the project has. `project = None`
+    /// searches every project. Newest first.
+    pub fn find_by_tag(
+        &self,
+        project: Option<&str>,
+        tag: &str,
+        include_resolved: bool,
+    ) -> Result<Vec<MemoryRecord>> {
+        self.find_tagged(project, "value = ?1", tag, include_resolved)
+    }
+
+    /// Records with at least one tag starting with `prefix` (e.g. `sid:`), newest
+    /// first. `project = None` searches every project.
+    pub fn find_by_tag_prefix(
+        &self,
+        project: Option<&str>,
+        prefix: &str,
+        include_resolved: bool,
+    ) -> Result<Vec<MemoryRecord>> {
+        // `substr` instead of LIKE: a `_` or `%` in the prefix must stay literal.
+        self.find_tagged(
+            project,
+            "substr(value, 1, length(?1)) = ?1",
+            prefix,
+            include_resolved,
+        )
+    }
+
+    fn find_tagged(
+        &self,
+        project: Option<&str>,
+        predicate: &str,
+        needle: &str,
+        include_resolved: bool,
+    ) -> Result<Vec<MemoryRecord>> {
+        let mut sql = format!(
+            "SELECT {RECORD_COLUMNS} FROM memories m \
+             WHERE EXISTS (SELECT 1 FROM json_each(m.tags) WHERE {predicate})"
+        );
+        if project.is_some() {
+            sql.push_str(" AND m.project = ?2");
+        }
+        if !include_resolved {
+            sql.push_str(" AND m.status = 'active'");
+        }
+        sql.push_str(" ORDER BY m.created_at DESC");
+        let conn = self.conn.lock().map_err(store_err)?;
+        let mut stmt = conn.prepare(&sql).map_err(store_err)?;
+        let rows = match project {
+            Some(p) => stmt.query_map(params![needle, p], map_record),
+            None => stmt.query_map(params![needle], map_record),
+        }
+        .map_err(store_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Change a record's importance and/or category — metadata only, so no
+    /// re-embed and no embedder needed. `Error::NotFound` for an unknown id.
+    pub fn set_importance_category(
+        &self,
+        id: &MemoryId,
+        importance: Option<f32>,
+        category: Option<Category>,
+    ) -> Result<()> {
+        if importance.is_none() && category.is_none() {
+            return Ok(());
+        }
+        let now = now_iso();
+        let conn = self.conn.lock().map_err(store_err)?;
+        let n = conn
+            .execute(
+                "UPDATE memories SET \
+                   importance = COALESCE(?1, importance), \
+                   category = COALESCE(?2, category), \
+                   updated_at = ?3 \
+                 WHERE id = ?4",
+                params![
+                    importance.map(|i| i as f64),
+                    category.map(category_str),
+                    now,
+                    id.as_str()
+                ],
+            )
+            .map_err(store_err)?;
+        if n == 0 {
+            return Err(Error::NotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// The registry's recorded root for `project`, if any.
+    pub fn registry_root(&self, project: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().map_err(store_err)?;
+        conn.query_row(
+            "SELECT root_path FROM projects WHERE name = ?1",
+            params![project],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map(Option::flatten)
+        .map_err(store_err)
     }
 }
 

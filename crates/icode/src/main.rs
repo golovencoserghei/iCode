@@ -12,6 +12,8 @@
 //!   `icode setup [path]`   — friendly onboarding: probe Ollama, print MCP config.
 //!   `icode mcp-config [p]` — print only the Claude Code MCP registration JSON.
 //!   `icode vault …`        — passphrase-encrypted secrets you must be able to recover.
+//!   `icode host`           — one-shot JSON API for an IDE host (request on stdin,
+//!                            one JSON reply on stdout, always exit 0; see `host`).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,6 +23,7 @@ use icode_core::config::EmbedConfig;
 use icode_core::traits::CodeReadStore;
 use icode_engine::SqliteCodeStore;
 
+mod host;
 mod vault_cli;
 
 #[derive(Parser)]
@@ -164,6 +167,10 @@ enum Command {
         #[command(subcommand)]
         action: HookAction,
     },
+    /// One-shot JSON API for an IDE host: reads ONE request `{"api":1,"op":…,
+    /// "args":{…}}` from stdin and prints ONE reply on stdout. Always exits 0 with
+    /// an empty stderr — failures are `{"ok":false,"error":{…}}` replies.
+    Host,
 }
 
 #[derive(Subcommand)]
@@ -326,6 +333,12 @@ fn existing_root(path: PathBuf) -> anyhow::Result<PathBuf> {
 }
 
 fn main() -> anyhow::Result<()> {
+    // `icode host` bypasses clap entirely: a stray argument must still produce a
+    // JSON reply and exit 0, never a clap usage error on stderr with exit 2.
+    if std::env::args_os().nth(1).is_some_and(|a| a == "host") {
+        host::run();
+        return Ok(());
+    }
     let cli = Cli::parse();
     match cli.command {
         Command::Index { path } => run_index(&existing_root(path)?),
@@ -360,6 +373,10 @@ fn main() -> anyhow::Result<()> {
         Command::Vault { file, action } => vault_cli::run(file, action),
         Command::Setup { project_path } => run_setup(project_path.as_deref()),
         Command::McpConfig { project_path } => run_mcp_config(project_path.as_deref()),
+        Command::Host => {
+            host::run();
+            Ok(())
+        }
         Command::Hook { action } => match action {
             HookAction::SessionStart { project, cwd } => {
                 run_hook_session_start(project.as_deref(), cwd.as_deref());
@@ -1641,6 +1658,9 @@ fn build_serve_embedder() -> Option<Arc<dyn icode_core::traits::Embedder>> {
 const HOOK_SESSION_PROJECT_N: usize = 6;
 /// How many developer-profile notes `session-start` surfaces.
 const HOOK_SESSION_PROFILE_N: usize = 5;
+/// How many recent project rows are scanned to find [`HOOK_SESSION_PROJECT_N`]
+/// that are not auto-summary drafts.
+const HOOK_SESSION_SCAN_N: usize = 60;
 /// Per-line content cap in the injected context (keeps the prompt budget small).
 const HOOK_LINE_MAX: usize = 200;
 
@@ -1652,10 +1672,47 @@ fn basename_str(d: &std::path::Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Memory bucket of a repo root: the name declared in its `.icode-project` marker
-/// (so several repos can share one bucket), else the directory name.
-fn bucket_name(root: &std::path::Path) -> Option<String> {
-    icode_engine::project_marker(root).or_else(|| basename_str(root))
+/// Why a directory maps to the bucket it does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BucketSource {
+    /// `<root>/.icode-project` names the bucket.
+    Marker,
+    /// A linked worktree, named after its MAIN checkout.
+    Worktree,
+    /// The repo root's directory name.
+    Basename,
+}
+
+impl BucketSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            BucketSource::Marker => "marker",
+            BucketSource::Worktree => "worktree",
+            BucketSource::Basename => "basename",
+        }
+    }
+}
+
+/// The memory bucket a git repo maps to: its name, the root it was taken from (the
+/// MAIN checkout for a linked worktree) and the rule that produced it.
+#[derive(Clone, Debug)]
+struct RepoBucket {
+    name: String,
+    root: PathBuf,
+    source: BucketSource,
+}
+
+/// The bucket named by `root` itself: the name declared in its `.icode-project`
+/// marker (so several repos can share one bucket), else its directory name.
+fn bucket_at(root: &std::path::Path, via_worktree: bool) -> Option<RepoBucket> {
+    if let Some(name) = icode_engine::project_marker(root) {
+        return Some(RepoBucket { name, root: root.to_path_buf(), source: BucketSource::Marker });
+    }
+    basename_str(root).map(|name| RepoBucket {
+        name,
+        root: root.to_path_buf(),
+        source: if via_worktree { BucketSource::Worktree } else { BucketSource::Basename },
+    })
 }
 
 /// Given the `.git` FILE of a linked worktree, resolve the MAIN repository's
@@ -1711,15 +1768,21 @@ fn worktree_main_root(dot_git_file: &std::path::Path, worktree_dir: &std::path::
 /// (`…/iCode/crates/foo` → `iCode`, `Onyx`/`onyx` can't split), and it treats a
 /// worktree as the SAME project as its main checkout instead of a fresh bucket.
 fn git_root_basename(dir: &std::path::Path) -> Option<String> {
+    repo_bucket(dir).map(|b| b.name)
+}
+
+/// [`git_root_basename`] with its provenance: the enclosing repo's bucket, the root
+/// it was derived from and why. `None` outside a git repo.
+fn repo_bucket(dir: &std::path::Path) -> Option<RepoBucket> {
     let mut cur = Some(dir);
     while let Some(d) = cur {
         let dot_git = d.join(".git");
         match std::fs::metadata(&dot_git) {
-            Ok(m) if m.is_dir() => return bucket_name(d),
+            Ok(m) if m.is_dir() => return bucket_at(d, false),
             Ok(m) if m.is_file() => {
                 return worktree_main_root(&dot_git, d)
-                    .and_then(|root| bucket_name(&root))
-                    .or_else(|| bucket_name(d));
+                    .and_then(|root| bucket_at(&root, true))
+                    .or_else(|| bucket_at(d, false));
             }
             _ => {}
         }
@@ -1929,6 +1992,7 @@ fn hook_session_fallback(project: &str) -> String {
 /// Build the SessionStart `additionalContext` text for `project`. Best-effort:
 /// returns the behavioural fallback string on any error or empty store.
 fn build_session_start_context(project: &str) -> String {
+    use icode_core::traits::WritableMemoryStore;
     use icode_engine::SqliteMemoryStore;
 
     let db_path = central_db_path();
@@ -1937,29 +2001,69 @@ fn build_session_start_context(project: &str) -> String {
         Err(_) => return hook_session_fallback(project),
     };
 
-    let session = match icode_engine::session_start(
-        &store,
-        project,
-        HOOK_SESSION_PROJECT_N,
-        HOOK_SESSION_PROFILE_N,
-    ) {
-        Ok(s) => s,
-        Err(_) => return hook_session_fallback(project),
+    let Ok(prime) = session_prime(&store, project, false) else {
+        return hook_session_fallback(project);
     };
-
-    if session.developer_profile.is_empty() && session.project_context.is_empty() {
+    if prime.count == 0 {
         return hook_session_fallback(project);
     }
+    // Warm-up (best-effort), as the engine's `session_start` does: the records the
+    // session was shown count as used for usage-aware ranking.
+    let _ = store.record_access(&prime.ids);
+
+    let mut lines = prime.lines;
+    // Pin the canonical project name so memory stays in ONE bucket: the agent picks
+    // the `project` argument for every icode call, and deriving it ad-hoc from the
+    // path is exactly what fragments a repo across `crates`, `Onyx`/`onyx`, etc.
+    lines.push(String::new());
+    lines.push(format!(
+        "> Use `project=\"{project}\"` for EVERY icode memory call this session \
+         (session_start / recall / add_memory / …). It is the canonical name for \
+         this repo — do not derive a different one from the working directory."
+    ));
+
+    lines.join("\n")
+}
+
+/// The fact lines of a session-start prime, shared by `hook session-start` and
+/// `icode host prime`. Pure read: no access warm-up (the hook does that itself).
+struct Prime {
+    lines: Vec<String>,
+    /// Records the lines were built from.
+    count: usize,
+    ids: Vec<icode_core::ids::MemoryId>,
+}
+
+/// Session-start facts: the developer profile (L0 first) and the recent project
+/// memory. With `skip_drafts`, auto-summary drafts below importance 2 are NOT
+/// recent project memory — see [`is_draft_auto_summary`].
+fn session_prime(
+    store: &dyn icode_core::traits::ReadableMemoryStore,
+    project: &str,
+    skip_drafts: bool,
+) -> icode_core::Result<Prime> {
+    use icode_core::ids::DEVELOPER_PROJECT;
+
+    let profile = store.list(DEVELOPER_PROJECT, None, HOOK_SESSION_PROFILE_N, false)?;
+    let context: Vec<_> = store
+        .list(project, None, HOOK_SESSION_SCAN_N, false)?
+        .into_iter()
+        .filter(|r| !(skip_drafts && is_draft_auto_summary(r)))
+        .take(HOOK_SESSION_PROJECT_N)
+        .collect();
 
     let mut lines: Vec<String> = Vec::new();
+    if profile.is_empty() && context.is_empty() {
+        return Ok(Prime { lines, count: 0, ids: Vec::new() });
+    }
     lines.push(format!("# iCode memory — session start for `{project}`"));
 
-    if !session.developer_profile.is_empty() {
+    if !profile.is_empty() {
         lines.push(String::new());
         lines.push("## Developer profile (cross-project, always honour these):".to_string());
         // L0/important notes first so the critical always-on rules lead.
         let cfg = icode_core::config::RankingConfig::default();
-        let mut profile = session.developer_profile.clone();
+        let mut profile = profile.clone();
         profile.sort_by(|a, b| {
             let al = icode_engine::is_l0(a, &cfg);
             let bl = icode_engine::is_l0(b, &cfg);
@@ -1974,25 +2078,22 @@ fn build_session_start_context(project: &str) -> String {
         }
     }
 
-    if !session.project_context.is_empty() {
+    if !context.is_empty() {
         lines.push(String::new());
         lines.push("## Recent project memory:".to_string());
-        for rec in &session.project_context {
+        for rec in &context {
             lines.push(format!("- {}", hook_memory_line(rec)));
         }
     }
 
-    // Pin the canonical project name so memory stays in ONE bucket: the agent picks
-    // the `project` argument for every icode call, and deriving it ad-hoc from the
-    // path is exactly what fragments a repo across `crates`, `Onyx`/`onyx`, etc.
-    lines.push(String::new());
-    lines.push(format!(
-        "> Use `project=\"{project}\"` for EVERY icode memory call this session \
-         (session_start / recall / add_memory / …). It is the canonical name for \
-         this repo — do not derive a different one from the working directory."
-    ));
+    let ids = profile.iter().chain(context.iter()).map(|r| r.id.clone()).collect();
+    Ok(Prime { lines, count: profile.len() + context.len(), ids })
+}
 
-    lines.join("\n")
+/// A Stop-hook auto-summary draft (`sid:*` tag) of low importance: a turn-by-turn
+/// safety net, not a curated fact, so it is kept out of the session-start prime.
+fn is_draft_auto_summary(rec: &icode_core::model::MemoryRecord) -> bool {
+    rec.importance < 2.0 && rec.tags.iter().any(|t| t.starts_with("sid:"))
 }
 
 /// `icode hook precompact` — re-inject the L0 "always-on" rules before/after
@@ -2010,8 +2111,6 @@ fn run_hook_precompact(project: Option<&str>, cwd: Option<&std::path::Path>) {
 /// profile + the project, listed for re-injection. Empty string when there are
 /// none (or the store can't open). Uses `list` only — NO embedding backend.
 fn build_precompact_context(project: &str) -> String {
-    use icode_core::ids::DEVELOPER_PROJECT;
-    use icode_core::traits::ReadableMemoryStore;
     use icode_engine::SqliteMemoryStore;
 
     let db_path = central_db_path();
@@ -2020,6 +2119,13 @@ fn build_precompact_context(project: &str) -> String {
         Ok(s) => s,
         Err(_) => return String::new(),
     };
+    precompact_prime(&store, project).lines.join("\n")
+}
+
+/// The L0 rules of the developer profile + `project`, highest importance first,
+/// shared by `hook precompact` and `icode host prime`. Empty when there are none.
+fn precompact_prime(store: &dyn icode_core::traits::ReadableMemoryStore, project: &str) -> Prime {
+    use icode_core::ids::DEVELOPER_PROJECT;
 
     let cfg = icode_core::config::RankingConfig::default();
     // Pull a generous slice of recent rows from each side; the L0 filter is applied
@@ -2034,7 +2140,7 @@ fn build_precompact_context(project: &str) -> String {
     }
 
     if l0.is_empty() {
-        return String::new();
+        return Prime { lines: Vec::new(), count: 0, ids: Vec::new() };
     }
 
     // Highest importance first (the most critical rule leads).
@@ -2051,7 +2157,7 @@ fn build_precompact_context(project: &str) -> String {
     for rec in &l0 {
         lines.push(format!("- {}", hook_memory_line(rec)));
     }
-    lines.join("\n")
+    Prime { lines, count: l0.len(), ids: l0.into_iter().map(|r| r.id).collect() }
 }
 
 /// `icode hook stop` — the `session_end` safety net. Claude Code fires Stop at
