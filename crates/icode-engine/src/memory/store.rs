@@ -1129,13 +1129,15 @@ pub struct RenameReport {
     pub registry_moved: bool,
 }
 
-/// A project name that can be used as a rename target: non-empty, no path
-/// separators or whitespace, and not in the reserved `__*` namespace.
+/// A project name that can be used as a rename target: a valid bucket name
+/// ([`super::validate_bucket_name`]: non-empty, not `__*`, no control characters)
+/// that additionally has no path separators or whitespace.
 pub fn validate_project_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name.contains(['/', '\\'])
         || name.chars().any(char::is_whitespace)
         || is_reserved_project(name)
+        || super::validate_bucket_name(name).is_err()
     {
         return Err(Error::Store(format!(
             "invalid project name {name:?}: must be non-empty, without slashes or whitespace, \

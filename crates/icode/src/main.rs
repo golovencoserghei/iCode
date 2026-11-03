@@ -1708,7 +1708,9 @@ fn bucket_at(root: &std::path::Path, via_worktree: bool) -> Option<RepoBucket> {
     if let Some(name) = icode_engine::project_marker(root) {
         return Some(RepoBucket { name, root: root.to_path_buf(), source: BucketSource::Marker });
     }
-    basename_str(root).map(|name| RepoBucket {
+    basename_str(root)
+        .filter(|name| icode_engine::validate_bucket_name(name).is_ok())
+        .map(|name| RepoBucket {
         name,
         root: root.to_path_buf(),
         source: if via_worktree { BucketSource::Worktree } else { BucketSource::Basename },
@@ -1811,7 +1813,7 @@ fn is_throwaway_dir(dir: &std::path::Path) -> bool {
 }
 
 /// Resolve the project name for a hook. Precedence:
-///   1. explicit `--project` (trimmed, if non-empty);
+///   1. explicit `--project` (trimmed, if it is a valid bucket name);
 ///   2. the basename of the enclosing GIT REPO root of the cwd — the canonical,
 ///      subdirectory- and casing-stable "which project" signal;
 ///   3. the cwd basename, UNLESS the cwd is a throwaway/container location
@@ -1824,7 +1826,9 @@ fn is_throwaway_dir(dir: &std::path::Path) -> bool {
 fn hook_project(project: Option<&str>, cwd: Option<&std::path::Path>) -> String {
     if let Some(p) = project {
         let p = p.trim();
-        if !p.is_empty() {
+        // An explicit name that cannot be a bucket (empty, reserved `__*`, control
+        // characters) is ignored rather than trusted: the cwd decides instead.
+        if icode_engine::validate_bucket_name(p).is_ok() {
             return p.to_string();
         }
     }
@@ -1843,7 +1847,7 @@ fn hook_project(project: Option<&str>, cwd: Option<&std::path::Path>) -> String 
     dir.file_name()
         .and_then(|n| n.to_str())
         .map(str::to_string)
-        .filter(|s| !s.is_empty())
+        .filter(|s| icode_engine::validate_bucket_name(s).is_ok())
         .unwrap_or_else(|| "general".to_string())
 }
 
@@ -2288,6 +2292,24 @@ mod derivation_tests {
         // A malformed marker falls back to the directory name.
         std::fs::write(root.join(".icode-project"), "a/b\n").unwrap();
         assert_eq!(git_root_basename(&deep).as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn reserved_or_invalid_names_never_become_buckets() {
+        let (_td, root, deep) = repo_with_subdir();
+        // A marker in the reserved namespace degrades to the directory name.
+        std::fs::write(root.join(".icode-project"), "__developer__\n").unwrap();
+        assert_eq!(git_root_basename(&deep).as_deref(), Some("root"));
+        // An explicit reserved / control-char name is ignored; the cwd decides.
+        assert_eq!(hook_project(Some("__developer__"), Some(&deep)), "root");
+        assert_eq!(hook_project(Some("a\u{7}b"), Some(&deep)), "root");
+        assert_eq!(hook_project(Some("My Project"), Some(&deep)), "My Project");
+        // A repo whose own directory name is reserved maps to `general`.
+        let td = tempfile::tempdir().expect("tempdir");
+        let odd = td.path().join("__odd");
+        std::fs::create_dir_all(odd.join(".git")).unwrap();
+        assert_eq!(git_root_basename(&odd), None);
+        assert_eq!(hook_project(None, Some(&odd)), "general");
     }
 
     #[test]

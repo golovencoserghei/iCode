@@ -22,16 +22,40 @@ mod wal;
 /// repo's bucket is its directory name. First non-empty, non-`#` line wins.
 pub const PROJECT_MARKER: &str = ".icode-project";
 
-/// The shared bucket name declared by `<root>/.icode-project`, if any. Names with a
-/// path separator, control characters or more than 64 chars are ignored (a malformed
-/// marker must degrade to the directory name, never to a junk bucket).
+/// Whether `name` can be a memory bucket: not empty, not in the reserved `__*`
+/// namespace (the developer profile lives there), no control characters, at most
+/// 200 characters. Spaces are allowed — a directory named `My Project` is a
+/// legitimate bucket. The single rule for a host's `project` argument, the
+/// `.icode-project` marker and every name the resolver derives from a path.
+pub fn validate_bucket_name(name: &str) -> std::result::Result<(), String> {
+    if name.trim().is_empty() {
+        return Err("project name is empty".into());
+    }
+    if icode_core::ids::is_reserved_project(name) {
+        return Err(format!("project name {name:?} is in the reserved `__` namespace"));
+    }
+    if name.chars().any(char::is_control) {
+        return Err(format!("project name {name:?} contains control characters"));
+    }
+    if name.chars().count() > 200 {
+        return Err("project name is longer than 200 characters".into());
+    }
+    Ok(())
+}
+
+/// The shared bucket name declared by `<root>/.icode-project`, if any. A name
+/// that fails [`validate_bucket_name`], has a path separator or more than 64 chars
+/// is ignored (a malformed marker must degrade to the directory name, never to a
+/// junk or reserved bucket).
 pub fn project_marker(root: &std::path::Path) -> Option<String> {
     let text = std::fs::read_to_string(root.join(PROJECT_MARKER)).ok()?;
     let name = text
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty() && !l.starts_with('#'))?;
-    let ok = name.chars().count() <= 64 && !name.chars().any(|c| c.is_control() || c == '/' || c == '\\');
+    let ok = name.chars().count() <= 64
+        && !name.contains(['/', '\\'])
+        && validate_bucket_name(name).is_ok();
     ok.then(|| name.to_string())
 }
 
@@ -49,3 +73,29 @@ pub use stop_hook::{
 };
 pub use store::{validate_project_name, RenameReport, SqliteMemoryStore};
 pub use wal::WalStore;
+
+#[cfg(test)]
+mod bucket_name_tests {
+    use super::{project_marker, validate_bucket_name};
+
+    #[test]
+    fn bucket_names_reject_empty_reserved_and_control_chars() {
+        for bad in ["", "   ", "__developer__", "__x", "a\u{7}b", "line\nbreak", &"x".repeat(201)] {
+            assert!(validate_bucket_name(bad).is_err(), "{bad:?} must be rejected");
+        }
+        for good in ["iCode", "My Project", "Proekt Bot_Phantom 2", "a_b", "проект"] {
+            assert!(validate_bucket_name(good).is_ok(), "{good:?} must be accepted");
+        }
+    }
+
+    #[test]
+    fn a_reserved_or_malformed_marker_is_ignored() {
+        let td = tempfile::tempdir().unwrap();
+        for bad in ["__developer__\n", "a/b\n", "\n# only a comment\n"] {
+            std::fs::write(td.path().join(".icode-project"), bad).unwrap();
+            assert_eq!(project_marker(td.path()), None, "{bad:?}");
+        }
+        std::fs::write(td.path().join(".icode-project"), "# shared\nSuite One\n").unwrap();
+        assert_eq!(project_marker(td.path()).as_deref(), Some("Suite One"));
+    }
+}

@@ -226,10 +226,10 @@ fn project_arg(args: &Map<String, Value>) -> Result<String, HostError> {
     check_project(p)
 }
 
+/// The bucket rule ([`icode_engine::validate_bucket_name`]): not empty, not in
+/// the reserved `__*` namespace, no control characters.
 fn check_project(p: &str) -> Result<String, HostError> {
-    if p.trim().is_empty() {
-        return Err(fail("bad_project", "empty project name"));
-    }
+    icode_engine::validate_bucket_name(p).map_err(|m| fail("bad_project", m))?;
     Ok(p.to_string())
 }
 

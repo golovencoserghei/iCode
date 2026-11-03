@@ -520,3 +520,41 @@ fn recall_semantic_degrades_to_lexical_without_an_embedder() {
     assert_eq!(data["degraded"], false);
     assert_eq!(data["items"][0]["id"], "mem_R1__demo");
 }
+
+// ──────────────────────────── project names ────────────────────────────
+
+#[test]
+fn every_project_argument_is_validated() {
+    let (home, _db) = seeded_home();
+    let h = home.path();
+    for bad in ["", "__developer__", "a\u{7}b"] {
+        for (op, mut args) in [
+            ("prime", json!({"kind": "session-start"})),
+            ("recall", json!({"query": "демон индексатора"})),
+            ("memory.list", json!({})),
+            ("memory.get", json!({"ids": ["mem_A__demo"]})),
+            ("memory.search", json!({"query": "демон"})),
+            ("memory.update", json!({"id": "mem_A__demo", "importance": 2})),
+            ("memory.resolve", json!({"id": "mem_A__demo"})),
+            ("memory.delete", json!({"id": "mem_A__demo"})),
+            ("memory.curate", json!({})),
+        ] {
+            args["project"] = json!(bad);
+            assert_eq!(err_code(&host(h, op, args)), "bad_project", "{op} with {bad:?}");
+        }
+    }
+    // A name with spaces is a legitimate bucket.
+    let data = ok_data(host(h, "memory.list", json!({"project": "My Project"})));
+    assert_eq!(data["items"], json!([]));
+}
+
+#[test]
+fn a_reserved_marker_is_not_a_bucket() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("Beta");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::write(repo.join(".icode-project"), "__developer__\n").unwrap();
+    let data = ok_data(host(tmp.path(), "project", json!({"cwd": repo})));
+    assert_eq!(data["name"], "Beta");
+    assert_eq!(data["source"], "basename");
+}
