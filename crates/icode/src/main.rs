@@ -1606,6 +1606,24 @@ fn build_serve_memory(
     Some(store)
 }
 
+/// The embed config for one-shot commands (`hook stop`, `icode host`), with the
+/// test/ops override `ICODE_EMBED_BACKEND`: `fake` = the deterministic offline
+/// embedder (CI, no Ollama), `none` = no embedder at all (`None`), anything else
+/// replaces the backend name.
+fn embed_config_from_env() -> Option<EmbedConfig> {
+    let mut cfg = EmbedConfig::default();
+    if let Ok(backend) = std::env::var("ICODE_EMBED_BACKEND") {
+        let backend = backend.trim().to_ascii_lowercase();
+        if backend == "none" {
+            return None;
+        }
+        if !backend.is_empty() {
+            cfg.backend = backend;
+        }
+    }
+    Some(cfg)
+}
+
 /// Build the configured embedder for `serve`, probe its health, and report the
 /// resulting mode on stderr. Returns `None` only when the embedder cannot be
 /// BUILT (an unsupported backend — a config error no retry fixes); `serve` never
@@ -2222,7 +2240,7 @@ fn try_hook_stop(project: Option<&str>, cwd: Option<&std::path::Path>) -> Option
 
     // add/update embed the content, so this path needs a live embedder — built
     // quietly (no stderr chatter on every turn), degrading to a no-op when down.
-    let embedder = icode_embed::build_embedder(&EmbedConfig::default()).ok()?;
+    let embedder = icode_embed::build_embedder(&embed_config_from_env()?).ok()?;
     embedder.health().ok()?;
     let embedder: Arc<dyn Embedder> = Arc::from(embedder);
     let base = icode_engine::SqliteMemoryStore::open(&central_db_path(), embedder).ok()?;

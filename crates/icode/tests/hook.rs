@@ -205,12 +205,18 @@ fn hook_config_prints_valid_json_snippet() {
 // ──────────────────────────── hook stop (session_end safety net) ────────────────────────────
 
 /// Run `icode hook stop <args…>` feeding `stdin`; returns (stdout, exit_code).
+/// Offline: no embedder unless a test asks for the fake one.
 fn run_hook_stop(home: &Path, args: &[&str], stdin: &str) -> (String, i32) {
+    run_hook_stop_with(home, "none", args, stdin)
+}
+
+fn run_hook_stop_with(home: &Path, backend: &str, args: &[&str], stdin: &str) -> (String, i32) {
     use std::io::Write;
     let mut child = Command::new(icode_bin())
         .args(["hook", "stop"])
         .args(args)
         .env("HOME", home)
+        .env("ICODE_EMBED_BACKEND", backend)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -302,35 +308,33 @@ fn stop_hook_upserts_one_auto_summary_per_session() {
         transcript.display()
     );
 
-    // Exit 0 in EVERY environment. With a live embedder (Ollama up) the summary
-    // must exist and stay a SINGLE row across repeated Stop firings; with Ollama
-    // down the hook degrades to a silent no-op (0 rows) — both are correct.
+    // No embedder: the hook degrades to a silent no-op — nothing is written.
     let (stdout, code) = run_hook_stop(home.path(), &["--project", "demo"], &stdin);
     assert_eq!(code, 0);
     assert!(stdout.is_empty(), "stop must print nothing, got: {stdout}");
-    let after_first = count_auto_rows(&db, "sid:feed1234");
-    assert!(after_first <= 1, "at most one auto-summary, got {after_first}");
+    assert_eq!(count_auto_rows(&db, "sid:feed1234"), 0);
 
-    let (_, code) = run_hook_stop(home.path(), &["--project", "demo"], &stdin);
+    // With an embedder (the offline fake): exactly one summary, and repeated Stop
+    // firings refresh it instead of adding rows.
+    let (stdout, code) = run_hook_stop_with(home.path(), "fake", &["--project", "demo"], &stdin);
     assert_eq!(code, 0);
-    let after_second = count_auto_rows(&db, "sid:feed1234");
-    assert_eq!(
-        after_first, after_second,
-        "repeated Stop firings must upsert, not multiply rows"
-    );
+    assert!(stdout.is_empty(), "stop must print nothing, got: {stdout}");
+    assert_eq!(count_auto_rows(&db, "sid:feed1234"), 1);
+    let (_, code) = run_hook_stop_with(home.path(), "fake", &["--project", "demo"], &stdin);
+    assert_eq!(code, 0);
+    assert_eq!(count_auto_rows(&db, "sid:feed1234"), 1, "repeated Stop firings must upsert, not multiply rows");
 
-    if after_first == 1 {
-        let conn = rusqlite::Connection::open(&db).unwrap();
-        let content: String = conn
-            .query_row(
-                "SELECT content FROM memories WHERE project='demo' AND tags LIKE '%sid:feed1234%'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!(content.contains("Задача: «почини баг"), "summary must cite the task: {content}");
-        assert!(content.contains("Итог:"), "summary must carry the outcome: {content}");
-    }
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let (content, importance): (String, f64) = conn
+        .query_row(
+            "SELECT content, importance FROM memories WHERE project='demo' AND tags LIKE '%sid:feed1234%'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(content.contains("Задача: «почини баг"), "summary must cite the task: {content}");
+    assert!(content.contains("Итог:"), "summary must carry the outcome: {content}");
+    assert_eq!(importance, 1.0);
 }
 
 // ──────────────────────────── host-managed sessions ────────────────────────────

@@ -282,20 +282,10 @@ fn open_write_embedding() -> Result<Arc<SqliteMemoryStore>, HostError> {
         .map_err(db_error)
 }
 
-/// The embedder for host calls, probed for health. `ICODE_EMBED_BACKEND`
-/// overrides the backend (`fake` = deterministic offline embedder for tests,
-/// `none` = no embedder at all); `None` when it is unavailable.
+/// The embedder for host calls, probed for health; `None` when it is
+/// unavailable. `ICODE_EMBED_BACKEND` applies (see `embed_config_from_env`).
 fn host_embedder(timeout_ms: u64) -> Option<Arc<dyn Embedder>> {
-    let mut cfg = icode_core::config::EmbedConfig::default();
-    if let Ok(backend) = std::env::var("ICODE_EMBED_BACKEND") {
-        let backend = backend.trim().to_ascii_lowercase();
-        if backend == "none" {
-            return None;
-        }
-        if !backend.is_empty() {
-            cfg.backend = backend;
-        }
-    }
+    let mut cfg = super::embed_config_from_env()?;
     cfg.timeout_ms = timeout_ms;
     let embedder = icode_embed::build_embedder(&cfg).ok()?;
     embedder.health().ok()?;
