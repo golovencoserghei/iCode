@@ -1065,6 +1065,8 @@ fn is_noise_for_recall(rec: &MemoryRecord) -> bool {
 
 /// A Stop-hook draft idle longer than this is garbage.
 const GC_DRAFT_DAYS: i64 = 14;
+/// At most this many drafts are listed in a `gc` reply.
+const GC_LIST_MAX: usize = 500;
 
 /// `gc {apply?=false}` — what is left over and safe to clean:
 ///
@@ -1108,11 +1110,16 @@ fn op_gc(args: &Map<String, Value>) -> HostResult {
                 .map_err(write_error)?;
         }
     }
+    // A long-neglected base holds thousands of drafts: the list is capped so the
+    // reply stays small (the host reads at most 256 KB); `draftsTotal` is exact
+    // and `apply` archives all of them.
+    let total = drafts.len();
     let drafts: Vec<Value> = drafts
         .iter()
+        .take(GC_LIST_MAX)
         .map(|d| json!({ "id": d.id.as_str(), "project": d.project, "ageDays": idle_days(d, now) }))
         .collect();
-    Ok(json!({ "daemons": daemons, "drafts": drafts, "applied": apply }))
+    Ok(json!({ "daemons": daemons, "drafts": drafts, "draftsTotal": total, "applied": apply }))
 }
 
 /// Days since the record last changed (`updated_at`, else `created_at`): a draft

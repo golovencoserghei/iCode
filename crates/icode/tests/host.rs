@@ -659,6 +659,7 @@ fn gc_reports_old_drafts_and_only_archives_them_on_apply() {
     let mut ids: Vec<&str> = data["drafts"].as_array().unwrap().iter().filter_map(|d| d["id"].as_str()).collect();
     ids.sort();
     assert_eq!(ids, vec!["mem_OLD2__other", "mem_OLD__demo"]);
+    assert_eq!(data["draftsTotal"], 2);
     assert!(data["drafts"][0]["ageDays"].as_i64().unwrap() > 14);
     assert!(data["daemons"].is_array());
     assert_eq!(count(&db, "SELECT COUNT(*) FROM memories WHERE status='resolved'"), 0, "dry run writes nothing");
