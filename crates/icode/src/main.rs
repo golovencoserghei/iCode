@@ -1652,6 +1652,12 @@ fn basename_str(d: &std::path::Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Memory bucket of a repo root: the name declared in its `.icode-project` marker
+/// (so several repos can share one bucket), else the directory name.
+fn bucket_name(root: &std::path::Path) -> Option<String> {
+    icode_engine::project_marker(root).or_else(|| basename_str(root))
+}
+
 /// Given the `.git` FILE of a linked worktree, resolve the MAIN repository's
 /// working-tree root, so every worktree of a repo maps to the SAME project name
 /// (no per-worktree memory bucket). A linked worktree's `.git` is a file
@@ -1709,11 +1715,11 @@ fn git_root_basename(dir: &std::path::Path) -> Option<String> {
     while let Some(d) = cur {
         let dot_git = d.join(".git");
         match std::fs::metadata(&dot_git) {
-            Ok(m) if m.is_dir() => return basename_str(d),
+            Ok(m) if m.is_dir() => return bucket_name(d),
             Ok(m) if m.is_file() => {
                 return worktree_main_root(&dot_git, d)
-                    .and_then(|root| basename_str(&root))
-                    .or_else(|| basename_str(d));
+                    .and_then(|root| bucket_name(&root))
+                    .or_else(|| bucket_name(d));
             }
             _ => {}
         }
@@ -2165,6 +2171,17 @@ mod derivation_tests {
         let (_td, root, deep) = repo_with_subdir();
         assert_eq!(git_root_basename(&deep).as_deref(), Some("root"));
         assert_eq!(git_root_basename(&root).as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn project_marker_overrides_directory_name_everywhere_in_the_repo() {
+        let (_td, root, deep) = repo_with_subdir();
+        std::fs::write(root.join(".icode-project"), "# shared\nEcosystem\n").unwrap();
+        assert_eq!(git_root_basename(&deep).as_deref(), Some("Ecosystem"));
+        assert_eq!(hook_project(None, Some(&deep)), "Ecosystem");
+        // A malformed marker falls back to the directory name.
+        std::fs::write(root.join(".icode-project"), "a/b\n").unwrap();
+        assert_eq!(git_root_basename(&deep).as_deref(), Some("root"));
     }
 
     #[test]

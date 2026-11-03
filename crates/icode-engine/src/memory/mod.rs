@@ -17,6 +17,24 @@ pub mod stop_hook;
 mod store;
 mod wal;
 
+/// File at a repo's working-tree root that names the memory bucket the repo shares
+/// with its siblings (e.g. several repos forming ONE product ecosystem). Without it a
+/// repo's bucket is its directory name. First non-empty, non-`#` line wins.
+pub const PROJECT_MARKER: &str = ".icode-project";
+
+/// The shared bucket name declared by `<root>/.icode-project`, if any. Names with a
+/// path separator, control characters or more than 64 chars are ignored (a malformed
+/// marker must degrade to the directory name, never to a junk bucket).
+pub fn project_marker(root: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(root.join(PROJECT_MARKER)).ok()?;
+    let name = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('#'))?;
+    let ok = name.chars().count() <= 64 && !name.chars().any(|c| c.is_control() || c == '/' || c == '\\');
+    ok.then(|| name.to_string())
+}
+
 pub use curate::{curate, Archived, CurateConfig, CurateReport, DuplicatePair};
 pub use ranking::{effective_score, is_l0, rank};
 pub use redact::{redact_secrets, Redaction};
