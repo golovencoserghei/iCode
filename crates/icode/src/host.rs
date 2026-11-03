@@ -38,12 +38,16 @@ const WRITE_BUSY_MS: u64 = 2000;
 const MAX_REQUEST_BYTES: u64 = 1 << 20;
 /// HTTP timeout for an embed call made by a write (`memory.update` content).
 const WRITE_EMBED_TIMEOUT_MS: u64 = 8000;
+/// HTTP timeout for the query embed of a semantic recall — the host's whole turn
+/// budget is 1.5 s, so a slow backend degrades to lexical instead of waiting.
+const RECALL_EMBED_TIMEOUT_MS: u64 = 1000;
 
 /// The ops this binary implements, in the order `capabilities` lists them.
 const OPS: &[&str] = &[
     "capabilities",
     "project",
     "prime",
+    "recall",
     "memory.list",
     "memory.get",
     "memory.search",
@@ -130,6 +134,7 @@ fn dispatch(op: &str, args: &Map<String, Value>) -> HostResult {
         "capabilities" => Ok(json!({ "api": API, "version": env!("CARGO_PKG_VERSION"), "ops": OPS })),
         "project" => op_project(args),
         "prime" => op_prime(args),
+        "recall" => op_recall(args),
         "memory.list" => op_memory_list(args),
         "memory.get" => op_memory_get(args),
         "memory.search" => op_memory_search(args),
@@ -600,6 +605,159 @@ fn op_memory_curate(args: &Map<String, Value>) -> HostResult {
     serde_json::to_value(report).map_err(|e| fail("internal", e.to_string()))
 }
 
+// ──────────────────────────── recall ────────────────────────────
+
+/// A recalled record must share at least this many significant tokens with the
+/// query. One shared word is how unrelated records used to leak into a turn.
+const RECALL_MIN_MATCHED: usize = 2;
+
+/// Tokens a record must share with a query of `n` significant tokens: at least
+/// [`RECALL_MIN_MATCHED`], and half of a longer query — two common words out of
+/// six ("панель", "памяти") are not what the message is about.
+fn required_matches(n: usize) -> usize {
+    RECALL_MIN_MATCHED.max(n.div_ceil(2))
+}
+/// Candidates pulled per arm before filtering.
+const RECALL_CANDIDATES: usize = 40;
+/// Lexical-only floor on the RAW fts5 bm25 (more negative = more relevant).
+/// Calibrated on a copy of a real 6k-record base: on-topic hits score -10 … -28,
+/// records that merely share two common words -4 … -9.
+const RECALL_LEXICAL_MAX_BM25: f64 = -5.0;
+/// Hybrid mode: a record qualifies on EITHER arm's own raw score. The lexical
+/// floor is stricter than in lexical-only mode, since a weak lexical hit that is
+/// genuinely relevant is caught by the dense arm instead…
+const RECALL_HYBRID_MAX_BM25: f64 = -6.0;
+/// …whose floor is the RAW cosine distance (qwen3-embedding:0.6b: on-topic
+/// records sit at 0.18–0.31, loosely related ones from 0.35 up).
+const RECALL_HYBRID_MAX_DISTANCE: f32 = 0.35;
+/// RRF constant for fusing the two arms in hybrid mode.
+const RECALL_RRF_K: f64 = 60.0;
+
+/// `recall {project, query, limit?≤5, budgetChars?=1200, excludeIds?, allowSemantic?}`
+/// — the few records worth putting in front of the agent for THIS message.
+///
+/// Precision over recall: the block lands in every turn's prompt, so a wrong
+/// record costs more than a missing one. Lexical by default; `allowSemantic`
+/// adds the dense arm when an embedder answers (else `degraded:true`, lexical).
+fn op_recall(args: &Map<String, Value>) -> HostResult {
+    let started = Instant::now();
+    let project = project_arg(args)?;
+    let query = opt_str(args, "query")?.ok_or_else(|| fail("bad_args", "missing `query`"))?;
+    let limit = opt_limit(args, "limit", 3, 5)?;
+    let budget = opt_limit(args, "budgetChars", 1200, 20_000)?;
+    let exclude: HashSet<String> = opt_str_list(args, "excludeIds")?.unwrap_or_default().into_iter().collect();
+    let allow_semantic = opt_bool(args, "allowSemantic")?.unwrap_or(false);
+
+    let reply = |mode: &str, degraded: bool, items: Vec<Value>| {
+        json!({
+            "mode": mode,
+            "degraded": degraded,
+            "ms": started.elapsed().as_millis() as u64,
+            "items": items,
+        })
+    };
+
+    let tokens = query_tokens(query, true);
+    if tokens.len() < RECALL_MIN_MATCHED {
+        return Ok(reply("lexical", false, Vec::new()));
+    }
+    let Some(store) = open_read()? else {
+        return Ok(reply("lexical", false, Vec::new()));
+    };
+
+    let lexical = store
+        .lexical_scored(&project, &fts_expr(&tokens), RECALL_CANDIDATES, false)
+        .map_err(db_error)?;
+
+    // Dense arm, only when asked for and only if the backend answers in time.
+    let mut degraded = false;
+    let dense = if allow_semantic {
+        // The host asks for the dense arm only while the model is resident; the
+        // embedder's light default (`keep_alive=0s`) would evict it with this very
+        // call and push every following turn to the cold path.
+        if std::env::var_os("ICODE_OLLAMA_KEEP_ALIVE").is_none() {
+            std::env::set_var("ICODE_OLLAMA_KEEP_ALIVE", "5m");
+        }
+        let clean = icode_engine::sanitize_nl(query);
+        let qvec = host_embedder(RECALL_EMBED_TIMEOUT_MS)
+            .and_then(|e| e.embed(&[clean.as_str()]).ok())
+            .and_then(|mut v| v.pop())
+            .filter(|v| v.len() == store.vector_dim());
+        match qvec {
+            Some(q) => Some(store.dense_scored(&project, &q, RECALL_CANDIDATES, false).map_err(db_error)?),
+            None => {
+                degraded = true;
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let need = required_matches(tokens.len());
+    let eligible = |rec: &MemoryRecord| {
+        !exclude.contains(rec.id.as_str())
+            && !is_noise_for_recall(rec)
+            && matched_tokens(&rec.content, &tokens) >= need
+    };
+
+    // (record, ordering score, raw bm25, raw cosine distance)
+    type Ranked = (MemoryRecord, f64, Option<f64>, Option<f32>);
+    let (mode, ranked): (&str, Vec<Ranked>) = match dense {
+        None => {
+            let ranked = lexical
+                .into_iter()
+                .filter(|(rec, bm25)| *bm25 <= RECALL_LEXICAL_MAX_BM25 && eligible(rec))
+                .map(|(rec, bm25)| (rec, -bm25, Some(bm25), None))
+                .collect();
+            ("lexical", ranked)
+        }
+        Some(dense) => {
+            // Each arm qualifies on its OWN raw score; RRF only orders survivors.
+            let mut fused: std::collections::HashMap<String, Ranked> = Default::default();
+            for (rank, (rec, bm25)) in lexical.into_iter().enumerate() {
+                if bm25 <= RECALL_HYBRID_MAX_BM25 && eligible(&rec) {
+                    let s = 1.0 / (RECALL_RRF_K + rank as f64);
+                    let e = fused.entry(rec.id.0.clone()).or_insert((rec, 0.0, None, None));
+                    e.1 += s;
+                    e.2 = Some(bm25);
+                }
+            }
+            for (rank, (rec, dist)) in dense.into_iter().enumerate() {
+                if dist <= RECALL_HYBRID_MAX_DISTANCE && eligible(&rec) {
+                    let s = 1.0 / (RECALL_RRF_K + rank as f64);
+                    let e = fused.entry(rec.id.0.clone()).or_insert((rec, 0.0, None, None));
+                    e.1 += s;
+                    e.3 = Some(dist);
+                }
+            }
+            let mut ranked: Vec<Ranked> = fused.into_values().collect();
+            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            ("hybrid", ranked)
+        }
+    };
+
+    // Budget by whole records: a record that does not fit is skipped, never cut.
+    let now = Utc::now();
+    let mut used = 0usize;
+    let mut items = Vec::new();
+    for (rec, score, bm25, distance) in ranked {
+        if items.len() >= limit {
+            break;
+        }
+        let len = rec.content.chars().count();
+        if used + len > budget {
+            continue;
+        }
+        used += len;
+        let mut item = scored_json(&rec, score, now);
+        item["bm25"] = json!(bm25.map(|b| (b * 1000.0).round() / 1000.0));
+        item["distance"] = json!(distance.map(|d| (f64::from(d) * 1000.0).round() / 1000.0));
+        items.push(item);
+    }
+    Ok(reply(mode, degraded, items))
+}
+
 // ──────────────────────────── query tokens ────────────────────────────
 
 /// Words too common to carry a query (RU + EN). Only tokens of 3+ characters are
@@ -628,25 +786,32 @@ const STOP_WORDS: &[&str] = &[
     "ваш", "себя", "себе", "кто", "чего", "чему", "нибудь", "либо", "какой", "какая", "какие",
     "какое", "такой", "такая", "такие", "раз", "ещe", "просто", "вообще", "ли", "ага", "окей",
     "спасибо", "привет", "посмотри", "проверь", "скажи", "хочу", "могу", "может", "нему",
+    // Imperative fillers that open a request but say nothing about its subject.
+    "добавь", "добавить", "почини", "починить", "исправь", "исправить", "убери", "убрать",
+    "поменяй", "поменять", "найди", "найти", "покажи", "показать", "напиши", "написать",
+    "создай", "создать", "удали", "удалить", "обнови", "обновить", "запусти", "запустить",
+    "сделал", "сделали", "работает", "работать", "дела", "fix", "add", "show", "find",
+    "remove", "update", "create", "write", "run", "check", "look", "help", "work", "works",
 ];
 
 /// Lower-cased word tokens of a query: Unicode-aware split (Cyrillic survives,
-/// like the curator's tokenizer), `ё` folded to `е` as fts5's `unicode61` does,
-/// tokens of 3+ characters, stop words dropped when `drop_stop`, deduplicated in
-/// order, at most 16.
+/// like the curator's tokenizer), tokens of 3+ characters, stop words dropped
+/// when `drop_stop`, deduplicated (`ё` = `е`) in order, at most 16.
 fn query_tokens(query: &str, drop_stop: bool) -> Vec<String> {
     let clean = icode_engine::sanitize_nl(query);
     let mut seen = HashSet::new();
     clean
         .split(|c: char| !c.is_alphanumeric())
-        .map(fold)
+        .map(str::to_lowercase)
         .filter(|t| t.chars().count() >= 3)
-        .filter(|t| !(drop_stop && STOP_WORDS.contains(&t.as_str())))
-        .filter(|t| seen.insert(t.clone()))
+        .filter(|t| !(drop_stop && STOP_WORDS.contains(&fold(t).as_str())))
+        .filter(|t| seen.insert(fold(t)))
         .take(16)
         .collect()
 }
 
+/// `ё` → `е` for comparisons. fts5's `unicode61` folds case but NOT `ё`, so the
+/// MATCH expression carries both spellings (see [`fts_expr`]).
 fn fold(t: &str) -> String {
     t.to_lowercase().replace('ё', "е")
 }
@@ -665,21 +830,46 @@ fn stem(t: &str) -> String {
     t.chars().take(keep).collect()
 }
 
-/// fts5 MATCH expression: every token as a quoted prefix phrase, OR-joined.
-/// Tokens are alphanumeric only, so no fts5 syntax can leak in.
+/// One token as an fts5 term: a quoted prefix phrase when it was stemmed.
+fn fts_term(t: &str) -> String {
+    let s = stem(t);
+    if s.chars().count() < t.chars().count() {
+        format!("\"{s}\"*")
+    } else {
+        format!("\"{s}\"")
+    }
+}
+
+/// fts5 MATCH expression: every token as a quoted (prefix) phrase, OR-joined, a
+/// token with `ё` also in its `е` spelling. Tokens are alphanumeric only, so no
+/// fts5 syntax can leak in.
 fn fts_expr(tokens: &[String]) -> String {
+    let mut terms = Vec::new();
+    for t in tokens {
+        terms.push(fts_term(t));
+        let folded = fold(t);
+        if folded != *t {
+            terms.push(fts_term(&folded));
+        }
+    }
+    terms.join(" OR ")
+}
+
+/// How many of the query `tokens` occur in `content` (a content word starting
+/// with the token's stem counts; `ё` = `е` on both sides).
+fn matched_tokens(content: &str, tokens: &[String]) -> usize {
+    let words: Vec<String> = content
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.chars().count() >= 3)
+        .map(fold)
+        .collect();
     tokens
         .iter()
-        .map(|t| {
-            let s = stem(t);
-            if s.chars().count() < t.chars().count() {
-                format!("\"{s}\"*")
-            } else {
-                format!("\"{s}\"")
-            }
+        .filter(|t| {
+            let s = stem(&fold(t));
+            words.iter().any(|w| w.starts_with(&s))
         })
-        .collect::<Vec<_>>()
-        .join(" OR ")
+        .count()
 }
 
 // ──────────────────────────── impact ────────────────────────────
@@ -797,7 +987,8 @@ mod tests {
         assert_eq!(t, vec!["демон", "видит", "изменения", "индексаторе"]);
         let t = query_tokens("what is the daemon doing with the index", true);
         assert_eq!(t, vec!["daemon", "doing", "index"]);
-        assert_eq!(query_tokens("Ёлка ёлка", true), vec!["елка"]);
+        assert_eq!(query_tokens("Ёлка елка", true), vec!["ёлка"]);
+        assert_eq!(fts_expr(&["ёлка".into()]), "\"ёлка\" OR \"елка\"");
     }
 
     #[test]

@@ -1362,6 +1362,11 @@ impl SqliteMemoryStore {
         Ok(out)
     }
 
+    /// Width of the memory vectors (`vec_memory`'s fixed dim).
+    pub fn vector_dim(&self) -> usize {
+        self.dim
+    }
+
     /// Embed `text` with the store's embedder WITHOUT any stderr note; `None` when
     /// the backend is unavailable. (The host's stderr must stay empty, so the
     /// noisy [`Self::embed_query_or_degrade`] is not used.)

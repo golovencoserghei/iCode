@@ -402,3 +402,121 @@ fn impact_reports_symbols_callers_and_memories() {
     assert!(helper["tests"].as_u64().unwrap() >= 1, "{helper}");
     assert_eq!(file["memories"][0]["id"], "mem_I__widget");
 }
+
+// ──────────────────────────── recall ────────────────────────────
+
+/// A base big enough for realistic bm25 (fts5's IDF is computed over the whole
+/// central db): 300 unrelated rows in another project, plus `demo` records.
+fn recall_home() -> (tempfile::TempDir, PathBuf) {
+    let home = tempfile::tempdir().unwrap();
+    let db = ensure_db(home.path());
+    {
+        let mut conn = rusqlite::Connection::open(&db).unwrap();
+        let tx = conn.transaction().unwrap();
+        for i in 0..300 {
+            let id = format!("mem_FILL{i}__filler");
+            let content = format!("filler note {i} about pasta recipes, weather {} and gardening tips", i % 7);
+            tx.execute(
+                "INSERT INTO memories (id, project, content, category, tags, importance, status, \
+                 access_count, created_at, last_accessed_at, content_hash) \
+                 VALUES (?1,'filler',?2,'context','[]',2,'active',0,'2026-10-01T00:00:00+00:00','2026-10-01T00:00:00+00:00','f')",
+                params![id, content],
+            )
+            .unwrap();
+            tx.execute("INSERT INTO mem_rowid (mem_id) VALUES (?1)", params![id]).unwrap();
+            let rowid = tx.last_insert_rowid();
+            tx.execute("INSERT INTO fts_memory (rowid, content) VALUES (?1, ?2)", params![rowid, content]).unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    let demo = [
+        ("mem_R1__demo", "decision", 3.0, &[][..], "Демон индексатора самозавершается, когда корень проекта исчезает с диска"),
+        ("mem_R2__demo", "bug", 3.0, &[][..], "Индексатор заходил в связанные worktree и дублировал файлы в индексе"),
+        ("mem_X1__demo", "general", 1.0, &["auto-session", "sid:aa11bb22"][..], "Авто-сводка: демон индексатора перезапущен"),
+        ("mem_X2__demo", "general", 1.0, &[][..], "заметка: демон индексатора и корень проекта"),
+        ("mem_X3__demo", "context", 3.0, &[][..], "[FlowCode: Work mode] демон индексатора корень проекта"),
+        ("mem_X4__demo", "context", 3.0, &[][..], "Continue the conversation below: демон индексатора корень"),
+        ("mem_ONE__demo", "decision", 3.0, &[][..], "Демон пишет журнал в daemon.log"),
+    ];
+    for (id, category, importance, tags, content) in demo {
+        seed(&db, Seed { id, category, importance, tags, content, ..Default::default() });
+    }
+    (home, db)
+}
+
+fn recall_ids(home: &Path, args: Value) -> (Value, Vec<String>) {
+    let data = ok_data(host(home, "recall", args));
+    let ids = data["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].as_str().unwrap().to_string())
+        .collect();
+    (data, ids)
+}
+
+#[test]
+fn recall_needs_two_significant_matching_tokens() {
+    let (home, _db) = recall_home();
+    let h = home.path();
+    // Inflected Cyrillic forms still match ("демона" ~ "Демон", "индексатор" ~ "индексатора").
+    let (data, ids) = recall_ids(h, json!({"project": "demo", "query": "Почему демона индексатор не видит?"}));
+    assert_eq!(data["mode"], "lexical");
+    assert_eq!(data["degraded"], false);
+    assert_eq!(ids, vec!["mem_R1__demo"], "{data}");
+    assert!(data["items"][0]["bm25"].as_f64().unwrap() <= -5.0);
+    // One significant token is not enough, whatever it matches.
+    let (_, ids) = recall_ids(h, json!({"project": "demo", "query": "демон"}));
+    assert!(ids.is_empty());
+    // Stop words alone are no query at all.
+    let (_, ids) = recall_ids(h, json!({"project": "demo", "query": "привет, как дела? что это?"}));
+    assert!(ids.is_empty());
+    // A record sharing only one of the tokens is not recalled.
+    let (_, ids) = recall_ids(h, json!({"project": "demo", "query": "демон индексатора корень"}));
+    assert!(!ids.contains(&"mem_ONE__demo".to_string()), "{ids:?}");
+}
+
+#[test]
+fn recall_excludes_drafts_low_general_host_markers_and_excluded_ids() {
+    let (home, _db) = recall_home();
+    let (_, ids) = recall_ids(home.path(), json!({"project": "demo", "query": "демон индексатора корень проекта", "limit": 5}));
+    assert_eq!(ids, vec!["mem_R1__demo"], "only the clean record survives: {ids:?}");
+    let (_, ids) = recall_ids(
+        home.path(),
+        json!({"project": "demo", "query": "демон индексатора корень проекта", "excludeIds": ["mem_R1__demo"]}),
+    );
+    assert!(ids.is_empty(), "{ids:?}");
+}
+
+#[test]
+fn recall_budget_counts_whole_records() {
+    let (home, _db) = recall_home();
+    let h = home.path();
+    let q = "индексатор worktree демон корень файлы проекта";
+    let (_, all) = recall_ids(h, json!({"project": "demo", "query": "индексатора демон корень worktree", "limit": 5, "budgetChars": 5000}));
+    assert!(all.len() <= 2);
+    // A budget below the first record's size skips it rather than cutting it.
+    let (data, _) = recall_ids(h, json!({"project": "demo", "query": q, "limit": 5, "budgetChars": 75}));
+    for item in data["items"].as_array().unwrap() {
+        assert!(item["content"].as_str().unwrap().chars().count() <= 75, "{item}");
+    }
+    let (data, _) = recall_ids(h, json!({"project": "demo", "query": q, "budgetChars": 10}));
+    assert_eq!(data["items"], json!([]));
+    // limit is capped at 5
+    let (data, _) = recall_ids(h, json!({"project": "demo", "query": q, "limit": 50}));
+    assert!(data["items"].as_array().unwrap().len() <= 5);
+}
+
+#[test]
+fn recall_semantic_degrades_to_lexical_without_an_embedder() {
+    let (home, _db) = recall_home();
+    let args = json!({"project": "demo", "query": "демон индексатора корень проекта", "allowSemantic": true});
+    let data = ok_data(host_with(home.path(), "none", "recall", args.clone()));
+    assert_eq!(data["mode"], "lexical");
+    assert_eq!(data["degraded"], true);
+    assert_eq!(data["items"][0]["id"], "mem_R1__demo");
+    let data = ok_data(host_with(home.path(), "fake", "recall", args));
+    assert_eq!(data["mode"], "hybrid");
+    assert_eq!(data["degraded"], false);
+    assert_eq!(data["items"][0]["id"], "mem_R1__demo");
+}
