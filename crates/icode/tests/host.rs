@@ -640,3 +640,68 @@ fn session_end_without_an_embedder_changes_nothing() {
         "bad_args"
     );
 }
+
+// ──────────────────────────── gc ────────────────────────────
+
+#[test]
+fn gc_reports_old_drafts_and_only_archives_them_on_apply() {
+    let (home, db) = seeded_home();
+    let old = "2026-01-01T00:00:00+00:00";
+    let fresh = chrono::Utc::now().to_rfc3339();
+    seed(&db, Seed { id: "mem_OLD__demo", content: "old draft", category: "general", importance: 1.0, tags: &["auto-session", "sid:00000001"], created_at: old, ..Default::default() });
+    seed(&db, Seed { id: "mem_OLD2__other", project: "other", content: "old draft elsewhere", category: "general", importance: 0.0, tags: &["auto-session", "sid:00000002"], created_at: old });
+    seed(&db, Seed { id: "mem_NEW__demo", content: "fresh draft", category: "general", importance: 1.0, tags: &["auto-session", "sid:00000003"], created_at: &fresh, ..Default::default() });
+    seed(&db, Seed { id: "mem_IMP__demo", content: "promoted draft", category: "general", importance: 2.0, tags: &["auto-session", "sid:00000004"], created_at: old, ..Default::default() });
+    seed(&db, Seed { id: "mem_TODO__demo", content: "old todo with sid", category: "todo", importance: 1.0, tags: &["sid:00000005"], created_at: old, ..Default::default() });
+
+    let data = ok_data(host(home.path(), "gc", json!({})));
+    assert_eq!(data["applied"], false);
+    let mut ids: Vec<&str> = data["drafts"].as_array().unwrap().iter().filter_map(|d| d["id"].as_str()).collect();
+    ids.sort();
+    assert_eq!(ids, vec!["mem_OLD2__other", "mem_OLD__demo"]);
+    assert!(data["drafts"][0]["ageDays"].as_i64().unwrap() > 14);
+    assert!(data["daemons"].is_array());
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM memories WHERE status='resolved'"), 0, "dry run writes nothing");
+
+    let data = ok_data(host(home.path(), "gc", json!({"apply": true})));
+    assert_eq!(data["applied"], true);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM memories WHERE status='resolved'"), 2);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM memories WHERE id IN ('mem_OLD__demo','mem_OLD2__other')"), 2, "archived, not deleted");
+    let data = ok_data(host(home.path(), "gc", json!({})));
+    assert_eq!(data["drafts"], json!([]));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn gc_lists_a_daemon_on_a_scratch_dir_without_killing_it() {
+    let home = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap().join("session/scratchpad/demo");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("lib.rs"), "pub fn f() {}\n").unwrap();
+    let mut daemon = Command::new(icode_bin())
+        .args(["daemon", "run"])
+        .arg(&root)
+        .env("HOME", home.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = daemon.id() as i64;
+    let mut seen = None;
+    for _ in 0..50 {
+        let data = ok_data(host(home.path(), "gc", json!({"apply": true})));
+        seen = data["daemons"].as_array().unwrap().iter().find(|d| d["pid"] == pid).cloned();
+        if seen.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let still_running = daemon.try_wait().unwrap().is_none();
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    let seen = seen.expect("the scratch daemon must be listed");
+    assert_eq!(seen["reason"], "root_in_tmp_scratch");
+    assert_eq!(seen["root"], root.to_string_lossy().as_ref());
+    assert!(still_running, "gc must never signal a daemon, even with apply");
+}

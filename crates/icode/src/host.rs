@@ -57,6 +57,7 @@ const OPS: &[&str] = &[
     "memory.curate",
     "session-end",
     "impact",
+    "gc",
 ];
 
 /// A failed op: a stable machine code and a human message.
@@ -145,6 +146,7 @@ fn dispatch(op: &str, args: &Map<String, Value>) -> HostResult {
         "memory.curate" => op_memory_curate(args),
         "session-end" => op_session_end(args),
         "impact" => op_impact(args),
+        "gc" => op_gc(args),
         other => Err(fail("unknown_op", format!("unknown op `{other}`"))),
     }
 }
@@ -1069,6 +1071,139 @@ fn is_noise_for_recall(rec: &MemoryRecord) -> bool {
         || rec.content.contains("Continue the conversation below")
 }
 
+// ──────────────────────────── gc ────────────────────────────
+
+/// A Stop-hook draft idle longer than this is garbage.
+const GC_DRAFT_DAYS: i64 = 14;
+
+/// `gc {apply?=false}` — what is left over and safe to clean:
+///
+/// * `daemons`: running `icode daemon run` processes whose root is gone
+///   (`root_missing`) or is a throwaway scratch dir under the temp dir
+///   (`root_in_tmp_scratch`). Reported only — gc NEVER signals a process; the
+///   host shows the pids. Linux only (read from `/proc`); elsewhere the list is
+///   empty.
+/// * `drafts`: Stop-hook drafts (`sid:*` tag, importance ≤ 1, not a
+///   todo/bug/decision) untouched for more than 14 days.
+///
+/// Dry run by default; `apply` archives the drafts (resolve, reversible) and
+/// does nothing else.
+fn op_gc(args: &Map<String, Value>) -> HostResult {
+    let apply = opt_bool(args, "apply")?.unwrap_or(false);
+    let tmp = std::env::temp_dir();
+    let daemons: Vec<Value> = icode_daemons()
+        .into_iter()
+        .filter_map(|(pid, root)| {
+            daemon_gc_reason(&root, &tmp)
+                .map(|reason| json!({ "pid": pid, "root": root.to_string_lossy(), "reason": reason }))
+        })
+        .collect();
+
+    let now = Utc::now();
+    let drafts: Vec<MemoryRecord> = match open_read()? {
+        Some(store) => store
+            .find_by_tag_prefix(None, "sid:", false)
+            .map_err(db_error)?
+            .into_iter()
+            .filter(|r| is_stale_draft(r, now))
+            .collect(),
+        None => Vec::new(),
+    };
+    if apply && !drafts.is_empty() {
+        let base = open_write()?;
+        let store = audited(&base);
+        for d in &drafts {
+            store
+                .resolve(&d.id, &format!("gc: Stop-hook draft idle > {GC_DRAFT_DAYS} days — archived, not deleted"))
+                .map_err(write_error)?;
+        }
+    }
+    let drafts: Vec<Value> = drafts
+        .iter()
+        .map(|d| json!({ "id": d.id.as_str(), "project": d.project, "ageDays": idle_days(d, now) }))
+        .collect();
+    Ok(json!({ "daemons": daemons, "drafts": drafts, "applied": apply }))
+}
+
+/// Days since the record last changed (`updated_at`, else `created_at`): a draft
+/// the Stop hook keeps refreshing is not idle.
+fn idle_days(rec: &MemoryRecord, now: DateTime<Utc>) -> i64 {
+    let ts = rec.updated_at.as_deref().unwrap_or(&rec.created_at);
+    DateTime::parse_from_rfc3339(ts)
+        .map(|t| (now - t.with_timezone(&Utc)).num_days().max(0))
+        .unwrap_or(0)
+}
+
+fn is_stale_draft(rec: &MemoryRecord, now: DateTime<Utc>) -> bool {
+    rec.status == MemoryStatus::Active
+        && rec.importance <= 1.0
+        && rec.tags.iter().any(|t| t.starts_with("sid:"))
+        && !matches!(rec.category, Category::Todo | Category::Bug | Category::Decision)
+        && idle_days(rec, now) > GC_DRAFT_DAYS
+}
+
+/// Why a daemon watching `root` is garbage, if it is.
+fn daemon_gc_reason(root: &Path, tmp: &Path) -> Option<&'static str> {
+    if !root.is_dir() {
+        return Some("root_missing");
+    }
+    let in_tmp = root.starts_with(tmp) || root.starts_with("/tmp");
+    let scratch = root.components().any(|c| c.as_os_str() == "scratchpad");
+    (in_tmp && scratch).then_some("root_in_tmp_scratch")
+}
+
+/// `(pid, root)` of every live `icode daemon run <root>` process.
+#[cfg(target_os = "linux")]
+fn icode_daemons() -> Vec<(i32, PathBuf)> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<i32>().ok()) else {
+            continue;
+        };
+        let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        if super::is_zombie(pid) {
+            continue;
+        }
+        let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).ok();
+        if let Some(root) = daemon_root_from_cmdline(&cmdline, cwd.as_deref()) {
+            out.push((pid, root));
+        }
+    }
+    out.sort();
+    out
+}
+
+#[cfg(not(target_os = "linux"))]
+fn icode_daemons() -> Vec<(i32, PathBuf)> {
+    Vec::new()
+}
+
+/// The root of an `icode daemon run <root>` command line (NUL-separated argv,
+/// as in `/proc/<pid>/cmdline`); a relative root is resolved against the
+/// process's `cwd`. `None` for any other command.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn daemon_root_from_cmdline(cmdline: &[u8], cwd: Option<&Path>) -> Option<PathBuf> {
+    if cmdline.is_empty() || !super::cmdline_is_icode(cmdline) {
+        return None;
+    }
+    let argv: Vec<String> = cmdline
+        .split(|b| *b == 0)
+        .filter(|a| !a.is_empty())
+        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .collect();
+    let at = argv.windows(2).position(|w| w[0] == "daemon" && w[1] == "run")?;
+    let root = PathBuf::from(argv.get(at + 2)?);
+    Some(match (root.is_absolute(), cwd) {
+        (false, Some(cwd)) => cwd.join(root),
+        _ => root,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1127,6 +1262,26 @@ mod tests {
         assert!(session_content("", &[], "  ").is_none());
         let long = session_content("t", &[], &"я".repeat(2000)).unwrap();
         assert!(long.chars().count() < 700);
+    }
+
+    #[test]
+    fn daemon_cmdlines_and_gc_reasons() {
+        let cmd = b"/home/u/.local/bin/icode\0daemon\0run\0/tmp/x/scratchpad/live\0";
+        assert_eq!(daemon_root_from_cmdline(cmd, None), Some(PathBuf::from("/tmp/x/scratchpad/live")));
+        let rel = b"./target/debug/icode\0daemon\0run\0proj\0";
+        assert_eq!(daemon_root_from_cmdline(rel, Some(Path::new("/work"))), Some(PathBuf::from("/work/proj")));
+        assert_eq!(daemon_root_from_cmdline(b"/usr/bin/icode\0serve\0", None), None);
+        assert_eq!(daemon_root_from_cmdline(b"/usr/bin/python\0daemon\0run\0/x\0", None), None);
+
+        let td = tempfile::tempdir().unwrap();
+        let tmp = td.path();
+        let scratch = tmp.join("sess/scratchpad/demo");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let plain = tmp.join("icode-host");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert_eq!(daemon_gc_reason(&tmp.join("gone"), tmp), Some("root_missing"));
+        assert_eq!(daemon_gc_reason(&scratch, tmp), Some("root_in_tmp_scratch"));
+        assert_eq!(daemon_gc_reason(&plain, tmp), None, "a /tmp project that is not scratch stays");
     }
 
     #[test]
