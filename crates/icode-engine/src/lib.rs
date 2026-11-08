@@ -6,6 +6,7 @@
 //! recall (M5) fill in later.
 
 pub mod chunk;
+pub mod cluster;
 pub mod daemon;
 pub mod doctor;
 pub mod embed;
@@ -14,6 +15,7 @@ pub mod index;
 pub mod memory;
 pub mod minhash;
 pub mod pagerank;
+pub mod pretool;
 pub mod module;
 pub mod parse;
 pub mod recall;
@@ -41,9 +43,13 @@ pub use memory::{
     upsert_auto_summary, project_marker, validate_bucket_name, validate_project_name, PROJECT_MARKER, SessionEnd, SessionStart, RenameReport, SqliteMemoryStore, StopHookInput,
     TranscriptDigest, WalStore, DEFAULT_PROFILE_NOTES, DEFAULT_PROJECT_MEMORIES,
 };
+pub use pretool::{
+    hint_cap, parse_grep_command, parse_pre_tool_input, render_hint, search_calls_in_command, shell_segments, symbol_brief,
+    symbol_from_pattern, symbols_from_pattern, HintLedger, PreToolInput, SearchCall, SearchScope, Segment, SymbolBrief,
+};
 pub use recall::{code_to_memory, recall, why_this_exists};
 pub use search::{find_similar, hybrid_search, rrf_fuse, semantic_search, RRF_K};
-pub use store::{SqliteCodeStore, Vec0Index};
+pub use store::{DefinitionSite, SqliteCodeStore, Vec0Index};
 pub use verdict::{check_exists, ExistScope};
 pub use vault::{Vault, VaultEntry};
 pub use verify::hook::{
