@@ -2495,7 +2495,7 @@ fn chain_json(from: &str, hops: Option<Vec<icode_core::model::ChainHop>>, min: C
         "path": path,
         "hops": hops,
         "found": true,
-        "confidence": confidence,
+        "confidence": icode_core::model::round_confidence(confidence),
         "certainty": Certainty::from_confidence(confidence).as_str(),
         "text": text,
     })

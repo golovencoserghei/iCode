@@ -149,7 +149,7 @@ pub struct Call {
     /// Deterministic confidence of this call edge, by the WAY it resolved:
     /// 0.9 exact qualified (1 def) · 0.7 qualified (>1 defs) · 0.6 bare unique ·
     /// 0.4 bare collision · 0.3 unresolved/dynamic. 0.0 before the resolve pass.
-    #[serde(default)]
+    #[serde(default, serialize_with = "ser_confidence")]
     pub confidence: f32,
 }
 
@@ -230,6 +230,7 @@ impl Call {
 pub struct ChainHop {
     pub from: String,
     pub to: String,
+    #[serde(serialize_with = "ser_confidence")]
     pub confidence: f32,
     pub certainty: Certainty,
 }
@@ -642,6 +643,17 @@ pub struct RecallResult {
     pub relevant_code: Vec<CodeHit>,
     pub relevant_memory: Vec<MemoryHit>,
     pub facts: Vec<Triple>,
+}
+
+/// Edge confidence on the wire: two decimals. The stored grades are 0.3..0.9 steps,
+/// and an f32 widened to JSON prints them as `0.6000000238`.
+pub fn ser_confidence<S: serde::Serializer>(v: &f32, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_f64(round_confidence(*v))
+}
+
+/// [`ser_confidence`]'s rounding, for responses built with `json!`.
+pub fn round_confidence(v: f32) -> f64 {
+    (f64::from(v) * 100.0).round() / 100.0
 }
 
 #[cfg(test)]
