@@ -1205,51 +1205,70 @@ fn run_serve(path: Option<PathBuf>) -> anyhow::Result<()> {
                 let want_daemon = std::env::var("ICODE_NO_DAEMON")
                     .map(|v| !matches!(v.trim(), "1" | "true" | "yes" | "on"))
                     .unwrap_or(true);
-                let store_bg = store.clone();
-                let root_bg = root.clone();
-                tokio::task::spawn_blocking(move || {
-                    // Best-effort: hash-skips unchanged files, writes only to stderr
-                    // (stdout is the MCP transport), and any failure degrades to
-                    // serving the existing graph rather than aborting serve.
-                    let state = match icode_engine::index_path(&root_bg, store_bg.as_ref()) {
-                        Ok(s) => {
-                            eprintln!(
-                                "icode serve: graph synced ({} indexed, {} skipped, {} errors)",
-                                s.files_indexed, s.files_skipped, s.errors
-                            );
-                            icode_serve::mcp::GraphSync::Ready
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "icode serve: graph sync skipped ({e}); serving existing index"
-                            );
-                            icode_serve::mcp::GraphSync::Failed
-                        }
-                    };
-                    // Release the waiting tools BEFORE spawning the watcher: the
-                    // graph is already complete at this point, and daemon startup
-                    // is not something a tool call should queue behind.
-                    signal.finish(state);
-
-                    // Started after the pass, not alongside it: two writers on one
-                    // SQLite file is a contention the sequential order avoids.
-                    if want_daemon {
-                        match daemon_pid(&root_bg) {
-                            Some(pid) => {
-                                eprintln!("icode serve: watcher already running (pid {pid})")
+                // A LIVE watcher already keeps this graph in lock-step with the tree,
+                // so the startup pass would only re-read and re-hash every file to
+                // confirm what the watcher already guarantees. That is not free: an
+                // MCP client that starts one `serve` per turn (FlowCode runs a fresh
+                // `claude -p`, hence a fresh server, on every turn) paid a whole-tree
+                // read on every turn, for nothing. Skip it — but only when the store
+                // is populated: an empty store means the watcher may still be in its
+                // own first pass, and tools must keep waiting on a real one.
+                // `ICODE_NO_DAEMON` keeps the pass: then nothing else syncs the graph.
+                let live_watcher =
+                    if want_daemon && already_indexed { daemon_pid(&root) } else { None };
+                if let Some(pid) = live_watcher {
+                    eprintln!(
+                        "icode serve: watcher already running (pid {pid}) — the graph is live, \
+                         skipping the startup pass"
+                    );
+                    signal.finish(icode_serve::mcp::GraphSync::Ready);
+                } else {
+                    let store_bg = store.clone();
+                    let root_bg = root.clone();
+                    tokio::task::spawn_blocking(move || {
+                        // Best-effort: hash-skips unchanged files, writes only to stderr
+                        // (stdout is the MCP transport), and any failure degrades to
+                        // serving the existing graph rather than aborting serve.
+                        let state = match icode_engine::index_path(&root_bg, store_bg.as_ref()) {
+                            Ok(s) => {
+                                eprintln!(
+                                    "icode serve: graph synced ({} indexed, {} skipped, {} errors)",
+                                    s.files_indexed, s.files_skipped, s.errors
+                                );
+                                icode_serve::mcp::GraphSync::Ready
                             }
-                            None => match spawn_daemon(&root_bg) {
-                                Ok(()) => {
-                                    eprintln!("icode serve: watcher started — the graph stays live")
+                            Err(e) => {
+                                eprintln!(
+                                    "icode serve: graph sync skipped ({e}); serving existing index"
+                                );
+                                icode_serve::mcp::GraphSync::Failed
+                            }
+                        };
+                        // Release the waiting tools BEFORE spawning the watcher: the
+                        // graph is already complete at this point, and daemon startup
+                        // is not something a tool call should queue behind.
+                        signal.finish(state);
+
+                        // Started after the pass, not alongside it: two writers on one
+                        // SQLite file is a contention the sequential order avoids.
+                        if want_daemon {
+                            match daemon_pid(&root_bg) {
+                                Some(pid) => {
+                                    eprintln!("icode serve: watcher already running (pid {pid})")
                                 }
-                                // Never fatal: a served snapshot is still useful.
-                                Err(e) => {
-                                    eprintln!("icode serve: could not start the watcher ({e})")
-                                }
-                            },
+                                None => match spawn_daemon(&root_bg) {
+                                    Ok(()) => {
+                                        eprintln!("icode serve: watcher started — the graph stays live")
+                                    }
+                                    // Never fatal: a served snapshot is still useful.
+                                    Err(e) => {
+                                        eprintln!("icode serve: could not start the watcher ({e})")
+                                    }
+                                },
+                            }
                         }
-                    }
-                });
+                    });
+                }
             }
         }
 
