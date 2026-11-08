@@ -1219,15 +1219,34 @@ fn run_serve(path: Option<PathBuf>) -> anyhow::Result<()> {
                 // period only when nobody is serving this project. Touched BEFORE
                 // the daemon check below, so a daemon on the verge of its idle exit
                 // sees this session first.
+                //
+                // The same tick also re-checks the watcher and respawns it when it is
+                // gone — it may have exited on idle in the very instant this session
+                // started, or died since. Only once this session's own startup pass
+                // is over: two writers walking one tree is the contention the
+                // sequential order exists to avoid.
+                let startup_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 if want_daemon {
                     let root_hb = root.clone();
+                    let done_hb = startup_done.clone();
                     touch_serve_heartbeat(&root_hb);
                     tokio::spawn(async move {
                         let mut every = tokio::time::interval(icode_engine::HEARTBEAT_EVERY);
                         every.tick().await; // the first tick is immediate; touched above
                         loop {
                             every.tick().await;
-                            touch_serve_heartbeat(&root_hb);
+                            let root_tick = root_hb.clone();
+                            let done = done_hb.load(std::sync::atomic::Ordering::Acquire);
+                            let _ = tokio::task::spawn_blocking(move || {
+                                touch_serve_heartbeat(&root_tick);
+                                if done && daemon_pid(&root_tick).is_none() {
+                                    match spawn_daemon(&root_tick) {
+                                        Ok(()) => eprintln!("icode serve: watcher was gone — restarted it"),
+                                        Err(e) => eprintln!("icode serve: could not restart the watcher ({e})"),
+                                    }
+                                }
+                            })
+                            .await;
                         }
                     });
                 }
@@ -1251,6 +1270,7 @@ fn run_serve(path: Option<PathBuf>) -> anyhow::Result<()> {
                     // a file's mtime/size disagrees with the index.
                     let store_bg = store.clone();
                     let root_bg = root.clone();
+                    let done_bg = startup_done.clone();
                     tokio::task::spawn_blocking(move || {
                         let state =
                             match icode_engine::reconcile_by_stat(&root_bg, store_bg.as_ref(), &root_bg) {
@@ -1268,10 +1288,12 @@ fn run_serve(path: Option<PathBuf>) -> anyhow::Result<()> {
                                 }
                             };
                         signal.finish(state);
+                        done_bg.store(true, std::sync::atomic::Ordering::Release);
                     });
                 } else {
                     let store_bg = store.clone();
                     let root_bg = root.clone();
+                    let done_bg = startup_done.clone();
                     tokio::task::spawn_blocking(move || {
                         // Best-effort: hash-skips unchanged files, writes only to stderr
                         // (stdout is the MCP transport), and any failure degrades to
@@ -1295,6 +1317,7 @@ fn run_serve(path: Option<PathBuf>) -> anyhow::Result<()> {
                         // graph is already complete at this point, and daemon startup
                         // is not something a tool call should queue behind.
                         signal.finish(state);
+                        done_bg.store(true, std::sync::atomic::Ordering::Release);
 
                         // Started after the pass, not alongside it: two writers on one
                         // SQLite file is a contention the sequential order avoids.
@@ -1413,39 +1436,37 @@ fn run_web(path: PathBuf, port: u16) -> anyhow::Result<()> {
 /// project with a clear error.
 /// The PID of the daemon watching `root`, if one is alive.
 ///
-/// The lock file carries the holder's PID; the flock itself is what guarantees
-/// single-writer, so a stale PID in the file after a crash is harmless — we probe
-/// liveness rather than trusting the file.
+/// Liveness is the daemon's flock on `.icode/daemon.lock` ([`icode_engine::DaemonLock::is_held`]):
+/// the kernel holds it exactly as long as the daemon process lives. The PID in the
+/// file is only read once the lock says a daemon is alive, and only to display or
+/// signal it — the holder writes its own PID right after taking the lock, so it
+/// names the holder.
 ///
-/// `kill(pid, 0)` alone is NOT that probe, and believing it made `daemon status`
-/// lie twice over (both observed live):
+/// It used to be the other way round: read the PID, then probe it with signal 0,
+/// `/proc/<pid>/stat` (zombies) and `/proc/<pid>/cmdline` (an `icode` binary). That
+/// still lied on PID reuse by ANOTHER icode process — a `serve`, a hook, a second
+/// daemon for another project — and with daemons now exiting when idle a stale
+/// PID is the normal case. A `serve` that believed it skipped its startup pass and
+/// never started a watcher, leaving the graph stale for the whole session.
 ///
-///   * **Zombies.** A daemon whose watcher init failed (inotify instance limit)
-///     exits, but until the parent reaps it the pid still exists as `Z (defunct)`
-///     — and signal 0 succeeds against it. Status then reported RUNNING for a
-///     daemon that had indexed nothing for days, which is worse than reporting
-///     nothing: a stale graph does not merely omit, it asserts what is no longer true.
-///   * **PID reuse.** Pids wrap. An unrelated process that inherited the dead
-///     daemon's number answers signal 0 just as happily.
-///
-/// So liveness = signal 0 AND `/proc/<pid>` says the process is not a zombie AND
-/// its command is actually ours. On a system without `/proc` (not Linux) the two
-/// extra checks are skipped: they degrade to the old behaviour rather than
-/// pretending a daemon is dead.
+/// `None` also when the lock is held but the PID cannot be read yet (a daemon in
+/// the instant between locking and writing it): the caller then spawns a daemon
+/// that loses the lock race and exits, which is harmless.
 fn daemon_pid(root: &std::path::Path) -> Option<i32> {
-    let pid: i32 = std::fs::read_to_string(root.join(".icode/daemon.lock"))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    // Signal 0 = existence/permission probe, sends nothing.
-    if unsafe { libc::kill(pid, 0) } != 0 {
+    if !icode_engine::DaemonLock::is_held(root) {
         return None;
     }
-    if is_zombie(pid) || !is_icode_process(pid) {
-        return None;
+    for _ in 0..5 {
+        let pid = std::fs::read_to_string(root.join(".icode/daemon.lock"))
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .filter(|pid| *pid > 0);
+        if pid.is_some() {
+            return pid;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    Some(pid)
+    None
 }
 
 /// True when `/proc/<pid>/stat` reports state `Z` (exited, not yet reaped).
@@ -1466,18 +1487,6 @@ fn is_zombie(pid: i32) -> bool {
 fn proc_state(stat: &str) -> Option<char> {
     let (_, after_comm) = stat.rsplit_once(')')?;
     after_comm.split_whitespace().next()?.chars().next()
-}
-
-/// True when pid's command looks like ours — guards against PID reuse handing us
-/// an unrelated process. Reads `/proc/<pid>/cmdline` (NUL-separated argv) and checks
-/// the executable name, so `/usr/bin/icode` and `./target/debug/icode` both match.
-/// Unreadable `/proc` (missing, or another user's process) counts as ours: this is a
-/// tie-breaker, not an authorisation check.
-fn is_icode_process(pid: i32) -> bool {
-    match std::fs::read(format!("/proc/{pid}/cmdline")) {
-        Ok(cmdline) => cmdline_is_icode(&cmdline),
-        Err(_) => true,
-    }
 }
 
 /// Whether a raw `/proc/<pid>/cmdline` (NUL-separated argv) belongs to an icode

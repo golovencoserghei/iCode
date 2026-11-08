@@ -303,3 +303,14 @@ mod lost_events {
         );
     }
 }
+
+#[test]
+fn lock_liveness_follows_the_flock_not_the_pid() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(!DaemonLock::is_held(dir.path()), "no lock file: no daemon");
+    let lock = DaemonLock::acquire(dir.path()).unwrap();
+    assert!(DaemonLock::is_held(dir.path()));
+    drop(lock);
+    // The file still names our (very much alive) pid — that must not count.
+    assert!(!DaemonLock::is_held(dir.path()), "a released lock means no daemon, whatever pid the file holds");
+}

@@ -453,8 +453,20 @@ impl DaemonLock {
         }
 
         // Non-blocking exclusive advisory lock. EWOULDBLOCK ⇒ someone else holds it.
-        // SAFETY: `fd` is a valid open descriptor we just created.
-        let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        // A few short retries: [`DaemonLock::is_held`] probes with a momentary
+        // SHARED lock, and a daemon starting during that instant must not mistake
+        // the probe for a rival daemon. A real holder outlasts the retries.
+        let mut rc = -1;
+        for attempt in 0..10 {
+            // SAFETY: `fd` is a valid open descriptor we just created.
+            rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+            if rc == 0 {
+                break;
+            }
+            if attempt < 9 {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
         if rc != 0 {
             let err = std::io::Error::last_os_error();
             // Read the holder's PID (best-effort) for a friendly message.
@@ -482,6 +494,38 @@ impl DaemonLock {
         let _ = std::fs::write(&path, format!("{}\n", std::process::id()));
 
         Ok(Self { fd })
+    }
+}
+
+impl DaemonLock {
+    /// Whether a live daemon holds `<root>/.icode/daemon.lock` right now.
+    ///
+    /// The kernel's flock IS the liveness signal: it is held exactly as long as the
+    /// daemon process lives (released on exit, crash or SIGKILL; a zombie has
+    /// already closed its fds). The PID written in the file is NOT — pids are
+    /// reused, and with daemons now exiting when idle a stale pid naming some
+    /// unrelated live process is the normal case, not a corner. Probed with a
+    /// non-blocking SHARED lock: it succeeds only if nobody holds the exclusive one,
+    /// and is dropped immediately.
+    pub fn is_held(root: &Path) -> bool {
+        let path = root.join(".icode").join("daemon.lock");
+        let Ok(c_path) = std::ffi::CString::new(path.as_os_str().to_string_lossy().as_bytes()) else {
+            return false;
+        };
+        // SAFETY: valid NUL-terminated path; read-only open creates nothing.
+        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return false; // no lock file: no daemon ever ran here
+        }
+        // SAFETY: `fd` is the descriptor just opened; closed before returning.
+        unsafe {
+            let rc = libc::flock(fd, libc::LOCK_SH | libc::LOCK_NB);
+            if rc == 0 {
+                libc::flock(fd, libc::LOCK_UN);
+            }
+            libc::close(fd);
+            rc != 0
+        }
     }
 }
 
