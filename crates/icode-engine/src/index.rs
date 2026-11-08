@@ -152,7 +152,10 @@ pub fn walk_source_files(root: &Path) -> Vec<std::path::PathBuf> {
     WalkDir::new(root)
         .into_iter()
         .filter_entry(|e| {
-            !is_excluded_dir(e.path())
+            // The walk root itself is never excluded, whatever it is named: only
+            // directories BELOW it are matched (a project checked out as `…/build`
+            // is still a project).
+            !(e.depth() > 0 && is_excluded_dir(e.path()))
                 && !(e.depth() > 0 && e.file_type().is_dir() && is_linked_worktree_below(root, e.path()))
         })
         .filter_map(|e| e.ok())
@@ -624,11 +627,27 @@ pub fn is_supported_source(path: &Path) -> bool {
     language_for(path).is_some()
 }
 
+/// Whether the changed `path` is one the indexer walk of `root` skips because of an
+/// excluded directory — the daemon's per-event form of the walk's rule.
+///
+/// Only the components BELOW `root` count. The walk matches directory names
+/// relative to its root, so a project that itself lives under `~/.cache/…`,
+/// `/srv/build/app` or `…/dist/…` is indexed in full; checking the absolute path
+/// here made the daemon drop EVERY event of such a project, and its graph never
+/// changed again after the first pass. A path outside `root` is never this tree's
+/// source and counts as excluded. `.icode` is in the set, so the daemon never
+/// reacts to its own db writes.
+pub fn is_excluded_below(root: &Path, path: &Path) -> bool {
+    match path.strip_prefix(root) {
+        Ok(rel) => is_in_excluded_dir(rel),
+        Err(_) => true,
+    }
+}
+
 /// Directory component names the indexer (and therefore the daemon) skips wholesale
-/// — build artefacts, VCS metadata, dependency caches. Exposed so the daemon's
-/// watch loop can drop events under any excluded directory using the *same* set the
-/// indexer walks with (a divergence would make the daemon index files `index_path`
-/// never sees). `.icode` is in the set, so the daemon never reacts to its own db writes.
+/// — build artefacts, VCS metadata, dependency caches — matched on EVERY component
+/// of `path`. Pass a path relative to the walk root (see [`is_excluded_below`]): an
+/// absolute path also matches the root's own ancestors.
 pub fn is_in_excluded_dir(path: &Path) -> bool {
     path.components().any(|c| match c {
         std::path::Component::Normal(name) => name
@@ -865,7 +884,7 @@ fn is_excluded_dir(path: &Path) -> bool {
 
 #[cfg(test)]
 mod exclude_tests {
-    use super::{is_excluded_dir, is_in_excluded_dir, is_in_linked_worktree, walk_source_files};
+    use super::{is_excluded_below, is_excluded_dir, is_in_excluded_dir, is_in_linked_worktree, walk_source_files};
     use std::path::Path;
 
     /// `dir/.git` as a FILE pointing at `gitdir`.
@@ -964,5 +983,29 @@ mod exclude_tests {
         assert!(is_excluded_dir(Path::new("/home/u/.cache")));
         assert!(is_excluded_dir(Path::new("/home/u/proj/target")));
         assert!(!is_excluded_dir(Path::new("/home/u/proj/src")));
+    }
+
+    #[test]
+    fn exclusion_looks_only_below_the_root() {
+        // The root's own ancestors may be named anything — a checkout under
+        // `~/.cache`, `/srv/build/app` or `…/dist/…` is still a project.
+        for root in ["/home/u/.cache/x", "/srv/build/app", "/w/dist/p", "/home/u/.local/src/p"] {
+            let root = Path::new(root);
+            assert!(!is_excluded_below(root, &root.join("src/a.ts")), "kept: {}", root.display());
+            assert!(is_excluded_below(root, &root.join("build/x.ts")), "<root>/build excluded");
+            assert!(is_excluded_below(root, &root.join(".icode/index.db")));
+            assert!(is_excluded_below(root, &root.join("pkg/node_modules/m/i.js")));
+        }
+        // Outside the root is never this tree's source.
+        assert!(is_excluded_below(Path::new("/srv/app"), Path::new("/srv/other/a.ts")));
+    }
+
+    #[test]
+    fn a_root_named_like_an_excluded_dir_is_walked() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path().join(".cache/build");
+        src(&root.join("src"), "lib.rs");
+        src(&root.join("build"), "gen.rs");
+        assert_eq!(walked(&root), vec!["src/lib.rs"]);
     }
 }

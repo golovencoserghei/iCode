@@ -359,3 +359,50 @@ fn a_directory_moved_in_and_out_is_reflected_in_the_graph() {
     assert!(wait_for(false), "a moved-out directory's files must leave the index");
     fs::remove_dir_all(&root).unwrap(); // stops the daemon
 }
+
+const CALLER_TS: &str = "import { computeTotal } from './a';\nexport function run(): number {\n  return computeTotal(21);\n}\n";
+const DEF_TS: &str = "export function computeTotal(x: number): number {\n  return x * 2;\n}\n";
+
+/// A project that itself lives under directories named like excluded ones
+/// (`.cache`, `build`) is indexed by the walk — and the daemon must keep it live.
+/// Before the fix the daemon matched the ABSOLUTE path against the exclusion list
+/// and dropped every event of such a project. `<root>/build/` stays excluded.
+#[test]
+fn a_project_inside_an_excluded_named_dir_stays_live() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = std::fs::canonicalize(dir.path()).unwrap().join(".cache/build/proj");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.ts"), DEF_TS).unwrap();
+    fs::write(root.join("src/b.ts"), CALLER_TS).unwrap();
+    let store = SqliteCodeStore::open(&root).expect("open store");
+    let reader = SqliteCodeStore::open(&root).expect("open reader");
+    let watched = root.clone();
+    std::thread::spawn(move || {
+        let _ = icode_engine::run_daemon(&watched, store);
+    });
+    let lock = root.join(".icode/daemon.lock");
+    for _ in 0..100 {
+        if fs::read_to_string(&lock).map(|s| !s.trim().is_empty()).unwrap_or(false) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(reader.get_function("computeTotal", None, true).unwrap().is_some(), "initial sync indexed the tree");
+
+    fs::create_dir_all(root.join("build")).unwrap();
+    fs::write(root.join("build/x.ts"), "export function inBuild() {}\n").unwrap();
+    fs::write(root.join("src/a.ts"), DEF_TS.replace("computeTotal", "computeSum")).unwrap();
+    let mut live = false;
+    for _ in 0..60 {
+        if reader.get_function("computeSum", None, true).unwrap().is_some() {
+            live = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(live, "an edit inside a project under `.cache/build/` must reach the graph");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(reader.get_function("inBuild", None, true).unwrap().is_none(), "<root>/build/ stays excluded");
+    fs::remove_dir_all(&root).unwrap(); // stops the daemon
+}
