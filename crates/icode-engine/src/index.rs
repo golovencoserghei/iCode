@@ -277,6 +277,9 @@ pub fn index_path(root: &Path, store: &SqliteCodeStore) -> Result<IndexStats> {
         stats.files_deleted += 1;
     }
 
+    // Errors recorded for files that are no longer on disk at all.
+    let _ = store.prune_parse_errors_except(&on_disk);
+
     // Ghost sweep: chunks whose file left the index without taking them along.
     // `delete_file` handles that from now on, so this only ever fires on a database
     // an older binary wrote — but it must fire, because nothing else would: a ghost

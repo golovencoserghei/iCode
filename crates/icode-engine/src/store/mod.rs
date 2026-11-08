@@ -1494,6 +1494,26 @@ impl SqliteCodeStore {
         collect(rows)
     }
 
+    /// Drop recorded parse errors for every path not in `on_disk`. A file that
+    /// failed to read was never in `files`, so deleting it from disk does not reach
+    /// `delete_file`; without this its error would be reported forever. Returns the
+    /// number of rows removed.
+    pub fn prune_parse_errors_except(&self, on_disk: &HashSet<String>) -> Result<u64> {
+        let conn = self.conn.lock().map_err(store_err)?;
+        let paths: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT DISTINCT path FROM parse_errors").map_err(store_err)?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).map_err(store_err)?;
+            collect(rows)?
+        };
+        let mut removed = 0u64;
+        for p in paths.iter().filter(|p| !on_disk.contains(p.as_str())) {
+            removed += conn
+                .execute("DELETE FROM parse_errors WHERE path = ?1", rusqlite::params![p])
+                .map_err(store_err)? as u64;
+        }
+        Ok(removed)
+    }
+
     /// `VACUUM` the index: rebuild the file without its free pages. Expensive (it
     /// rewrites the whole db and, under WAL, writes it through the WAL), so callers
     /// run it only after a large purge; follow it with [`Self::checkpoint_truncate`].
@@ -2667,6 +2687,9 @@ impl CodeWriteStore for SqliteCodeStore {
         // Replace the file row (ON DELETE CASCADE drops all its old graph rows).
         tx.execute("DELETE FROM files WHERE path = ?1", rusqlite::params![file.path])
             .map_err(store_err)?;
+        // It indexes now, so whatever failure was recorded for it is history.
+        tx.execute("DELETE FROM parse_errors WHERE path = ?1", rusqlite::params![file.path])
+            .map_err(store_err)?;
         tx.execute(
             "INSERT INTO files (path, language, content_hash, ast_hash, lines_total, mtime, file_size, module) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -2859,6 +2882,9 @@ impl CodeWriteStore for SqliteCodeStore {
         // returning symbols from a file nobody can open. The `code_chunks_ad`
         // trigger mirrors the delete into `vec_code`.
         tx.execute("DELETE FROM code_chunks WHERE path = ?1", rusqlite::params![path])
+            .map_err(store_err)?;
+        // A file that left the index has no parse error worth reporting either.
+        tx.execute("DELETE FROM parse_errors WHERE path = ?1", rusqlite::params![path])
             .map_err(store_err)?;
         tx.commit().map_err(store_err)?;
         // ON DELETE CASCADE dropped the file's `calls` rows → invalidate the cache.

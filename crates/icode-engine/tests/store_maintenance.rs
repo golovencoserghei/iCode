@@ -194,3 +194,19 @@ fn concurrent_first_opens_of_an_old_index_all_succeed() {
         assert!(errors.is_empty(), "round {round}: {errors:?}");
     }
 }
+
+#[test]
+fn parse_errors_clear_once_the_file_indexes_or_disappears() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    fs::write(root.join("a.rs"), b"fn a() {}\n\xff\n").unwrap();
+    fs::write(root.join("b.rs"), b"fn b() {}\n\xff\n").unwrap();
+    let store = SqliteCodeStore::open(&root).unwrap();
+    index_path(&root, &store).unwrap();
+    assert_eq!(parse_error_rows(&root), 2);
+
+    fs::write(root.join("a.rs"), "fn a() {}\n").unwrap(); // fixed
+    fs::remove_file(root.join("b.rs")).unwrap(); // gone, and never was in `files`
+    index_path(&root, &store).unwrap();
+    assert_eq!(parse_error_rows(&root), 0);
+}
