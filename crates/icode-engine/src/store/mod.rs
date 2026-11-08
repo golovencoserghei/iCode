@@ -1441,6 +1441,14 @@ impl SqliteCodeStore {
         done
     }
 
+    /// `VACUUM` the index: rebuild the file without its free pages. Expensive (it
+    /// rewrites the whole db and, under WAL, writes it through the WAL), so callers
+    /// run it only after a large purge; follow it with [`Self::checkpoint_truncate`].
+    pub fn vacuum(&self) -> Result<()> {
+        let conn = self.conn.lock().map_err(store_err)?;
+        conn.execute_batch("VACUUM").map_err(store_err)
+    }
+
     /// Read `PRAGMA user_version` from an existing db file via a throwaway
     /// connection (dropped before the caller may delete the file).
     fn db_is_current(db_path: &Path) -> Result<bool> {

@@ -296,12 +296,39 @@ pub fn index_path(root: &Path, store: &SqliteCodeStore) -> Result<IndexStats> {
         // Graph centrality (free, CPU-only) — a search-ranking prior. Must run AFTER
         // the edges are resolved, since it reads the finished call graph.
         store.compute_symbol_ranks()?;
-        // A pass that wrote anything grew the WAL; hand that space back now rather
-        // than leaving it at its high-water mark for the life of the connection.
+        // Deleting rows frees pages but never shrinks the file: an index that once
+        // held every linked worktree's copy kept its 593 MB after the walk stopped
+        // seeing them (88% of rows gone). Reclaim the space when a pass dropped a
+        // large share of the tree — never on an ordinary pass, VACUUM rewrites the
+        // whole file.
+        if should_vacuum(prior.len(), stats.files_deleted) {
+            match store.vacuum() {
+                Ok(()) => eprintln!(
+                    "index: {} of {} files left the index — compacted the database (VACUUM)",
+                    stats.files_deleted,
+                    prior.len()
+                ),
+                Err(e) => eprintln!("index: VACUUM skipped ({e}); will retry on a later large purge"),
+            }
+        }
+        // A pass that wrote anything grew the WAL (a VACUUM most of all); hand that
+        // space back now rather than leaving it at its high-water mark for the life
+        // of the connection.
         store.checkpoint_truncate();
     }
 
     Ok(stats)
+}
+
+/// Whether a full pass that removed `deleted` of the `prior_files` it started with
+/// purged enough to be worth a `VACUUM`: at least 500 files, or at least 20% of the
+/// index. Below that the freed pages are simply reused by later writes.
+pub fn should_vacuum(prior_files: usize, deleted: u64) -> bool {
+    const MIN_FILES: u64 = 500;
+    if deleted == 0 {
+        return false;
+    }
+    deleted >= MIN_FILES || deleted.saturating_mul(5) >= prior_files as u64
 }
 
 /// The prior-index facts the incremental pass compares a file against.

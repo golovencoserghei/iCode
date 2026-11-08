@@ -3,7 +3,7 @@
 
 use std::fs;
 
-use icode_engine::{index_path, SqliteCodeStore};
+use icode_engine::{index_path, should_vacuum, SqliteCodeStore};
 
 fn write_tree(root: &std::path::Path, files: usize, tag: &str) {
     for i in 0..files {
@@ -40,4 +40,35 @@ fn checkpoint_truncate_reports_success_on_an_idle_store() {
     let dir = tempfile::tempdir().unwrap();
     let store = SqliteCodeStore::open(dir.path()).unwrap();
     assert!(store.checkpoint_truncate());
+}
+
+#[test]
+fn vacuum_only_after_a_large_purge() {
+    assert!(!should_vacuum(0, 0));
+    assert!(!should_vacuum(10_000, 0));
+    assert!(!should_vacuum(10_000, 499), "under both thresholds");
+    assert!(should_vacuum(10_000, 500), "500 files is large in absolute terms");
+    assert!(should_vacuum(100, 20), "20% of the index");
+    assert!(!should_vacuum(100, 19));
+    assert!(should_vacuum(5, 5), "a tree that emptied out");
+}
+
+#[test]
+fn a_pass_that_purges_most_of_the_tree_shrinks_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    write_tree(&root, 300, "a");
+    let store = SqliteCodeStore::open(&root).unwrap();
+    index_path(&root, &store).unwrap();
+    let db = root.join(".icode/index.db");
+    let before = fs::metadata(&db).unwrap().len();
+
+    for i in 10..300 {
+        fs::remove_file(root.join(format!("m{i}.rs"))).unwrap();
+    }
+    let stats = index_path(&root, &store).unwrap();
+    assert_eq!(stats.files_deleted, 290);
+    let after = fs::metadata(&db).unwrap().len();
+    assert!(after * 2 < before, "VACUUM must give the space back: {before} -> {after} bytes");
+    assert_eq!(wal_len(&root), 0, "and the VACUUM's WAL must be truncated");
 }
