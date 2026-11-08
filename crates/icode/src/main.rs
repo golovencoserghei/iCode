@@ -1133,7 +1133,17 @@ fn run_serve(path: Option<PathBuf>) -> anyhow::Result<()> {
     let memory = build_serve_memory(embedder.clone());
 
     // Serving is async (rmcp/tokio); the rest of the CLI stays sync.
-    let runtime = tokio::runtime::Runtime::new()?;
+    //
+    // Two workers, not one per core: the async side is a single stdio transport
+    // plus a heartbeat timer, and every heavy job (the startup pass, embedding
+    // drains, tool queries) runs on the separate blocking pool, which grows on
+    // demand and shrinks again when idle. The default runtime started a worker per
+    // core — ~35 threads on a 16-core machine, multiplied by every concurrent
+    // server — to multiplex one pipe.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
     let served = runtime.block_on(async move {
         let store = Arc::new(open_store_with_shared_cache(&root)?);
 
