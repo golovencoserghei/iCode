@@ -35,7 +35,8 @@ use std::time::Duration;
 
 use icode_core::error::{Error, Result};
 use icode_core::traits::CodeWriteStore;
-use notify::RecursiveMode;
+use notify::event::{AccessKind, AccessMode};
+use notify::{EventKind, RecursiveMode};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 
 use crate::index::{
@@ -89,8 +90,11 @@ pub fn run_daemon(root: &Path, store: SqliteCodeStore) -> Result<()> {
     let (tx, rx) = mpsc::channel::<Vec<PathBuf>>();
     let mut debouncer = new_debouncer(DEBOUNCE, None, move |res: DebounceEventResult| {
         if let Ok(events) = res {
-            let paths: Vec<PathBuf> =
-                events.into_iter().flat_map(|e| e.event.paths.clone()).collect();
+            let paths: Vec<PathBuf> = events
+                .into_iter()
+                .filter(|e| is_content_event(&e.event.kind))
+                .flat_map(|e| e.event.paths.clone())
+                .collect();
             if !paths.is_empty() {
                 let _ = tx.send(paths);
             }
@@ -192,6 +196,27 @@ fn process_batch(root: &Path, store: &SqliteCodeStore, mut paths: Vec<PathBuf>) 
     log(&format!(
         "daemon: reindexed {reindexed} files, deleted {deleted} (vectors refresh on demand)"
     ));
+}
+
+/// True for watcher events that can mean a file's bytes or existence changed.
+///
+/// `notify`'s inotify backend also subscribes to `IN_OPEN`, so merely READING a
+/// file yields an `Access(Open)` event. Forwarding those made the daemon feed
+/// itself: re-indexing a file reads it, the read is an open, the open is the next
+/// batch — once any file had been read by anyone (an agent's grep, an editor,
+/// git) the daemon re-read it every debounce tick forever, and a whole project
+/// ended up in that loop (measured: 5k files, ~12k opens/s, half a core idle).
+/// Only creations, modifications (data, metadata, renames) and removals count;
+/// `Close(Write)` is kept because some writers only surface on close.
+pub fn is_content_event(kind: &EventKind) -> bool {
+    match kind {
+        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => true,
+        EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
+        EventKind::Access(_) | EventKind::Other => false,
+        // Unknown kind from a backend that cannot classify: re-index to be safe;
+        // the content-hash skip makes a spurious one cheap.
+        EventKind::Any => true,
+    }
 }
 
 /// Rebuild a watched path into the indexer's key form: the canonical absolute path

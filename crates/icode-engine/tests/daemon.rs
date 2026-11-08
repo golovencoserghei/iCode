@@ -188,3 +188,37 @@ fn daemon_exits_when_its_root_disappears() {
     let exited = rx.recv_timeout(std::time::Duration::from_secs(10));
     assert_eq!(exited, Ok(true), "daemon must exit cleanly once its root is gone");
 }
+
+/// (5) Reads are not changes. The inotify backend reports every open as
+/// `Access(Open)`; if the daemon re-indexed on those, its own read of a file would
+/// schedule the next read forever. Only events that can change bytes or existence
+/// may reach the re-index path.
+#[test]
+fn reads_do_not_trigger_reindex_but_changes_do() {
+    use icode_engine::is_content_event;
+    use notify::event::{
+        AccessKind, AccessMode, CreateKind, DataChange, EventKind, MetadataKind, ModifyKind,
+        RemoveKind, RenameMode,
+    };
+
+    for read in [
+        EventKind::Access(AccessKind::Open(AccessMode::Any)),
+        EventKind::Access(AccessKind::Read),
+        EventKind::Access(AccessKind::Close(AccessMode::Read)),
+        EventKind::Access(AccessKind::Any),
+        EventKind::Other,
+    ] {
+        assert!(!is_content_event(&read), "{read:?} must not re-index");
+    }
+    for change in [
+        EventKind::Create(CreateKind::File),
+        EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+        EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+        EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+        EventKind::Remove(RemoveKind::File),
+        EventKind::Access(AccessKind::Close(AccessMode::Write)),
+        EventKind::Any,
+    ] {
+        assert!(is_content_event(&change), "{change:?} must re-index");
+    }
+}
