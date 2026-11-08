@@ -19,10 +19,9 @@
 //! directory became the name of two of three clusters. Each test file is attached
 //! afterwards to the subsystem it calls most, and only counted there.
 //!
-//! In languages without `is_method` (JS/TS/Python/Go), a call with a receiver to a
-//! FREE function is dropped unless the receiver is a name the caller imports:
-//! `Math.round()` and `out.push()` are not calls to a local `round`/`push` (on
-//! FlowCode they were 92 and 300+ false edges, and topped the hub list).
+//! A method-syntax call never reaches a FREE function (`is_method`, which the
+//! resolve pass also sets for `Math.round()` / `out.push()` in JS/TS/Python/Go —
+//! on FlowCode those were 92 and 300+ false edges and topped the hub list).
 //!
 //! Cost (release, loaded machine): ~7 ms on iCode (99 files), ~13 ms on FlowCode
 //! (373 files), ~400 ms on a synthetic 8.2k-file / 776k-call tree — paid once per
@@ -45,7 +44,7 @@ const IMPORT_WEIGHT: f64 = 0.5;
 /// Weight of the "neighbouring file in the same directory" prior.
 const SIBLING_WEIGHT: f64 = 0.25;
 /// Bump to invalidate every cached partition when the algorithm changes.
-const ALGO_VERSION: u32 = 5;
+const ALGO_VERSION: u32 = 6;
 /// How many hubs are cached (the reply trims to the caller's limit).
 const HUBS_CACHED: usize = 50;
 /// A cross-file call edge: (caller file, callee file, weight, from test code).
@@ -134,8 +133,6 @@ fn compute(conn: &Connection, scope: &str) -> Result<SubsystemMap> {
         .collect::<rusqlite::Result<_>>()
         .map_err(store_err)?;
     drop(stmt);
-    // Rust/PHP calls carry `is_method`; elsewhere a receiver is the only clue.
-    let typed_calls: Vec<bool> = file_rows.iter().map(|(_, l, _)| l == "rust" || l == "php").collect();
     let id_ix: HashMap<i64, usize> = file_rows.iter().enumerate().map(|(i, (_, _, id))| (*id, i)).collect();
     let paths: Vec<String> = file_rows.into_iter().map(|(p, _, _)| p).collect();
     if paths.is_empty() {
@@ -195,8 +192,7 @@ fn compute(conn: &Connection, scope: &str) -> Result<SubsystemMap> {
         .collect();
     let mut in_degree: Vec<usize> = vec![0; funcs.len()];
 
-    // ── imports: per-file names a receiver may legitimately be (`api.get()` after
-    // `import * as api`), and the resolved import edges ──
+    // ── resolved import edges ──
     let mut by_suffix: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, p) in rel.iter().enumerate() {
         let stem = p.rsplit_once('.').map(|(s, _)| s).unwrap_or(p);
@@ -205,13 +201,12 @@ fn compute(conn: &Connection, scope: &str) -> Result<SubsystemMap> {
             by_suffix.entry(segs[k..].join("/")).or_default().push(i);
         }
     }
-    let mut import_names: HashMap<usize, std::collections::HashSet<String>> = HashMap::new();
     let mut import_edges: Vec<FileEdge> = Vec::new();
     // Many files import the same module: resolve each distinct spelling once.
     let mut resolved_import: HashMap<String, Option<usize>> = HashMap::new();
     let mut stmt = conn
         .prepare(
-            "SELECT i.file_id, i.module, i.name, i.alias FROM imports i JOIN files f ON f.id = i.file_id \
+            "SELECT i.file_id, i.module FROM imports i JOIN files f ON f.id = i.file_id \
              WHERE (?1 = '' OR f.module = ?1)",
         )
         .map_err(store_err)?;
@@ -220,13 +215,6 @@ fn compute(conn: &Connection, scope: &str) -> Result<SubsystemMap> {
         let file_id: i64 = r.get(0).map_err(store_err)?;
         let Some(&src) = id_ix.get(&file_id) else { continue };
         let module = text(r, 1)?.unwrap_or("");
-        let names = import_names.entry(src).or_default();
-        let last = module.rsplit(['/', '.', ':']).find(|s| !s.is_empty()).unwrap_or("");
-        for ident in [Some(last), text(r, 2)?, text(r, 3)?].into_iter().flatten() {
-            if !ident.is_empty() && !names.contains(ident) {
-                names.insert(ident.to_string());
-            }
-        }
         let dst = match resolved_import.get(module) {
             Some(d) => *d,
             None => {
@@ -246,7 +234,7 @@ fn compute(conn: &Connection, scope: &str) -> Result<SubsystemMap> {
     let mut weights: HashMap<(usize, usize, bool), f64> = HashMap::new();
     let mut stmt = conn
         .prepare(
-            "SELECT file_id, caller, callee, resolved_callee, is_method, confidence, receiver FROM calls \
+            "SELECT file_id, caller, callee, resolved_callee, is_method, confidence FROM calls \
              WHERE (?1 = '' OR module = ?1)",
         )
         .map_err(store_err)?;
@@ -267,15 +255,6 @@ fn compute(conn: &Connection, scope: &str) -> Result<SubsystemMap> {
             }),
         };
         let Some(t) = target else { continue };
-        // Untyped languages: `Math.round()` / `out.push()` is not a call to a local
-        // free `round`/`push` — unless the receiver is a module this file imports.
-        if !typed_calls[src] && funcs[t].free {
-            if let Some(rcv) = text(r, 6)?.filter(|r| !r.is_empty()) {
-                if !import_names.get(&src).is_some_and(|names| names.contains(rcv)) {
-                    continue;
-                }
-            }
-        }
         let from_test = test_file[src] || test_fn.contains(&(src, text(r, 1)?.unwrap_or("")));
         if !from_test {
             in_degree[t] += 1;

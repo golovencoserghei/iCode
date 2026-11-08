@@ -297,7 +297,8 @@ pub fn index_path(root: &Path, store: &SqliteCodeStore) -> Result<IndexStats> {
     // callee may live in a file processed later than its caller). Skipped on a pure
     // no-op pass — the persisted resolution is already correct, so re-running the
     // full-table UPDATE would only burn a write for an identical result.
-    if any_change {
+    // An index graded by older rules is re-graded once (no re-parse).
+    if any_change || store.resolution_outdated()? {
         store.resolve_call_edges(None)?;
         // Graph centrality (free, CPU-only) — a search-ranking prior. Must run AFTER
         // the edges are resolved, since it reads the finished call graph.
@@ -404,7 +405,7 @@ pub fn reconcile_by_stat(root: &Path, store: &SqliteCodeStore, under: &Path) -> 
             stats.files_deleted += 1;
         }
     }
-    if any_change {
+    if any_change || store.resolution_outdated()? {
         store.resolve_call_edges(None)?;
         store.compute_symbol_ranks()?;
         store.checkpoint_truncate();

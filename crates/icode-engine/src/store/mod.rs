@@ -3219,9 +3219,182 @@ fn resolve_callee_guess(
     }
 }
 
+/// Version of the call-grading rules. A stored index graded by older rules is
+/// re-resolved on the next index pass (see [`SqliteCodeStore::resolution_outdated`])
+/// — only `calls.confidence`/`is_method`/`resolved_callee` are rewritten, nothing is
+/// re-parsed and nothing is thrown away.
+const RESOLVE_VERSION: u32 = 2;
+const RESOLVE_VERSION_KEY: &str = "resolve_version";
+
+/// Receivers that are runtime/standard-library globals, never a project module:
+/// `Math.round()` is not a call to a local `round`.
+const BUILTIN_RECEIVERS: &[&str] = &[
+    "Math", "Object", "JSON", "Array", "Promise", "console", "String", "Number", "Boolean", "Date",
+    "Reflect", "process", "window", "document", "globalThis", "Symbol", "Map", "Set", "WeakMap",
+    "Buffer", "Intl", "navigator", "localStorage", "sessionStorage", "Error", "RegExp", "URL",
+    "crypto", "performance", "std", "core", "alloc", "os", "sys", "re", "json", "math", "fmt",
+    "strings", "errors", "time", "http", "io", "bytes", "sort", "strconv",
+];
+
+/// Receivers that mean "this object" — resolved through the enclosing type.
+const SELF_RECEIVERS: &[&str] = &["self", "this", "$this", "cls", "static", "parent", "Self", "super"];
+
+/// First identifier of a receiver expression (`os.path` → `os`, `std::mem` → `std`).
+fn receiver_root(r: &str) -> &str {
+    r.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+        .find(|s| !s.is_empty())
+        .unwrap_or("")
+}
+
+/// Path segments of an import specifier, normalised across languages
+/// (`./lib/util.js`, `pkg.mod`, `crate::a::b`, `github.com/x/y/store`).
+fn import_segments(module: &str) -> Vec<String> {
+    let m = module.trim();
+    let m = m.strip_suffix(".js").or_else(|| m.strip_suffix(".mjs")).or_else(|| m.strip_suffix(".ts")).unwrap_or(m);
+    m.replace("::", "/")
+        .replace(['\\', '.'], "/")
+        .split('/')
+        .filter(|s| !s.is_empty() && !matches!(*s, "crate" | "self" | "super" | "@" | "~"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Mark receiver calls that cannot target a FREE function with `is_method = 1`.
+///
+/// Rust and PHP parsers set `is_method` from the grammar (`a.b()` vs `a::b()`). The
+/// others could not: in JS/TS/Python/Go a dot is both method syntax and module
+/// access, so `timer.unref()`, `Math.round()` and `out.push()` were left as free
+/// calls and bound to any local function of that name at 0.6 ("bare unique").
+/// Here the ambiguity is settled against the caller file's imports: a receiver
+/// whose root names an import of a PROJECT module (relative, or a path that ends
+/// in an indexed file or directory) is module access and stays a free call;
+/// `self`/`this` stay as they are (the enclosing type resolves them); anything
+/// else — a builtin global, an external package, a local variable of unknown
+/// type — is a method call on a value. For Rust, a path call into `std`/`core`/
+/// `alloc` is marked too: `std::mem::take()` is not the project's `take`.
+///
+/// Idempotent; scoped to one file's calls when `path` is given.
+fn mark_receiver_calls(conn: &Connection, path: Option<&str>) -> Result<()> {
+    // Project path suffixes: file stems and directories, every trailing slice.
+    let mut project: HashSet<String> = HashSet::new();
+    {
+        let mut stmt = conn.prepare("SELECT path FROM files").map_err(store_err)?;
+        let mut rows = stmt.query([]).map_err(store_err)?;
+        while let Some(r) = rows.next().map_err(store_err)? {
+            let p: String = r.get(0).map_err(store_err)?;
+            let p = p.replace('\\', "/");
+            let stem = p.rsplit_once('.').map(|(s, _)| s.to_string()).unwrap_or(p);
+            let segs: Vec<&str> = stem.split('/').filter(|s| !s.is_empty()).collect();
+            // Skip the leading absolute part: a 1..=4 segment suffix is plenty.
+            for len in 1..=segs.len().min(4) {
+                project.insert(segs[segs.len() - len..].join("/"));
+                if len < segs.len() {
+                    project.insert(segs[segs.len() - len - 1..segs.len() - 1].join("/"));
+                }
+            }
+        }
+    }
+    let file_filter = if path.is_some() { " WHERE f.path = ?1" } else { "" };
+    let args: Vec<&dyn rusqlite::types::ToSql> = match &path {
+        Some(p) => vec![p],
+        None => vec![],
+    };
+    // Per file: the identifiers that name a project module.
+    let mut module_names: HashMap<i64, HashSet<String>> = HashMap::new();
+    {
+        let sql = format!(
+            "SELECT i.file_id, i.module, i.name, i.alias FROM imports i JOIN files f ON f.id = i.file_id{file_filter}"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(store_err)?;
+        let mut rows = stmt.query(args.as_slice()).map_err(store_err)?;
+        while let Some(r) = rows.next().map_err(store_err)? {
+            let file_id: i64 = r.get(0).map_err(store_err)?;
+            let module: String = r.get(1).map_err(store_err)?;
+            let segs = import_segments(&module);
+            let relative = module.starts_with('.');
+            let in_project = relative
+                || (1..=segs.len().min(4)).any(|len| project.contains(&segs[segs.len() - len..].join("/")));
+            if !in_project {
+                continue;
+            }
+            let names = module_names.entry(file_id).or_default();
+            for n in [r.get::<_, Option<String>>(2).map_err(store_err)?, r.get::<_, Option<String>>(3).map_err(store_err)?]
+                .into_iter()
+                .flatten()
+            {
+                names.insert(n);
+            }
+            if let Some(first) = segs.first() {
+                names.insert(first.clone());
+            }
+            if let Some(last) = segs.last() {
+                names.insert(last.clone());
+            }
+        }
+    }
+    let sql = format!(
+        "SELECT c.id, c.file_id, c.receiver, f.language FROM calls c JOIN files f ON f.id = c.file_id{} \
+         {} c.is_method = 0 AND c.receiver IS NOT NULL AND c.receiver != ''",
+        file_filter,
+        if path.is_some() { "AND" } else { "WHERE" },
+    );
+    let mut to_mark: Vec<i64> = Vec::new();
+    {
+        let mut stmt = conn.prepare(&sql).map_err(store_err)?;
+        let mut rows = stmt.query(args.as_slice()).map_err(store_err)?;
+        while let Some(r) = rows.next().map_err(store_err)? {
+            let id: i64 = r.get(0).map_err(store_err)?;
+            let file_id: i64 = r.get(1).map_err(store_err)?;
+            let receiver: String = r.get(2).map_err(store_err)?;
+            let lang: String = r.get(3).map_err(store_err)?;
+            let root = receiver_root(&receiver);
+            if SELF_RECEIVERS.contains(&root) {
+                continue;
+            }
+            let builtin = BUILTIN_RECEIVERS.contains(&root);
+            let foreign = match lang.as_str() {
+                // Grammar-typed: only a path into the standard library is foreign.
+                "rust" | "php" => lang == "rust" && matches!(root, "std" | "core" | "alloc"),
+                _ => builtin || !module_names.get(&file_id).is_some_and(|n| n.contains(root)),
+            };
+            if foreign {
+                to_mark.push(id);
+            }
+        }
+    }
+    if !to_mark.is_empty() {
+        let mut stmt = conn.prepare("UPDATE calls SET is_method = 1 WHERE id = ?1").map_err(store_err)?;
+        conn.execute_batch("SAVEPOINT mark_receivers").map_err(store_err)?;
+        for id in to_mark {
+            if let Err(e) = stmt.execute([id]) {
+                let _ = conn.execute_batch("ROLLBACK TO mark_receivers; RELEASE mark_receivers");
+                return Err(store_err(e));
+            }
+        }
+        conn.execute_batch("RELEASE mark_receivers").map_err(store_err)?;
+    }
+    Ok(())
+}
+
 /// Resolve a function (then class) by `name`, optionally preferring `file_hint`.
 /// Returns the wrapped definition, the symbol's path, and its qualified name.
 impl SqliteCodeStore {
+    /// True when the stored call grading predates the current rules
+    /// ([`RESOLVE_VERSION`]); the indexer then re-resolves even on a no-op pass.
+    pub fn resolution_outdated(&self) -> Result<bool> {
+        use rusqlite::OptionalExtension;
+        let conn = self.conn.lock().map_err(store_err)?;
+        let v: Option<String> = conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", [RESOLVE_VERSION_KEY], |r| r.get(0))
+            .optional()
+            .map_err(store_err)?;
+        let has_calls: bool = conn
+            .query_row("SELECT EXISTS(SELECT 1 FROM calls)", [], |r| r.get::<_, i64>(0))
+            .map_err(store_err)?
+            != 0;
+        Ok(has_calls && v.and_then(|v| v.parse::<u32>().ok()) != Some(RESOLVE_VERSION))
+    }
+
     /// Finalize receiver-aware call resolution against the COMPLETE `functions`
     /// table: validate each `resolved_callee` guess (null it out on a miss so the
     /// edge falls back to bare-name) and grade `confidence` by the way it resolved.
@@ -3239,13 +3412,22 @@ impl SqliteCodeStore {
             Some(p) => vec![p],
             None => vec![],
         };
-        // 1) Grade confidence by resolution method (uses the pre-null guess).
+        // 0) Receiver calls that cannot reach a free function. See
+        //    `mark_receiver_calls`: afterwards `is_method = 1` means exactly that, in
+        //    every language, and every read query's soundness rule applies to it.
+        mark_receiver_calls(&conn, path)?;
+        // 1) Grade confidence by resolution method (uses the pre-null guess). A
+        //    receiver call whose receiver did NOT pin a definition is a guess about
+        //    an unknown value's type: never better than ambiguous.
         let conf_sql = format!(
             "UPDATE calls SET confidence = CASE \
                WHEN resolved_callee IS NOT NULL \
                     AND (SELECT COUNT(*) FROM functions f WHERE f.qualified_name = calls.resolved_callee) = 1 THEN {q1} \
                WHEN resolved_callee IS NOT NULL \
                     AND (SELECT COUNT(*) FROM functions f WHERE f.qualified_name = calls.resolved_callee) > 1 THEN {q2} \
+               WHEN is_method = 1 \
+                    AND EXISTS (SELECT 1 FROM functions f WHERE f.name = calls.callee) THEN {b2} \
+               WHEN is_method = 1 THEN {u} \
                WHEN (SELECT COUNT(*) FROM functions f WHERE f.name = calls.callee) = 1 THEN {b1} \
                WHEN (SELECT COUNT(*) FROM functions f WHERE f.name = calls.callee) > 1 THEN {b2} \
                ELSE {u} END \
@@ -3265,6 +3447,13 @@ impl SqliteCodeStore {
                AND NOT EXISTS (SELECT 1 FROM functions f WHERE f.qualified_name = calls.resolved_callee){filter}"
         );
         conn.execute(&null_sql, args.as_slice()).map_err(store_err)?;
+        if path.is_none() {
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+                rusqlite::params![RESOLVE_VERSION_KEY, RESOLVE_VERSION.to_string()],
+            )
+            .map_err(store_err)?;
+        }
         // `calls` was re-graded. This pass only touches `confidence`/`resolved_callee`
         // — not `caller`/`callee`, the only columns the adjacency reads — so the
         // adjacency is unchanged in practice, but we invalidate CONSERVATIVELY (an
