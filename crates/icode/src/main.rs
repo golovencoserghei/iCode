@@ -264,6 +264,16 @@ enum HookAction {
         #[arg(long)]
         cwd: Option<PathBuf>,
     },
+    /// PreToolUse hook: when the agent greps for ONE symbol (Grep, or a plain
+    /// `rg`/`grep` Bash command), answer from the code graph — definitions, call
+    /// count, top callers — as `additionalContext`. Never blocks the call. Silent
+    /// when there is no index, no definition, no clear identifier, or the
+    /// per-session cap (`ICODE_HOOK_HINT_CAP`, default 8) is spent. Always exits 0.
+    PreTool {
+        /// Working directory used when the payload carries no `cwd`.
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+    },
     /// Print a ready-to-paste `~/.claude/settings.json` hooks snippet wiring the
     /// SessionStart / PreCompact / Stop events to `icode hook …`, plus where to
     /// put it.
@@ -339,6 +349,17 @@ fn main() -> anyhow::Result<()> {
         host::run();
         return Ok(());
     }
+    // `icode hook pre-tool` bypasses clap too: it runs before EVERY Grep/Bash call,
+    // and Claude Code treats exit 2 (clap's usage-error code) as "block the tool".
+    // A stray or future flag must never cost the agent its grep, so its arguments
+    // are read leniently and it always exits 0.
+    {
+        let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+        if args.len() >= 3 && args[1] == "hook" && args[2] == "pre-tool" {
+            run_hook_pre_tool(pre_tool_cwd_arg(&args[3..]).as_deref());
+            std::process::exit(0);
+        }
+    }
     let cli = Cli::parse();
     match cli.command {
         Command::Index { path } => run_index(&existing_root(path)?),
@@ -392,6 +413,10 @@ fn main() -> anyhow::Result<()> {
             }
             HookAction::PostTool { project, cwd } => {
                 run_hook_post_tool(project.as_deref(), cwd.as_deref());
+                Ok(())
+            }
+            HookAction::PreTool { cwd } => {
+                run_hook_pre_tool(cwd.as_deref());
                 Ok(())
             }
             HookAction::Config => {
@@ -689,6 +714,168 @@ fn try_hook_post_tool(project: Option<&str>, cwd: Option<&std::path::Path>) -> O
     })
     .ok()?;
     Some(())
+}
+
+/// PreToolUse hook: a graph answer for a symbol grep. Fail-open in every sense:
+/// any error, panic or doubt prints nothing and exits 0, and stderr stays empty
+/// (the panic hook is silenced) — a hint is optional, the grep is not.
+fn run_hook_pre_tool(cwd: Option<&std::path::Path>) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static PRINTING: AtomicBool = AtomicBool::new(false);
+    std::panic::set_hook(Box::new(|_| {}));
+    // Time budget: the hint must never be what makes a grep feel slow. A cold
+    // page cache on a big index (measured: ~140 ms on 150k call edges on an
+    // external disk) is the realistic overrun; past the budget the process just
+    // leaves, silently — unless it is already printing, so the JSON is never cut.
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(PRE_TOOL_BUDGET_MS));
+        if !PRINTING.swap(true, Ordering::SeqCst) {
+            std::process::exit(0);
+        }
+    });
+    let out = std::panic::catch_unwind(|| {
+        use std::io::Read;
+        let mut raw = String::new();
+        std::io::stdin().take(1 << 20).read_to_string(&mut raw).ok()?;
+        pre_tool_hint(&raw, cwd, &hook_state_dir())
+    });
+    if let Ok(Some(json)) = out {
+        if !PRINTING.swap(true, Ordering::SeqCst) {
+            println!("{json}");
+        }
+    }
+}
+
+/// Wall-clock budget of `icode hook pre-tool`, in milliseconds.
+const PRE_TOOL_BUDGET_MS: u64 = 140;
+
+/// `--cwd DIR` / `--cwd=DIR` from the pre-tool arguments; anything else ignored.
+fn pre_tool_cwd_arg(args: &[std::ffi::OsString]) -> Option<PathBuf> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let s = a.to_string_lossy();
+        if s == "--cwd" {
+            return it.next().map(PathBuf::from).filter(|p| !p.as_os_str().is_empty());
+        }
+        if let Some(v) = s.strip_prefix("--cwd=") {
+            return (!v.is_empty()).then(|| PathBuf::from(v));
+        }
+    }
+    None
+}
+
+/// Where the per-session hint ledgers live: `$ICODE_HOOK_STATE_DIR`, else
+/// `~/.icode/hook-hints` (beside the central db, never inside a project tree).
+fn hook_state_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("ICODE_HOOK_STATE_DIR") {
+        if !p.trim().is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    let db = PathBuf::from(central_db_path());
+    db.parent().map(|p| p.join("hook-hints")).unwrap_or_else(|| PathBuf::from(".icode/hook-hints"))
+}
+
+/// The indexed tree a (canonical) search target belongs to.
+///
+/// The target's repo top — a linked worktree's OWN root, never its main checkout
+/// — is the only candidate: if it holds no index the hook stays silent. Climbing
+/// past it would answer a worktree's grep from another checkout's index, with
+/// another branch's line numbers. Outside any repo, the nearest ancestor holding
+/// an index is used.
+fn index_root_for(target: &std::path::Path) -> Option<PathBuf> {
+    let has_index = |d: &std::path::Path| d.join(".icode").join("index.db").is_file();
+    match find_repo_top(target) {
+        Some(top) => has_index(&top).then_some(top),
+        None => target.ancestors().find(|d| has_index(d)).map(std::path::Path::to_path_buf),
+    }
+}
+
+/// The whole decision, stdin JSON in → hook JSON out (or `None` = silence).
+fn pre_tool_hint(raw: &str, cwd: Option<&std::path::Path>, state_dir: &std::path::Path) -> Option<String> {
+    let cap = icode_engine::hint_cap();
+    if cap == 0 {
+        return None;
+    }
+    let input = icode_engine::parse_pre_tool_input(raw)?;
+    let calls = input.search_calls();
+    if calls.is_empty() {
+        return None;
+    }
+    let mut ledger = icode_engine::HintLedger::open(state_dir, &input.session_id)?;
+    if ledger.count() >= cap {
+        return None;
+    }
+
+    // The shell cwd: the payload's, then --cwd, then ours.
+    let base = input
+        .cwd
+        .as_deref()
+        .filter(|c| !c.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| cwd.map(std::path::Path::to_path_buf))
+        .or_else(|| std::env::current_dir().ok())?;
+
+    // One hint per tool call, for ONE indexed tree: the tree of the first search
+    // that names a symbol. Up to three symbols, each never hinted before.
+    let mut root: Option<PathBuf> = None;
+    let mut wanted: Vec<(String, icode_engine::SearchScope)> = Vec::new();
+    for call in &calls {
+        let symbols = icode_engine::symbols_from_pattern(&call.pattern, call.fixed, call.extended);
+        if symbols.is_empty() {
+            continue;
+        }
+        // Where the search really runs: `cd` dir, then each search path, resolved
+        // on disk (`..` and symlinks included) — never textually.
+        let dir = match &call.dir {
+            Some(d) => base.join(d),
+            None => base.clone(),
+        };
+        let raw_targets: Vec<PathBuf> =
+            if call.paths.is_empty() { vec![dir.clone()] } else { call.paths.iter().map(|p| dir.join(p)).collect() };
+        let targets: Vec<PathBuf> = raw_targets.iter().filter_map(|t| std::fs::canonicalize(t).ok()).collect();
+        let Some(first) = targets.first() else { continue };
+        let Some(r) = index_root_for(first) else { continue };
+        if unindexable_root(&r).is_some() || targets.iter().any(|t| !t.starts_with(&r)) {
+            continue;
+        }
+        match &root {
+            None => root = Some(r),
+            Some(have) if *have != r => continue,
+            Some(_) => {}
+        }
+        let scope = icode_engine::SearchScope { targets, globs: call.globs.clone(), types: call.types.clone() };
+        for sym in symbols {
+            if !wanted.iter().any(|(w, _)| *w == sym) && !ledger.contains(&sym) {
+                wanted.push((sym, scope.clone()));
+            }
+        }
+    }
+    let root = root?;
+    // A read-only connection: never creates `.icode/` or an index, never writes
+    // the db. (SQLite may still create the `-wal`/`-shm` sidecars of a WAL-mode
+    // db it reads — that is SQLite's reader protocol, not a write.) A missing
+    // or foreign-schema index = silence.
+    let store = SqliteCodeStore::open_existing_readonly(&root, 50).ok()??;
+    let briefs: Vec<icode_engine::SymbolBrief> = wanted
+        .iter()
+        .take(6)
+        .filter_map(|(s, scope)| icode_engine::symbol_brief(&store, s, &root, scope))
+        .take(3)
+        .collect();
+    if briefs.is_empty() {
+        return None;
+    }
+
+    // Claim under the session lock before printing: a cap we cannot record is a
+    // cap we cannot keep, and a parallel hook may have taken these symbols.
+    let names: Vec<&str> = briefs.iter().map(|b| b.name.as_str()).collect();
+    let claimed = ledger.commit(&names, cap).ok()?;
+    let briefs: Vec<icode_engine::SymbolBrief> = briefs.into_iter().filter(|b| claimed.contains(&b.name)).collect();
+    if briefs.is_empty() {
+        return None;
+    }
+    Some(hook_output_json("PreToolUse", &icode_engine::render_hint(&briefs)))
 }
 
 fn run_stats(path: &std::path::Path) -> anyhow::Result<()> {
@@ -2375,10 +2562,11 @@ fn try_hook_stop(project: Option<&str>, cwd: Option<&std::path::Path>) -> Option
 fn run_hook_config() {
     eprintln!("# Add the `hooks` block below to ~/.claude/settings.json (merge into an");
     eprintln!("# existing \"hooks\" object if you already have one). Claude Code will then");
-    eprintln!("# run `icode hook …` on SessionStart / PreCompact / Stop / PostToolUse to");
+    eprintln!("# run `icode hook …` on SessionStart / PreCompact / Stop / PreToolUse / PostToolUse to");
     eprintln!("# inject memory, re-assert L0 rules across compaction, auto-save a session");
     eprintln!("# summary when the agent forgets `session_end`, and file every test/build");
-    eprintln!("# run in the verification ledger. (stdout below is the JSON snippet.)");
+    eprintln!("# run in the verification ledger; a grep for one symbol gets the code-graph");
+    eprintln!("# answer (definitions, callers) up front. (stdout below is the JSON snippet.)");
     eprintln!();
     println!("{}", hook_settings_json());
 }
@@ -2395,10 +2583,14 @@ fn hook_settings_json() -> String {
     let cmd_precompact = format!("{exe} hook precompact --cwd \\\"$CLAUDE_PROJECT_DIR\\\"");
     let cmd_stop = format!("{exe} hook stop --cwd \\\"$CLAUDE_PROJECT_DIR\\\"");
     let cmd_post = format!("{exe} hook post-tool --cwd \\\"$CLAUDE_PROJECT_DIR\\\"");
+    // Fail-open at the SHELL level too: an older icode without `pre-tool` would
+    // exit 2 from its argument parser, and exit 2 from a PreToolUse hook BLOCKS
+    // the tool call — every grep of the session.
+    let cmd_pre = format!("{exe} hook pre-tool --cwd \\\"$CLAUDE_PROJECT_DIR\\\" 2>/dev/null || true");
     // PostToolUse is matched to Bash only: the ledger cares about commands that
     // ran, and firing on every file read would be pure overhead.
     format!(
-        "{{\n  \"hooks\": {{\n    \"SessionStart\": [\n      {{\n        \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \"{cmd_session}\" }}\n        ]\n      }}\n    ],\n    \"PreCompact\": [\n      {{\n        \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \"{cmd_precompact}\" }}\n        ]\n      }}\n    ],\n    \"Stop\": [\n      {{\n        \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \"{cmd_stop}\" }}\n        ]\n      }}\n    ],\n    \"PostToolUse\": [\n      {{\n        \"matcher\": \"Bash\",\n        \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \"{cmd_post}\" }}\n        ]\n      }}\n    ]\n  }}\n}}"
+        "{{\n  \"hooks\": {{\n    \"SessionStart\": [\n      {{\n        \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \"{cmd_session}\" }}\n        ]\n      }}\n    ],\n    \"PreCompact\": [\n      {{\n        \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \"{cmd_precompact}\" }}\n        ]\n      }}\n    ],\n    \"Stop\": [\n      {{\n        \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \"{cmd_stop}\" }}\n        ]\n      }}\n    ],\n    \"PreToolUse\": [\n      {{\n        \"matcher\": \"Grep|Bash\",\n        \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \"{cmd_pre}\" }}\n        ]\n      }}\n    ],\n    \"PostToolUse\": [\n      {{\n        \"matcher\": \"Bash\",\n        \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \"{cmd_post}\" }}\n        ]\n      }}\n    ]\n  }}\n}}"
     )
 }
 
