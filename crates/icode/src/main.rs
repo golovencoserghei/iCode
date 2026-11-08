@@ -1205,6 +1205,22 @@ fn run_serve(path: Option<PathBuf>) -> anyhow::Result<()> {
                 let want_daemon = std::env::var("ICODE_NO_DAEMON")
                     .map(|v| !matches!(v.trim(), "1" | "true" | "yes" | "on"))
                     .unwrap_or(true);
+                // Tell the watcher a client is alive: it exits after a long idle
+                // period only when nobody is serving this project. Touched BEFORE
+                // the daemon check below, so a daemon on the verge of its idle exit
+                // sees this session first.
+                if want_daemon {
+                    let root_hb = root.clone();
+                    touch_serve_heartbeat(&root_hb);
+                    tokio::spawn(async move {
+                        let mut every = tokio::time::interval(icode_engine::HEARTBEAT_EVERY);
+                        every.tick().await; // the first tick is immediate; touched above
+                        loop {
+                            every.tick().await;
+                            touch_serve_heartbeat(&root_hb);
+                        }
+                    });
+                }
                 // A LIVE watcher already keeps this graph in lock-step with the tree,
                 // so the startup pass would only re-read and re-hash every file to
                 // confirm what the watcher already guarantees. That is not free: an
@@ -1321,6 +1337,22 @@ fn run_serve(path: Option<PathBuf>) -> anyhow::Result<()> {
     // either; the next complete pass starts it.
     runtime.shutdown_background();
     served
+}
+
+/// Refresh `<root>/.icode/serve.heartbeat`'s mtime — the "a client is alive"
+/// signal the watcher daemon's idle exit reads. Best-effort: a failure only means
+/// the daemon may exit after its idle period and be restarted by the next serve.
+fn touch_serve_heartbeat(root: &std::path::Path) {
+    let path = root.join(".icode").join(icode_engine::SERVE_HEARTBEAT);
+    let touched = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .and_then(|f| f.set_modified(std::time::SystemTime::now()));
+    if let Err(e) = touched {
+        eprintln!("icode serve: could not refresh {} ({e})", path.display());
+    }
 }
 
 /// `icode web <path> [--port N]` — open the store and serve the local web

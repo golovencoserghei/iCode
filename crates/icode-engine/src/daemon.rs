@@ -26,12 +26,14 @@
 //!
 //! Graceful: a single file's parse error is recorded and skipped (the daemon never
 //! dies on bad input); SIGINT (Ctrl-C) stops the watch loop and releases the lock.
+//! After a long idle period with no live client the daemon exits on its own — see
+//! [`should_exit_idle`].
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use icode_core::error::{Error, Result};
 use icode_core::traits::CodeWriteStore;
@@ -47,6 +49,64 @@ use crate::store::SqliteCodeStore;
 /// Debounce window: collapse a burst of FS events (editor save dance, git
 /// checkout, rename pairs) into one batch before we touch the store.
 const DEBOUNCE: Duration = Duration::from_millis(1000);
+
+/// File under `<root>/.icode/` whose mtime a running `icode serve` refreshes (at
+/// start and about once a minute) so the daemon can tell a client is still using
+/// the graph. See [`should_exit_idle`].
+pub const SERVE_HEARTBEAT: &str = "serve.heartbeat";
+
+/// How often a running `serve` refreshes [`SERVE_HEARTBEAT`].
+pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(60);
+
+/// Default idle period after which a daemon with no events and no live client exits.
+const DEFAULT_IDLE: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// How often the watch loop re-evaluates the idle rule once the idle period is up.
+const IDLE_CHECK_EVERY: Duration = Duration::from_secs(30);
+
+/// The idle period: `ICODE_DAEMON_IDLE_SECS` (seconds; `0` disables the idle exit),
+/// else 6 hours.
+pub fn idle_timeout() -> Option<Duration> {
+    match std::env::var("ICODE_DAEMON_IDLE_SECS").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(0) => None,
+        Some(secs) => Some(Duration::from_secs(secs)),
+        None => Some(DEFAULT_IDLE),
+    }
+}
+
+/// Whether an idle daemon should exit now.
+///
+/// A daemon used to live forever: one per project ever served, each holding an
+/// inotify watch on the whole tree and an open SQLite connection (which in turn
+/// kept the WAL from shrinking), long after anyone last asked it anything. It now
+/// exits when BOTH hold for at least `idle`:
+///   * no batch of source-file events arrived (`last_activity`), and
+///   * no client is alive — the [`SERVE_HEARTBEAT`] mtime is older than `idle`
+///     (or the file does not exist).
+///
+/// The next `serve` finds no daemon, runs its own startup pass and spawns a fresh
+/// one, so exiting costs one pass, never correctness. A clock that went backwards
+/// (a timestamp in the future) counts as "just now": it keeps the daemon alive.
+pub fn should_exit_idle(
+    now: SystemTime,
+    last_activity: SystemTime,
+    heartbeat: Option<SystemTime>,
+    idle: Duration,
+) -> bool {
+    let age = |t: SystemTime| now.duration_since(t).unwrap_or(Duration::ZERO);
+    if age(last_activity) < idle {
+        return false;
+    }
+    match heartbeat {
+        Some(beat) => age(beat) >= idle,
+        None => true,
+    }
+}
+
+/// mtime of `<root>/.icode/serve.heartbeat`, if it exists.
+fn heartbeat_mtime(root: &Path) -> Option<SystemTime> {
+    std::fs::metadata(root.join(".icode").join(SERVE_HEARTBEAT)).ok()?.modified().ok()
+}
 
 /// Run the live indexing daemon for `root` (foreground; blocks until SIGINT).
 ///
@@ -110,6 +170,9 @@ pub fn run_daemon(root: &Path, store: SqliteCodeStore) -> Result<()> {
 
     // Main loop: pull debounced batches; poll the stop flag on each timeout tick so
     // Ctrl-C is responsive even with no FS activity.
+    let idle = idle_timeout();
+    let mut last_activity = SystemTime::now();
+    let mut next_idle_check = Instant::now();
     while running.load(Ordering::Relaxed) {
         // A daemon whose tree is gone (a deleted worktree, a cleaned-up scratch
         // dir) has nothing left to watch: exit instead of lingering forever.
@@ -118,8 +181,25 @@ pub fn run_daemon(root: &Path, store: SqliteCodeStore) -> Result<()> {
             break;
         }
         match rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(paths) => process_batch(&root, &store, paths),
-            Err(RecvTimeoutError::Timeout) => continue,
+            Ok(paths) => {
+                if process_batch(&root, &store, paths) {
+                    last_activity = SystemTime::now();
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                let Some(idle) = idle else { continue };
+                if Instant::now() < next_idle_check {
+                    continue;
+                }
+                next_idle_check = Instant::now() + IDLE_CHECK_EVERY.min(idle);
+                if should_exit_idle(SystemTime::now(), last_activity, heartbeat_mtime(&root), idle) {
+                    log(&format!(
+                        "daemon: no changes and no client for {}s — exiting (the next `icode serve` restarts it)",
+                        idle.as_secs()
+                    ));
+                    break;
+                }
+            }
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
@@ -132,10 +212,15 @@ pub fn run_daemon(root: &Path, store: SqliteCodeStore) -> Result<()> {
 /// delete vanished files and re-index the rest (GRAPH only — embedding is on-demand,
 /// so changed chunks are simply left in the pending queue). Never returns an error —
 /// a single bad file is recorded and skipped so the daemon keeps running.
-fn process_batch(root: &Path, store: &SqliteCodeStore, mut paths: Vec<PathBuf>) {
+///
+/// Returns whether the batch touched any source file this tree indexes (even one
+/// whose bytes turned out unchanged) — the activity signal for the idle exit. A
+/// batch of only excluded paths (our own `.icode` writes, `target/`) is not activity.
+fn process_batch(root: &Path, store: &SqliteCodeStore, mut paths: Vec<PathBuf>) -> bool {
     paths.sort();
     paths.dedup();
 
+    let mut relevant = false;
     let mut reindexed = 0u64;
     let mut deleted = 0u64;
 
@@ -152,6 +237,7 @@ fn process_batch(root: &Path, store: &SqliteCodeStore, mut paths: Vec<PathBuf>) 
         if is_in_excluded_dir(&path) || !is_supported_source(&path) || is_in_linked_worktree(root, &path) {
             continue;
         }
+        relevant = true;
 
         if path.exists() {
             // Created or modified → re-index (replaces the file's old rows).
@@ -178,7 +264,7 @@ fn process_batch(root: &Path, store: &SqliteCodeStore, mut paths: Vec<PathBuf>) 
     }
 
     if reindexed == 0 && deleted == 0 {
-        return; // batch was all noise (excluded/unsupported paths)
+        return relevant; // nothing changed (noise, or unchanged bytes)
     }
 
     // Graph centrality is a WHOLE-GRAPH property: editing one file can change the rank
@@ -201,6 +287,7 @@ fn process_batch(root: &Path, store: &SqliteCodeStore, mut paths: Vec<PathBuf>) 
     log(&format!(
         "daemon: reindexed {reindexed} files, deleted {deleted} (vectors refresh on demand)"
     ));
+    true
 }
 
 /// True for watcher events that can mean a file's bytes or existence changed.

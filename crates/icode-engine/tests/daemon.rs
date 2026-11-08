@@ -222,3 +222,48 @@ fn reads_do_not_trigger_reindex_but_changes_do() {
         assert!(is_content_event(&change), "{change:?} must re-index");
     }
 }
+
+// ──────────────────────────── idle exit ────────────────────────────
+
+mod idle_exit {
+    use icode_engine::should_exit_idle;
+    use std::time::{Duration, SystemTime};
+
+    const IDLE: Duration = Duration::from_secs(6 * 3600);
+    fn ago(now: SystemTime, secs: u64) -> SystemTime {
+        now - Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn recent_events_keep_the_daemon_alive_even_without_a_client() {
+        let now = SystemTime::now();
+        assert!(!should_exit_idle(now, ago(now, 60), None, IDLE));
+    }
+
+    #[test]
+    fn a_fresh_heartbeat_keeps_an_idle_daemon_alive() {
+        let now = SystemTime::now();
+        assert!(!should_exit_idle(now, ago(now, 7 * 3600), Some(ago(now, 30)), IDLE));
+    }
+
+    #[test]
+    fn no_events_and_a_stale_heartbeat_mean_exit() {
+        let now = SystemTime::now();
+        assert!(should_exit_idle(now, ago(now, 7 * 3600), Some(ago(now, 7 * 3600)), IDLE));
+        assert!(should_exit_idle(now, ago(now, 6 * 3600), Some(ago(now, 6 * 3600)), IDLE), "boundary is inclusive");
+    }
+
+    #[test]
+    fn no_events_and_no_heartbeat_file_mean_exit() {
+        let now = SystemTime::now();
+        assert!(should_exit_idle(now, ago(now, 7 * 3600), None, IDLE));
+    }
+
+    #[test]
+    fn timestamps_from_the_future_count_as_now() {
+        let now = SystemTime::now();
+        let future = now + Duration::from_secs(3600);
+        assert!(!should_exit_idle(now, future, None, IDLE));
+        assert!(!should_exit_idle(now, ago(now, 7 * 3600), Some(future), IDLE));
+    }
+}

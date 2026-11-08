@@ -24,7 +24,10 @@ pub mod vault;
 pub mod verify;
 
 pub use chunk::{chunks_for_file, rel_display_path, CHUNK_BUDGET_BYTES};
-pub use daemon::{is_content_event, run_daemon, DaemonLock};
+pub use daemon::{
+    idle_timeout, is_content_event, run_daemon, should_exit_idle, DaemonLock, HEARTBEAT_EVERY,
+    SERVE_HEARTBEAT,
+};
 pub use doctor::{diagnose, DiagnosticReport};
 pub use embed::{embed_pending, embed_pending_capped, EmbedStats};
 pub use index::{
