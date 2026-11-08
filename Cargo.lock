@@ -1250,7 +1250,7 @@ dependencies = [
 
 [[package]]
 name = "icode"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1269,7 +1269,7 @@ dependencies = [
 
 [[package]]
 name = "icode-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "chrono",
  "serde",
@@ -1280,7 +1280,7 @@ dependencies = [
 
 [[package]]
 name = "icode-embed"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "icode-core",
@@ -1291,7 +1291,7 @@ dependencies = [
 
 [[package]]
 name = "icode-engine"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "age",
  "anyhow",
@@ -1324,7 +1324,7 @@ dependencies = [
 
 [[package]]
 name = "icode-serve"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum",
