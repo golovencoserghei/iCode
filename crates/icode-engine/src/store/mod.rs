@@ -1441,6 +1441,39 @@ impl SqliteCodeStore {
         done
     }
 
+    /// Record that `path` failed to index — once per version of the file.
+    ///
+    /// `fingerprint` identifies the bytes that failed (see
+    /// [`crate::index::error_fingerprint`]). If the stored error for `path` already
+    /// carries it, nothing is written and `false` comes back: the caller should not
+    /// log it again either. Otherwise the path's previous error rows are replaced by
+    /// this one and `true` comes back.
+    ///
+    /// The plain [`CodeWriteStore::record_parse_error`] appended a row per call, and
+    /// the daemon calls it on every watcher event: one non-UTF-8 file that something
+    /// kept touching produced a row and a log line per event, which is how a
+    /// `daemon.log` reached 202 MB.
+    pub fn record_parse_error_once(&self, path: &str, fingerprint: &str, error: &str) -> Result<bool> {
+        let mut conn = self.conn.lock().map_err(store_err)?;
+        let seen = conn
+            .prepare("SELECT 1 FROM parse_errors WHERE path = ?1 AND fingerprint = ?2")
+            .and_then(|mut st| st.exists(rusqlite::params![path, fingerprint]))
+            .map_err(store_err)?;
+        if seen {
+            return Ok(false);
+        }
+        let tx = conn.transaction().map_err(store_err)?;
+        tx.execute("DELETE FROM parse_errors WHERE path = ?1", rusqlite::params![path])
+            .map_err(store_err)?;
+        tx.execute(
+            "INSERT INTO parse_errors (path, error, fingerprint) VALUES (?1, ?2, ?3)",
+            rusqlite::params![path, error, fingerprint],
+        )
+        .map_err(store_err)?;
+        tx.commit().map_err(store_err)?;
+        Ok(true)
+    }
+
     /// `VACUUM` the index: rebuild the file without its free pages. Expensive (it
     /// rewrites the whole db and, under WAL, writes it through the WAL), so callers
     /// run it only after a large purge; follow it with [`Self::checkpoint_truncate`].
@@ -1497,6 +1530,17 @@ impl SqliteCodeStore {
         conn.pragma_update(None, "journal_size_limit", JOURNAL_SIZE_LIMIT).map_err(store_err)?;
 
         conn.execute_batch(schema::SCHEMA).map_err(store_err)?;
+        // Additive column on a table that predates it: `CREATE TABLE IF NOT EXISTS`
+        // leaves an existing table alone, and a schema-version bump would throw the
+        // whole regenerable index away for one nullable column.
+        let has_fingerprint = conn
+            .prepare("SELECT 1 FROM pragma_table_info('parse_errors') WHERE name = 'fingerprint'")
+            .and_then(|mut st| st.exists([]))
+            .map_err(store_err)?;
+        if !has_fingerprint {
+            conn.execute_batch("ALTER TABLE parse_errors ADD COLUMN fingerprint TEXT")
+                .map_err(store_err)?;
+        }
         // Stamp the schema generation so a future incompatible version is detected.
         conn.pragma_update(None, "user_version", SCHEMA_VERSION).map_err(store_err)?;
         Ok(Self {

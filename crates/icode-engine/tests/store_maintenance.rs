@@ -72,3 +72,59 @@ fn a_pass_that_purges_most_of_the_tree_shrinks_the_file() {
     assert!(after * 2 < before, "VACUUM must give the space back: {before} -> {after} bytes");
     assert_eq!(wal_len(&root), 0, "and the VACUUM's WAL must be truncated");
 }
+
+fn parse_error_rows(root: &std::path::Path) -> i64 {
+    let conn = rusqlite::Connection::open(root.join(".icode/index.db")).unwrap();
+    conn.query_row("SELECT COUNT(*) FROM parse_errors", [], |r| r.get(0)).unwrap()
+}
+
+#[test]
+fn a_failing_file_is_recorded_once_per_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let bad = root.join("bad.rs");
+    fs::write(&bad, b"fn f() {}\n\xff\xfe not utf-8\n").unwrap();
+    let store = SqliteCodeStore::open(&root).unwrap();
+    let key = bad.to_string_lossy().to_string();
+
+    // The daemon path: same bytes failing on every event.
+    let fp = icode_engine::error_fingerprint(&bad);
+    assert!(fp.starts_with("sha256:"), "raw bytes are hashable even when not UTF-8: {fp}");
+    assert!(store.record_parse_error_once(&key, &fp, "invalid utf-8").unwrap());
+    for _ in 0..5 {
+        assert!(!store.record_parse_error_once(&key, &fp, "invalid utf-8").unwrap(), "a repeat is not news");
+    }
+    assert_eq!(parse_error_rows(&root), 1);
+
+    // Full passes over the unchanged file do not pile up rows either.
+    index_path(&root, &store).unwrap();
+    index_path(&root, &store).unwrap();
+    assert_eq!(parse_error_rows(&root), 1);
+
+    // New bytes, still broken: recorded again, replacing the old row.
+    fs::write(&bad, b"fn g() {}\n\xff still not utf-8\n").unwrap();
+    let fp2 = icode_engine::error_fingerprint(&bad);
+    assert_ne!(fp, fp2);
+    assert!(store.record_parse_error_once(&key, &fp2, "invalid utf-8").unwrap());
+    assert_eq!(parse_error_rows(&root), 1);
+}
+
+#[test]
+fn an_index_from_before_the_fingerprint_column_gains_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    drop(SqliteCodeStore::open(&root).unwrap());
+    {
+        // Rebuild the table in its old shape, with an old-style row in it.
+        let conn = rusqlite::Connection::open(root.join(".icode/index.db")).unwrap();
+        conn.execute_batch(
+            "DROP TABLE parse_errors; \
+             CREATE TABLE parse_errors (id INTEGER PRIMARY KEY, path TEXT NOT NULL, error TEXT NOT NULL); \
+             INSERT INTO parse_errors (path, error) VALUES ('/x.rs', 'old');",
+        )
+        .unwrap();
+    }
+    let store = SqliteCodeStore::open(&root).unwrap();
+    assert!(store.record_parse_error_once("/x.rs", "sha256:abc", "new").unwrap());
+    assert_eq!(parse_error_rows(&root), 1, "the old duplicate rows for the path are replaced");
+}

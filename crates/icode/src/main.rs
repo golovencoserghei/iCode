@@ -1501,6 +1501,24 @@ fn run_daemon_start(path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Size past which `daemon.log` is rotated when a new daemon is spawned.
+const DAEMON_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+/// If `path` is larger than `max` bytes, move it to `<path>.1` (replacing an older
+/// `.1`) so the next writer starts a fresh file. The daemon log used to be opened
+/// append-only forever and was observed at 202 MB. Rotating at spawn is enough: a
+/// running daemon holds its own fd, and only one daemon per project runs at a time.
+/// Best-effort — a failed rename just keeps appending.
+fn rotate_log_if_larger(path: &std::path::Path, max: u64) {
+    let Ok(meta) = std::fs::metadata(path) else { return };
+    if meta.len() <= max {
+        return;
+    }
+    let mut rotated = path.as_os_str().to_owned();
+    rotated.push(".1");
+    let _ = std::fs::rename(path, std::path::PathBuf::from(rotated));
+}
+
 /// Spawn `icode daemon run <root>` in its own session, logging to `.icode/daemon.log`.
 /// Best-effort and non-blocking: the caller does not wait on the child.
 fn spawn_daemon(root: &std::path::Path) -> anyhow::Result<()> {
@@ -1508,10 +1526,12 @@ fn spawn_daemon(root: &std::path::Path) -> anyhow::Result<()> {
 
     let dir = root.join(".icode");
     std::fs::create_dir_all(&dir)?;
+    let log_path = dir.join("daemon.log");
+    rotate_log_if_larger(&log_path, DAEMON_LOG_MAX_BYTES);
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(dir.join("daemon.log"))?;
+        .open(&log_path)?;
     let log_err = log.try_clone()?;
 
     let mut cmd = std::process::Command::new(icode_exe_path());
@@ -2565,5 +2585,26 @@ mod derivation_tests {
         assert!(!cmdline_is_icode(b"/usr/lib/firefox/firefox\0"));
         // Unreadable/empty cmdline is "cannot tell" → treated as ours.
         assert!(cmdline_is_icode(b""));
+    }
+
+    #[test]
+    fn a_large_daemon_log_is_rotated_and_a_small_one_is_kept() {
+        use super::rotate_log_if_larger;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("daemon.log");
+        let old = dir.path().join("daemon.log.1");
+
+        std::fs::write(&log, b"small").unwrap();
+        rotate_log_if_larger(&log, 10);
+        assert_eq!(std::fs::read(&log).unwrap(), b"small", "under the limit: untouched");
+        assert!(!old.exists());
+
+        std::fs::write(&old, b"older rotation").unwrap();
+        std::fs::write(&log, b"0123456789AB").unwrap();
+        rotate_log_if_larger(&log, 10);
+        assert!(!log.exists(), "over the limit: moved away so the next writer starts fresh");
+        assert_eq!(std::fs::read(&old).unwrap(), b"0123456789AB", "replaces the older .1");
+
+        rotate_log_if_larger(&dir.path().join("absent.log"), 10); // no file: no-op
     }
 }

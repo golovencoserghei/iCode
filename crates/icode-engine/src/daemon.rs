@@ -42,7 +42,7 @@ use notify::{EventKind, RecursiveMode};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 
 use crate::index::{
-    index_one_file, index_path, is_in_excluded_dir, is_in_linked_worktree, is_supported_source,
+    error_fingerprint, index_one_file, index_path, is_in_excluded_dir, is_in_linked_worktree, is_supported_source,
 };
 use crate::store::SqliteCodeStore;
 
@@ -249,9 +249,16 @@ fn process_batch(root: &Path, store: &SqliteCodeStore, mut paths: Vec<PathBuf>) 
                 Ok(s) if s.files_indexed == 0 => {}
                 Ok(_) => reindexed += 1,
                 Err(e) => {
-                    // A parse/read failure of one file must not kill the daemon.
-                    let _ = store.record_parse_error(&path.to_string_lossy(), &e.to_string());
-                    log(&format!("daemon: parse error {} ({e})", path.display()));
+                    // A parse/read failure of one file must not kill the daemon. Each
+                    // version of a failing file is recorded and logged ONCE: the same
+                    // bytes failing again on the next event is not news.
+                    let fp = error_fingerprint(&path);
+                    let fresh = store
+                        .record_parse_error_once(&path.to_string_lossy(), &fp, &e.to_string())
+                        .unwrap_or(true);
+                    if fresh {
+                        log(&format!("daemon: parse error {} ({e})", path.display()));
+                    }
                 }
             }
         } else {

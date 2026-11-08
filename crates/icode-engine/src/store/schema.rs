@@ -184,9 +184,13 @@ CREATE INDEX IF NOT EXISTS idx_routes_method ON routes(method);
 -- ──────────────────────────── parse errors ────────────────────────────
 
 CREATE TABLE IF NOT EXISTS parse_errors (
-    id    INTEGER PRIMARY KEY,
-    path  TEXT NOT NULL,
-    error TEXT NOT NULL
+    id          INTEGER PRIMARY KEY,
+    path        TEXT NOT NULL,
+    error       TEXT NOT NULL,
+    -- What the file looked like when it failed (see `record_parse_error_once`);
+    -- NULL on rows written before the column existed. Added to older dbs by
+    -- `SqliteCodeStore::from_conn`.
+    fingerprint TEXT
 );
 
 -- ──────────────────────────── FTS5: functions ────────────────────────────

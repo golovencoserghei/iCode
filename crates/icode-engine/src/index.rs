@@ -236,7 +236,9 @@ pub fn index_path(root: &Path, store: &SqliteCodeStore) -> Result<IndexStats> {
                     }
                     Err(e) => {
                         stats.errors += 1;
-                        let _ = store.record_parse_error(&pf.file.path, &e.to_string());
+                        // The parsed content hash IS the fingerprint of these bytes.
+                        let fp = format!("sha256:{}", pf.file.content_hash);
+                        let _ = store.record_parse_error_once(&pf.file.path, &fp, &e.to_string());
                     }
                 },
                 Outcome::Oversize { path } => {
@@ -254,7 +256,8 @@ pub fn index_path(root: &Path, store: &SqliteCodeStore) -> Result<IndexStats> {
                 }
                 Outcome::Failed { path, error } => {
                     stats.errors += 1;
-                    let _ = store.record_parse_error(&path, &error);
+                    let fp = error_fingerprint(Path::new(&path));
+                    let _ = store.record_parse_error_once(&path, &fp, &error);
                 }
             }
         }
@@ -732,8 +735,27 @@ fn parse_for(language: Language, source: &str, path: &str, os_path: &Path) -> Pa
 }
 
 fn content_hash(source: &str) -> String {
+    bytes_hash(source.as_bytes())
+}
+
+/// Identify the version of a file that failed to index, for
+/// [`SqliteCodeStore::record_parse_error_once`]: `sha256:<hex>` of its raw bytes
+/// (the same digest `content_hash` gives valid UTF-8, and still defined for bytes
+/// that are not), else `meta:<mtime>:<size>` when the bytes cannot be read, else
+/// `missing`. Same bytes ⇒ same fingerprint ⇒ the error is not recorded again.
+pub fn error_fingerprint(path: &Path) -> String {
+    if let Ok(bytes) = std::fs::read(path) {
+        return format!("sha256:{}", bytes_hash(&bytes));
+    }
+    match std::fs::metadata(path) {
+        Ok(meta) => format!("meta:{}:{}", mtime_secs(&meta), meta.len()),
+        Err(_) => "missing".to_string(),
+    }
+}
+
+fn bytes_hash(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
-    h.update(source.as_bytes());
+    h.update(bytes);
     let digest = h.finalize();
     let mut out = String::with_capacity(64);
     for b in digest {
