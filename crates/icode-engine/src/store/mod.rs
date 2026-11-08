@@ -37,6 +37,9 @@ pub use vector::Vec0Index;
 /// rebuild handles the added columns; no in-place migration.
 const SCHEMA_VERSION: i64 = 9;
 
+/// Bytes a checkpoint may leave in the `-wal` file (`PRAGMA journal_size_limit`).
+const JOURNAL_SIZE_LIMIT: i64 = 64 * 1024 * 1024;
+
 /// A graph node's identity: `module\u{1}qualified_name`. Keying by name ALONE collapses
 /// every homonym in the tree into one node, which in a monorepo silently rewrites the
 /// graph (see `compute_symbol_ranks`). The separator is a control char so it cannot
@@ -1417,6 +1420,27 @@ impl SqliteCodeStore {
         collect(rows)
     }
 
+    /// Best-effort `PRAGMA wal_checkpoint(TRUNCATE)`: copy the WAL back into the
+    /// db and truncate the `-wal` file to zero bytes. Called after a write burst
+    /// (a daemon batch that changed rows, the end of a full pass) so the WAL does
+    /// not sit at its high-water mark between bursts.
+    ///
+    /// Never an error: a reader in another process (a `serve` mid-query) makes the
+    /// checkpoint report busy, and that just means the next burst tries again. The
+    /// busy timeout is shortened for the call so a checkpoint never holds this
+    /// store's connection for the full 5 s write timeout. Returns whether the WAL
+    /// was fully checkpointed.
+    pub fn checkpoint_truncate(&self) -> bool {
+        let Ok(conn) = self.conn.lock() else { return false };
+        let _ = conn.busy_timeout(std::time::Duration::from_millis(250));
+        let done = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get::<_, i64>(0))
+            .map(|busy| busy == 0)
+            .unwrap_or(false);
+        let _ = conn.busy_timeout(std::time::Duration::from_millis(5_000));
+        done
+    }
+
     /// Read `PRAGMA user_version` from an existing db file via a throwaway
     /// connection (dropped before the caller may delete the file).
     fn db_is_current(db_path: &Path) -> Result<bool> {
@@ -1457,6 +1481,12 @@ impl SqliteCodeStore {
         // unbounded under the bulk-write indexer, while keeping commit-time fsync
         // off (synchronous=NORMAL only fsyncs at these checkpoints).
         conn.pragma_update(None, "wal_autocheckpoint", 1000).map_err(store_err)?;
+        // ...but an auto-checkpoint only REWINDS the WAL, it never shrinks the file:
+        // after one large pass the `-wal` stays at its high-water mark for as long as
+        // any connection is open (observed: 387 MB next to a long-lived daemon). Cap
+        // what a checkpoint leaves on disk; [`Self::checkpoint_truncate`] does the
+        // rest after a write burst.
+        conn.pragma_update(None, "journal_size_limit", JOURNAL_SIZE_LIMIT).map_err(store_err)?;
 
         conn.execute_batch(schema::SCHEMA).map_err(store_err)?;
         // Stamp the schema generation so a future incompatible version is detected.

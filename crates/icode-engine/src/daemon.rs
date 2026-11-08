@@ -190,6 +190,11 @@ fn process_batch(root: &Path, store: &SqliteCodeStore, mut paths: Vec<PathBuf>) 
         log(&format!("daemon: rank refresh failed ({e}) — ranking may be stale"));
     }
 
+    // The batch's writes are in the WAL; fold them back and shrink the file so a
+    // long-lived daemon does not keep the WAL at its high-water mark. Best-effort:
+    // a busy reader just defers it to the next batch.
+    store.checkpoint_truncate();
+
     // Graph only. The re-index nulled out the replaced chunks' vectors; they now
     // sit in the pending queue and are embedded on demand (cache-accelerated, so a
     // revert/branch-switch costs nothing) — never in this hot path.

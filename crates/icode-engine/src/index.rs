@@ -296,6 +296,9 @@ pub fn index_path(root: &Path, store: &SqliteCodeStore) -> Result<IndexStats> {
         // Graph centrality (free, CPU-only) — a search-ranking prior. Must run AFTER
         // the edges are resolved, since it reads the finished call graph.
         store.compute_symbol_ranks()?;
+        // A pass that wrote anything grew the WAL; hand that space back now rather
+        // than leaving it at its high-water mark for the life of the connection.
+        store.checkpoint_truncate();
     }
 
     Ok(stats)
