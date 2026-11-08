@@ -14,6 +14,7 @@ pub mod index;
 pub mod memory;
 pub mod minhash;
 pub mod pagerank;
+pub mod pretool;
 pub mod module;
 pub mod parse;
 pub mod recall;
@@ -40,6 +41,10 @@ pub use memory::{
     redact_secrets, remove_auto_summary, Redaction, sanitize_fts5, sanitize_nl, session_end, session_start,
     upsert_auto_summary, project_marker, validate_bucket_name, validate_project_name, PROJECT_MARKER, SessionEnd, SessionStart, RenameReport, SqliteMemoryStore, StopHookInput,
     TranscriptDigest, WalStore, DEFAULT_PROFILE_NOTES, DEFAULT_PROJECT_MEMORIES,
+};
+pub use pretool::{
+    hint_cap, parse_grep_command, parse_pre_tool_input, render_hint, search_calls_in_command, shell_segments, symbol_brief,
+    symbol_from_pattern, symbols_from_pattern, HintLedger, PreToolInput, SearchCall, Segment, SymbolBrief,
 };
 pub use recall::{code_to_memory, recall, why_this_exists};
 pub use search::{find_similar, hybrid_search, rrf_fuse, semantic_search, RRF_K};

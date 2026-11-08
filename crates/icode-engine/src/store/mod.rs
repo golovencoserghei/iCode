@@ -776,6 +776,48 @@ impl SqliteCodeStore {
         Ok(out)
     }
 
+    /// Every DEFINITION of `symbol` (bare name or qualified name) across functions
+    /// and classes, ordered by path/line: the first `limit` of them plus the total.
+    ///
+    /// `get_function`/`get_class` return ONE row; a name defined in several places
+    /// (a trait method, a homonym in two crates) needs all of them to be answered
+    /// honestly, and the mention scan in [`Self::find_references`] is far too slow
+    /// for a hook that runs before every grep.
+    pub fn find_definitions(&self, symbol: &str, limit: usize) -> Result<(Vec<CodeHit>, usize)> {
+        if limit == 0 || symbol.trim().is_empty() {
+            return Ok((vec![], 0));
+        }
+        let conn = self.conn.lock().map_err(store_err)?;
+        let mut out: Vec<CodeHit> = Vec::new();
+        for (table, kind) in [("functions", SymbolKind::Function), ("classes", SymbolKind::Class)] {
+            let sql = format!(
+                "SELECT name, qualified_name, path, line_start, line_end FROM {table} \
+                 WHERE name = ?1 OR qualified_name = ?1"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(store_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![symbol], |r| {
+                    Ok(CodeHit {
+                        kind,
+                        name: r.get(0)?,
+                        qualified_name: r.get(1)?,
+                        path: r.get(2)?,
+                        line_start: r.get::<_, i64>(3)? as u32,
+                        line_end: r.get::<_, i64>(4)? as u32,
+                        score: 1.0,
+                        snippet: None,
+                        stale: false,
+                    })
+                })
+                .map_err(store_err)?;
+            out.extend(collect(rows)?);
+        }
+        out.sort_by(|a, b| a.path.cmp(&b.path).then(a.line_start.cmp(&b.line_start)));
+        let total = out.len();
+        out.truncate(limit);
+        Ok((out, total))
+    }
+
     /// Every place `symbol` is referenced, CLASSIFIED — the precise answer to "where
     /// is this used", which grep cannot give.
     ///
