@@ -151,7 +151,10 @@ const EXCLUDED_DIRS: &[&str] = &[
 pub fn walk_source_files(root: &Path) -> Vec<std::path::PathBuf> {
     WalkDir::new(root)
         .into_iter()
-        .filter_entry(|e| !is_excluded_dir(e.path()))
+        .filter_entry(|e| {
+            !is_excluded_dir(e.path())
+                && !(e.depth() > 0 && e.file_type().is_dir() && is_linked_worktree_below(root, e.path()))
+        })
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .map(|e| e.into_path())
@@ -233,7 +236,9 @@ pub fn index_path(root: &Path, store: &SqliteCodeStore) -> Result<IndexStats> {
                     }
                     Err(e) => {
                         stats.errors += 1;
-                        let _ = store.record_parse_error(&pf.file.path, &e.to_string());
+                        // The parsed content hash IS the fingerprint of these bytes.
+                        let fp = format!("sha256:{}", pf.file.content_hash);
+                        let _ = store.record_parse_error_once(&pf.file.path, &fp, &e.to_string());
                     }
                 },
                 Outcome::Oversize { path } => {
@@ -251,7 +256,8 @@ pub fn index_path(root: &Path, store: &SqliteCodeStore) -> Result<IndexStats> {
                 }
                 Outcome::Failed { path, error } => {
                     stats.errors += 1;
-                    let _ = store.record_parse_error(&path, &error);
+                    let fp = error_fingerprint(Path::new(&path));
+                    let _ = store.record_parse_error_once(&path, &fp, &error);
                 }
             }
         }
@@ -270,6 +276,9 @@ pub fn index_path(root: &Path, store: &SqliteCodeStore) -> Result<IndexStats> {
         any_change = true;
         stats.files_deleted += 1;
     }
+
+    // Errors recorded for files that are no longer on disk at all.
+    let _ = store.prune_parse_errors_except(&on_disk);
 
     // Ghost sweep: chunks whose file left the index without taking them along.
     // `delete_file` handles that from now on, so this only ever fires on a database
@@ -293,9 +302,125 @@ pub fn index_path(root: &Path, store: &SqliteCodeStore) -> Result<IndexStats> {
         // Graph centrality (free, CPU-only) — a search-ranking prior. Must run AFTER
         // the edges are resolved, since it reads the finished call graph.
         store.compute_symbol_ranks()?;
+        // Deleting rows frees pages but never shrinks the file: an index that once
+        // held every linked worktree's copy kept its 593 MB after the walk stopped
+        // seeing them (88% of rows gone). Reclaim the space when a pass dropped a
+        // large share of the tree — never on an ordinary pass, VACUUM rewrites the
+        // whole file.
+        if should_vacuum(prior.len(), stats.files_deleted) {
+            match store.vacuum() {
+                Ok(()) => eprintln!(
+                    "index: {} of {} files left the index — compacted the database (VACUUM)",
+                    stats.files_deleted,
+                    prior.len()
+                ),
+                Err(e) => eprintln!("index: VACUUM skipped ({e}); will retry on a later large purge"),
+            }
+        }
+        // A pass that wrote anything grew the WAL (a VACUUM most of all); hand that
+        // space back now rather than leaving it at its high-water mark for the life
+        // of the connection.
+        store.checkpoint_truncate();
     }
 
     Ok(stats)
+}
+
+/// Bring the part of the index under `under` (the whole tree when `under == root`)
+/// back in line with disk using only `stat` — the cheap check for when something
+/// else (the watcher daemon) is supposed to have kept the graph current.
+///
+/// Unlike [`index_path`] it reads no file whose indexed `mtime` and size still match
+/// disk, so an unchanged tree costs one walk plus one stat per file. What it does:
+///   * a path on disk that is not indexed, or whose mtime/size drifted, goes through
+///     [`index_one_file`] (which still hash-skips if only the metadata changed);
+///   * an indexed path under `under` that is no longer on disk is deleted;
+///   * edges and ranks are re-resolved and the WAL truncated only if a row changed.
+///
+/// The trade-off is the mtime granularity: an edit that keeps the size and lands
+/// in the same second as the indexed mtime is invisible to it. That is the gap the
+/// daemon's own events cover; this pass exists for the events the daemon LOST.
+pub fn reconcile_by_stat(root: &Path, store: &SqliteCodeStore, under: &Path) -> Result<IndexStats> {
+    let mut stats = IndexStats::default();
+    let whole_tree = under == root;
+    let prior: HashMap<String, (i64, u64)> = if whole_tree {
+        store
+            .list_files(None, None, usize::MAX)?
+            .into_iter()
+            .map(|f| (f.path, (f.mtime, f.file_size)))
+            .collect()
+    } else {
+        store
+            .files_under(&under.to_string_lossy())?
+            .into_iter()
+            .map(|(p, m, z)| (p, (m, z)))
+            .collect()
+    };
+
+    let on_disk: Vec<std::path::PathBuf> = if under.is_dir() {
+        walk_source_files(under)
+            .into_iter()
+            .filter(|p| whole_tree || !is_in_linked_worktree(root, p))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut any_change = false;
+    let mut seen: HashSet<String> = HashSet::with_capacity(on_disk.len());
+    for path in &on_disk {
+        let key = path.to_string_lossy().to_string();
+        let current = std::fs::metadata(path).ok().map(|m| (mtime_secs(&m), m.len()));
+        let drifted = match (prior.get(&key), current) {
+            (Some(indexed), Some(now)) => *indexed != now,
+            (None, Some(_)) => true,
+            (_, None) => false, // vanished mid-walk: the deletion sweep below has it
+        };
+        if current.is_some() {
+            seen.insert(key.clone());
+        }
+        if !drifted {
+            stats.files_skipped += 1;
+            continue;
+        }
+        match index_one_file(path, store, root) {
+            Ok(s) if s.files_indexed == 0 => stats.files_skipped += 1,
+            Ok(s) => {
+                any_change = true;
+                stats.files_indexed += 1;
+                stats.functions += s.functions;
+                stats.classes += s.classes;
+            }
+            Err(e) => {
+                stats.errors += 1;
+                let _ = store.record_parse_error_once(&key, &error_fingerprint(path), &e.to_string());
+            }
+        }
+    }
+    for path in prior.keys() {
+        if !seen.contains(path) {
+            store.delete_file(path)?;
+            any_change = true;
+            stats.files_deleted += 1;
+        }
+    }
+    if any_change {
+        store.resolve_call_edges(None)?;
+        store.compute_symbol_ranks()?;
+        store.checkpoint_truncate();
+    }
+    Ok(stats)
+}
+
+/// Whether a full pass that removed `deleted` of the `prior_files` it started with
+/// purged enough to be worth a `VACUUM`: at least 500 files, or at least 20% of the
+/// index. Below that the freed pages are simply reused by later writes.
+pub fn should_vacuum(prior_files: usize, deleted: u64) -> bool {
+    const MIN_FILES: u64 = 500;
+    if deleted == 0 {
+        return false;
+    }
+    deleted >= MIN_FILES || deleted.saturating_mul(5) >= prior_files as u64
 }
 
 /// The prior-index facts the incremental pass compares a file against.
@@ -513,6 +638,63 @@ pub fn is_in_excluded_dir(path: &Path) -> bool {
     })
 }
 
+/// Whether `dir`, a directory BELOW the walk root `root`, is a linked git worktree
+/// that must not be indexed as part of `root`: its `.git` is a FILE pointing at
+/// `…/worktrees/<name>`, or its path relative to `root` runs through
+/// `.claude/worktrees` (agent worktrees, which may not even have their `.git`
+/// yet). A worktree is a second checkout of the same repo — indexing it under the
+/// main tree doubles every symbol and pins the daemon on someone else's branch.
+///
+/// The root itself is NEVER excluded (`dir == root` → false), even when it is a
+/// worktree: indexing a worktree on purpose is legitimate. Submodules (`gitdir:
+/// …/modules/<name>`, also inside a worktree: `…/worktrees/<wt>/modules/<name>`)
+/// and nested ordinary repos (`.git` directory) are not worktrees and stay in.
+///
+/// The ONE exclusion rule shared by the indexer walk and the daemon's event filter
+/// ([`is_in_linked_worktree`]).
+pub fn is_linked_worktree_below(root: &Path, dir: &Path) -> bool {
+    let Ok(rel) = dir.strip_prefix(root) else {
+        return false;
+    };
+    if rel.as_os_str().is_empty() {
+        return false;
+    }
+    let names: Vec<_> = rel.components().map(|c| c.as_os_str()).collect();
+    names.windows(2).any(|w| w[0] == ".claude" && w[1] == "worktrees") || is_linked_worktree_dir(dir)
+}
+
+/// `dir/.git` is a file whose `gitdir:` points straight at `…/worktrees/<name>`.
+fn is_linked_worktree_dir(dir: &Path) -> bool {
+    let dot_git = dir.join(".git");
+    match std::fs::symlink_metadata(&dot_git) {
+        Ok(m) if m.is_file() && m.len() < 4096 => {}
+        _ => return false,
+    }
+    let Ok(text) = std::fs::read_to_string(&dot_git) else {
+        return false;
+    };
+    let Some(gitdir) = text.lines().find_map(|l| l.trim().strip_prefix("gitdir:")) else {
+        return false;
+    };
+    let gitdir = Path::new(gitdir.trim());
+    gitdir.file_name().is_some()
+        && gitdir
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|n| n == "worktrees")
+}
+
+/// Whether the changed `path` lies inside a linked worktree below `root` — the
+/// daemon's form of [`is_linked_worktree_below`], checked on every ancestor
+/// directory between the path and the root (the root itself excluded). Works for
+/// a path that no longer exists (a deletion event): a vanished directory simply
+/// has no `.git` to read, and the `.claude/worktrees` rule is purely lexical.
+pub fn is_in_linked_worktree(root: &Path, path: &Path) -> bool {
+    path.ancestors()
+        .take_while(|a| *a != root && a.starts_with(root))
+        .any(|dir| is_linked_worktree_below(root, dir))
+}
+
 /// Per-file node counts (rolled up into `IndexStats`).
 #[derive(Clone, Copy, Default)]
 struct FileCounts {
@@ -642,8 +824,27 @@ fn parse_for(language: Language, source: &str, path: &str, os_path: &Path) -> Pa
 }
 
 fn content_hash(source: &str) -> String {
+    bytes_hash(source.as_bytes())
+}
+
+/// Identify the version of a file that failed to index, for
+/// [`SqliteCodeStore::record_parse_error_once`]: `sha256:<hex>` of its raw bytes
+/// (the same digest `content_hash` gives valid UTF-8, and still defined for bytes
+/// that are not), else `meta:<mtime>:<size>` when the bytes cannot be read, else
+/// `missing`. Same bytes ⇒ same fingerprint ⇒ the error is not recorded again.
+pub fn error_fingerprint(path: &Path) -> String {
+    if let Ok(bytes) = std::fs::read(path) {
+        return format!("sha256:{}", bytes_hash(&bytes));
+    }
+    match std::fs::metadata(path) {
+        Ok(meta) => format!("meta:{}:{}", mtime_secs(&meta), meta.len()),
+        Err(_) => "missing".to_string(),
+    }
+}
+
+fn bytes_hash(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
-    h.update(source.as_bytes());
+    h.update(bytes);
     let digest = h.finalize();
     let mut out = String::with_capacity(64);
     for b in digest {
@@ -663,8 +864,69 @@ fn is_excluded_dir(path: &Path) -> bool {
 
 #[cfg(test)]
 mod exclude_tests {
-    use super::{is_excluded_dir, is_in_excluded_dir};
+    use super::{is_excluded_dir, is_in_excluded_dir, is_in_linked_worktree, walk_source_files};
     use std::path::Path;
+
+    /// `dir/.git` as a FILE pointing at `gitdir`.
+    fn git_file(dir: &Path, gitdir: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(".git"), format!("gitdir: {gitdir}\n")).unwrap();
+    }
+
+    fn src(dir: &Path, name: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(name), "pub fn f() {}\n").unwrap();
+    }
+
+    fn walked(root: &Path) -> Vec<String> {
+        let mut v: Vec<String> = walk_source_files(root)
+            .iter()
+            .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn linked_worktrees_below_the_root_are_skipped_submodules_and_nested_repos_kept() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path();
+        std::fs::create_dir_all(root.join(".git/worktrees/wt")).unwrap();
+        src(root, "main.rs");
+        // A linked worktree checked out inside the tree.
+        git_file(&root.join("wt"), &root.join(".git/worktrees/wt").to_string_lossy());
+        src(&root.join("wt"), "dup.rs");
+        // An agent worktree under .claude/worktrees (no .git yet).
+        src(&root.join(".claude/worktrees/agent-1/src"), "agent.rs");
+        // A submodule (relative gitdir into .git/modules) and a nested plain repo.
+        git_file(&root.join("vendored"), "../.git/modules/vendored");
+        src(&root.join("vendored"), "sub.rs");
+        std::fs::create_dir_all(root.join("nested/.git")).unwrap();
+        src(&root.join("nested"), "inner.rs");
+        // A submodule of a worktree points into …/worktrees/<wt>/modules/<name>.
+        git_file(&root.join("lib2"), "/repo/.git/worktrees/wt/modules/lib2");
+        src(&root.join("lib2"), "lib2.rs");
+
+        assert_eq!(walked(root), vec!["lib2/lib2.rs", "main.rs", "nested/inner.rs", "vendored/sub.rs"]);
+
+        // The daemon's per-event form agrees, including for a deleted path.
+        assert!(is_in_linked_worktree(root, &root.join("wt/dup.rs")));
+        assert!(is_in_linked_worktree(root, &root.join(".claude/worktrees/agent-1/src/gone.rs")));
+        assert!(!is_in_linked_worktree(root, &root.join("vendored/sub.rs")));
+        assert!(!is_in_linked_worktree(root, &root.join("nested/inner.rs")));
+        assert!(!is_in_linked_worktree(root, &root.join("main.rs")));
+    }
+
+    #[test]
+    fn a_worktree_used_as_the_root_is_indexed() {
+        let td = tempfile::tempdir().unwrap();
+        // The walk root itself is a linked worktree under .claude/worktrees.
+        let root = td.path().join("repo/.claude/worktrees/agent-7");
+        git_file(&root, "/repo/.git/worktrees/agent-7");
+        src(&root.join("src"), "lib.rs");
+        assert_eq!(walked(&root), vec!["src/lib.rs"]);
+        assert!(!is_in_linked_worktree(&root, &root.join("src/lib.rs")));
+    }
 
     #[test]
     fn user_tool_caches_are_excluded() {

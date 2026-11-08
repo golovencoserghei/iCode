@@ -106,12 +106,8 @@ pub fn digest_transcript(jsonl: &str) -> TranscriptDigest {
                                     }
                                 }
                             }
-                            Some("tool_use") => {
-                                if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
-                                    if name.ends_with("session_end") {
-                                        digest.session_end_called = true;
-                                    }
-                                }
+                            Some("tool_use") if is_session_end_call(item) => {
+                                digest.session_end_called = true;
                             }
                             _ => {}
                         }
@@ -122,6 +118,24 @@ pub fn digest_transcript(jsonl: &str) -> TranscriptDigest {
         }
     }
     digest
+}
+
+/// Whether a `tool_use` block closes the session: the legacy `…session_end` tool,
+/// or the grouped `session` tool of an iCode MCP server (`mcp__icode__session`,
+/// any server name containing `icode`) called with `op: "end"`.
+fn is_session_end_call(item: &serde_json::Value) -> bool {
+    let Some(name) = item.get("name").and_then(|n| n.as_str()) else {
+        return false;
+    };
+    if name.ends_with("session_end") {
+        return true;
+    }
+    let mut parts = name.split("__");
+    let grouped = matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some("mcp"), Some(server), Some("session"), None) if server.contains("icode")
+    );
+    grouped && item.get("input").and_then(|i| i.get("op")).and_then(|o| o.as_str()) == Some("end")
 }
 
 /// A user-message `content` is either a plain string or an array of blocks;
@@ -288,6 +302,21 @@ mod tests {
         // garbage lines are skipped, not fatal
         let d2 = digest_transcript("{{{\nnot json\n");
         assert_eq!(d2, TranscriptDigest::default());
+    }
+
+    #[test]
+    fn grouped_session_tool_with_op_end_closes_the_session() {
+        let call = |name: &str, input: serde_json::Value| {
+            serde_json::json!({"type":"assistant","message":{"content":[{"type":"tool_use","name":name,"input":input}]}})
+                .to_string()
+        };
+        let ends = |line: String| digest_transcript(&line).session_end_called;
+        assert!(ends(call("mcp__icode__session", serde_json::json!({"op":"end","project":"p"}))));
+        assert!(ends(call("mcp__icode-dev__session", serde_json::json!({"op":"end"}))));
+        assert!(!ends(call("mcp__icode__session", serde_json::json!({"op":"start"}))));
+        assert!(!ends(call("mcp__icode__session", serde_json::json!({}))));
+        assert!(!ends(call("mcp__other__session", serde_json::json!({"op":"end"}))));
+        assert!(!ends(call("mcp__icode__memory", serde_json::json!({"op":"end"}))));
     }
 
     #[test]

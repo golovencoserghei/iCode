@@ -12,6 +12,8 @@
 //!   `icode setup [path]`   — friendly onboarding: probe Ollama, print MCP config.
 //!   `icode mcp-config [p]` — print only the Claude Code MCP registration JSON.
 //!   `icode vault …`        — passphrase-encrypted secrets you must be able to recover.
+//!   `icode host`           — one-shot JSON API for an IDE host (request on stdin,
+//!                            one JSON reply on stdout, always exit 0; see `host`).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,6 +23,7 @@ use icode_core::config::EmbedConfig;
 use icode_core::traits::CodeReadStore;
 use icode_engine::SqliteCodeStore;
 
+mod host;
 mod vault_cli;
 
 #[derive(Parser)]
@@ -164,6 +167,10 @@ enum Command {
         #[command(subcommand)]
         action: HookAction,
     },
+    /// One-shot JSON API for an IDE host: reads ONE request `{"api":1,"op":…,
+    /// "args":{…}}` from stdin and prints ONE reply on stdout. Always exits 0 with
+    /// an empty stderr — failures are `{"ok":false,"error":{…}}` replies.
+    Host,
 }
 
 #[derive(Subcommand)]
@@ -326,6 +333,12 @@ fn existing_root(path: PathBuf) -> anyhow::Result<PathBuf> {
 }
 
 fn main() -> anyhow::Result<()> {
+    // `icode host` bypasses clap entirely: a stray argument must still produce a
+    // JSON reply and exit 0, never a clap usage error on stderr with exit 2.
+    if std::env::args_os().nth(1).is_some_and(|a| a == "host") {
+        host::run();
+        return Ok(());
+    }
     let cli = Cli::parse();
     match cli.command {
         Command::Index { path } => run_index(&existing_root(path)?),
@@ -360,6 +373,10 @@ fn main() -> anyhow::Result<()> {
         Command::Vault { file, action } => vault_cli::run(file, action),
         Command::Setup { project_path } => run_setup(project_path.as_deref()),
         Command::McpConfig { project_path } => run_mcp_config(project_path.as_deref()),
+        Command::Host => {
+            host::run();
+            Ok(())
+        }
         Command::Hook { action } => match action {
             HookAction::SessionStart { project, cwd } => {
                 run_hook_session_start(project.as_deref(), cwd.as_deref());
@@ -1119,7 +1136,17 @@ fn run_serve(path: Option<PathBuf>) -> anyhow::Result<()> {
     let memory = build_serve_memory(embedder.clone());
 
     // Serving is async (rmcp/tokio); the rest of the CLI stays sync.
-    let runtime = tokio::runtime::Runtime::new()?;
+    //
+    // Two workers, not one per core: the async side is a single stdio transport
+    // plus a heartbeat timer, and every heavy job (the startup pass, embedding
+    // drains, tool queries) runs on the separate blocking pool, which grows on
+    // demand and shrinks again when idle. The default runtime started a worker per
+    // core — ~35 threads on a 16-core machine, multiplied by every concurrent
+    // server — to multiplex one pipe.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
     let served = runtime.block_on(async move {
         let store = Arc::new(open_store_with_shared_cache(&root)?);
 
@@ -1191,51 +1218,130 @@ fn run_serve(path: Option<PathBuf>) -> anyhow::Result<()> {
                 let want_daemon = std::env::var("ICODE_NO_DAEMON")
                     .map(|v| !matches!(v.trim(), "1" | "true" | "yes" | "on"))
                     .unwrap_or(true);
-                let store_bg = store.clone();
-                let root_bg = root.clone();
-                tokio::task::spawn_blocking(move || {
-                    // Best-effort: hash-skips unchanged files, writes only to stderr
-                    // (stdout is the MCP transport), and any failure degrades to
-                    // serving the existing graph rather than aborting serve.
-                    let state = match icode_engine::index_path(&root_bg, store_bg.as_ref()) {
-                        Ok(s) => {
-                            eprintln!(
-                                "icode serve: graph synced ({} indexed, {} skipped, {} errors)",
-                                s.files_indexed, s.files_skipped, s.errors
-                            );
-                            icode_serve::mcp::GraphSync::Ready
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "icode serve: graph sync skipped ({e}); serving existing index"
-                            );
-                            icode_serve::mcp::GraphSync::Failed
-                        }
-                    };
-                    // Release the waiting tools BEFORE spawning the watcher: the
-                    // graph is already complete at this point, and daemon startup
-                    // is not something a tool call should queue behind.
-                    signal.finish(state);
-
-                    // Started after the pass, not alongside it: two writers on one
-                    // SQLite file is a contention the sequential order avoids.
-                    if want_daemon {
-                        match daemon_pid(&root_bg) {
-                            Some(pid) => {
-                                eprintln!("icode serve: watcher already running (pid {pid})")
-                            }
-                            None => match spawn_daemon(&root_bg) {
-                                Ok(()) => {
-                                    eprintln!("icode serve: watcher started — the graph stays live")
+                // Tell the watcher a client is alive: it exits after a long idle
+                // period only when nobody is serving this project. Touched BEFORE
+                // the daemon check below, so a daemon on the verge of its idle exit
+                // sees this session first.
+                //
+                // The same tick also re-checks the watcher and respawns it when it is
+                // gone — it may have exited on idle in the very instant this session
+                // started, or died since. Only once this session's own startup pass
+                // is over: two writers walking one tree is the contention the
+                // sequential order exists to avoid.
+                let startup_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                if want_daemon {
+                    let root_hb = root.clone();
+                    let done_hb = startup_done.clone();
+                    touch_serve_heartbeat(&root_hb);
+                    tokio::spawn(async move {
+                        let mut every = tokio::time::interval(icode_engine::HEARTBEAT_EVERY);
+                        every.tick().await; // the first tick is immediate; touched above
+                        loop {
+                            every.tick().await;
+                            let root_tick = root_hb.clone();
+                            let done = done_hb.load(std::sync::atomic::Ordering::Acquire);
+                            let _ = tokio::task::spawn_blocking(move || {
+                                touch_serve_heartbeat(&root_tick);
+                                if done && daemon_pid(&root_tick).is_none() {
+                                    match spawn_daemon(&root_tick) {
+                                        Ok(()) => eprintln!("icode serve: watcher was gone — restarted it"),
+                                        Err(e) => eprintln!("icode serve: could not restart the watcher ({e})"),
+                                    }
                                 }
-                                // Never fatal: a served snapshot is still useful.
+                            })
+                            .await;
+                        }
+                    });
+                }
+                // A LIVE watcher already keeps this graph in lock-step with the tree,
+                // so the startup pass would only re-read and re-hash every file to
+                // confirm what the watcher already guarantees. That is not free: an
+                // MCP client that starts one `serve` per turn (FlowCode runs a fresh
+                // `claude -p`, hence a fresh server, on every turn) paid a whole-tree
+                // read on every turn, for nothing. Skip it — but only when the store
+                // is populated: an empty store means the watcher may still be in its
+                // own first pass, and tools must keep waiting on a real one.
+                // `ICODE_NO_DAEMON` keeps the pass: then nothing else syncs the graph.
+                let live_watcher =
+                    if want_daemon && already_indexed { daemon_pid(&root) } else { None };
+                if let Some(pid) = live_watcher {
+                    // Trusting the watcher blindly is not enough: a watcher can be
+                    // alive and still have missed events (a stopped process, a
+                    // kernel queue overflow, a directory it could not watch), and
+                    // nothing would ever repair that. A stat-only reconcile is the
+                    // cheap middle: one walk and one stat per file, no reads unless
+                    // a file's mtime/size disagrees with the index.
+                    let store_bg = store.clone();
+                    let root_bg = root.clone();
+                    let done_bg = startup_done.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let state =
+                            match icode_engine::reconcile_by_stat(&root_bg, store_bg.as_ref(), &root_bg) {
+                                Ok(s) => {
+                                    eprintln!(
+                                        "icode serve: watcher already running (pid {pid}) — skipping the \
+                                         startup pass; stat check: {} reindexed, {} deleted, {} unchanged",
+                                        s.files_indexed, s.files_deleted, s.files_skipped
+                                    );
+                                    icode_serve::mcp::GraphSync::Ready
+                                }
                                 Err(e) => {
-                                    eprintln!("icode serve: could not start the watcher ({e})")
+                                    eprintln!("icode serve: stat check failed ({e}); serving existing index");
+                                    icode_serve::mcp::GraphSync::Failed
                                 }
-                            },
+                            };
+                        signal.finish(state);
+                        done_bg.store(true, std::sync::atomic::Ordering::Release);
+                    });
+                } else {
+                    let store_bg = store.clone();
+                    let root_bg = root.clone();
+                    let done_bg = startup_done.clone();
+                    tokio::task::spawn_blocking(move || {
+                        // Best-effort: hash-skips unchanged files, writes only to stderr
+                        // (stdout is the MCP transport), and any failure degrades to
+                        // serving the existing graph rather than aborting serve.
+                        let state = match icode_engine::index_path(&root_bg, store_bg.as_ref()) {
+                            Ok(s) => {
+                                eprintln!(
+                                    "icode serve: graph synced ({} indexed, {} skipped, {} errors)",
+                                    s.files_indexed, s.files_skipped, s.errors
+                                );
+                                icode_serve::mcp::GraphSync::Ready
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "icode serve: graph sync skipped ({e}); serving existing index"
+                                );
+                                icode_serve::mcp::GraphSync::Failed
+                            }
+                        };
+                        // Release the waiting tools BEFORE spawning the watcher: the
+                        // graph is already complete at this point, and daemon startup
+                        // is not something a tool call should queue behind.
+                        signal.finish(state);
+                        done_bg.store(true, std::sync::atomic::Ordering::Release);
+
+                        // Started after the pass, not alongside it: two writers on one
+                        // SQLite file is a contention the sequential order avoids.
+                        if want_daemon {
+                            match daemon_pid(&root_bg) {
+                                Some(pid) => {
+                                    eprintln!("icode serve: watcher already running (pid {pid})")
+                                }
+                                None => match spawn_daemon(&root_bg) {
+                                    Ok(()) => {
+                                        eprintln!("icode serve: watcher started — the graph stays live")
+                                    }
+                                    // Never fatal: a served snapshot is still useful.
+                                    Err(e) => {
+                                        eprintln!("icode serve: could not start the watcher ({e})")
+                                    }
+                                },
+                            }
                         }
-                    }
-                });
+                    });
+                }
             }
         }
 
@@ -1290,6 +1396,22 @@ fn run_serve(path: Option<PathBuf>) -> anyhow::Result<()> {
     served
 }
 
+/// Refresh `<root>/.icode/serve.heartbeat`'s mtime — the "a client is alive"
+/// signal the watcher daemon's idle exit reads. Best-effort: a failure only means
+/// the daemon may exit after its idle period and be restarted by the next serve.
+fn touch_serve_heartbeat(root: &std::path::Path) {
+    let path = root.join(".icode").join(icode_engine::SERVE_HEARTBEAT);
+    let touched = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .and_then(|f| f.set_modified(std::time::SystemTime::now()));
+    if let Err(e) = touched {
+        eprintln!("icode serve: could not refresh {} ({e})", path.display());
+    }
+}
+
 /// `icode web <path> [--port N]` — open the store and serve the local web
 /// dashboard on `127.0.0.1:<port>` (default 7420). Mirrors `serve`: builds the
 /// embedder + cross-session memory best-effort BEFORE the async runtime (a down
@@ -1317,39 +1439,37 @@ fn run_web(path: PathBuf, port: u16) -> anyhow::Result<()> {
 /// project with a clear error.
 /// The PID of the daemon watching `root`, if one is alive.
 ///
-/// The lock file carries the holder's PID; the flock itself is what guarantees
-/// single-writer, so a stale PID in the file after a crash is harmless — we probe
-/// liveness rather than trusting the file.
+/// Liveness is the daemon's flock on `.icode/daemon.lock` ([`icode_engine::DaemonLock::is_held`]):
+/// the kernel holds it exactly as long as the daemon process lives. The PID in the
+/// file is only read once the lock says a daemon is alive, and only to display or
+/// signal it — the holder writes its own PID right after taking the lock, so it
+/// names the holder.
 ///
-/// `kill(pid, 0)` alone is NOT that probe, and believing it made `daemon status`
-/// lie twice over (both observed live):
+/// It used to be the other way round: read the PID, then probe it with signal 0,
+/// `/proc/<pid>/stat` (zombies) and `/proc/<pid>/cmdline` (an `icode` binary). That
+/// still lied on PID reuse by ANOTHER icode process — a `serve`, a hook, a second
+/// daemon for another project — and with daemons now exiting when idle a stale
+/// PID is the normal case. A `serve` that believed it skipped its startup pass and
+/// never started a watcher, leaving the graph stale for the whole session.
 ///
-///   * **Zombies.** A daemon whose watcher init failed (inotify instance limit)
-///     exits, but until the parent reaps it the pid still exists as `Z (defunct)`
-///     — and signal 0 succeeds against it. Status then reported RUNNING for a
-///     daemon that had indexed nothing for days, which is worse than reporting
-///     nothing: a stale graph does not merely omit, it asserts what is no longer true.
-///   * **PID reuse.** Pids wrap. An unrelated process that inherited the dead
-///     daemon's number answers signal 0 just as happily.
-///
-/// So liveness = signal 0 AND `/proc/<pid>` says the process is not a zombie AND
-/// its command is actually ours. On a system without `/proc` (not Linux) the two
-/// extra checks are skipped: they degrade to the old behaviour rather than
-/// pretending a daemon is dead.
+/// `None` also when the lock is held but the PID cannot be read yet (a daemon in
+/// the instant between locking and writing it): the caller then spawns a daemon
+/// that loses the lock race and exits, which is harmless.
 fn daemon_pid(root: &std::path::Path) -> Option<i32> {
-    let pid: i32 = std::fs::read_to_string(root.join(".icode/daemon.lock"))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    // Signal 0 = existence/permission probe, sends nothing.
-    if unsafe { libc::kill(pid, 0) } != 0 {
+    if !icode_engine::DaemonLock::is_held(root) {
         return None;
     }
-    if is_zombie(pid) || !is_icode_process(pid) {
-        return None;
+    for _ in 0..5 {
+        let pid = std::fs::read_to_string(root.join(".icode/daemon.lock"))
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .filter(|pid| *pid > 0);
+        if pid.is_some() {
+            return pid;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    Some(pid)
+    None
 }
 
 /// True when `/proc/<pid>/stat` reports state `Z` (exited, not yet reaped).
@@ -1370,18 +1490,6 @@ fn is_zombie(pid: i32) -> bool {
 fn proc_state(stat: &str) -> Option<char> {
     let (_, after_comm) = stat.rsplit_once(')')?;
     after_comm.split_whitespace().next()?.chars().next()
-}
-
-/// True when pid's command looks like ours — guards against PID reuse handing us
-/// an unrelated process. Reads `/proc/<pid>/cmdline` (NUL-separated argv) and checks
-/// the executable name, so `/usr/bin/icode` and `./target/debug/icode` both match.
-/// Unreadable `/proc` (missing, or another user's process) counts as ours: this is a
-/// tie-breaker, not an authorisation check.
-fn is_icode_process(pid: i32) -> bool {
-    match std::fs::read(format!("/proc/{pid}/cmdline")) {
-        Ok(cmdline) => cmdline_is_icode(&cmdline),
-        Err(_) => true,
-    }
 }
 
 /// Whether a raw `/proc/<pid>/cmdline` (NUL-separated argv) belongs to an icode
@@ -1436,6 +1544,24 @@ fn run_daemon_start(path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Size past which `daemon.log` is rotated when a new daemon is spawned.
+const DAEMON_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+/// If `path` is larger than `max` bytes, move it to `<path>.1` (replacing an older
+/// `.1`) so the next writer starts a fresh file. The daemon log used to be opened
+/// append-only forever and was observed at 202 MB. Rotating at spawn is enough: a
+/// running daemon holds its own fd, and only one daemon per project runs at a time.
+/// Best-effort — a failed rename just keeps appending.
+fn rotate_log_if_larger(path: &std::path::Path, max: u64) {
+    let Ok(meta) = std::fs::metadata(path) else { return };
+    if meta.len() <= max {
+        return;
+    }
+    let mut rotated = path.as_os_str().to_owned();
+    rotated.push(".1");
+    let _ = std::fs::rename(path, std::path::PathBuf::from(rotated));
+}
+
 /// Spawn `icode daemon run <root>` in its own session, logging to `.icode/daemon.log`.
 /// Best-effort and non-blocking: the caller does not wait on the child.
 fn spawn_daemon(root: &std::path::Path) -> anyhow::Result<()> {
@@ -1443,10 +1569,12 @@ fn spawn_daemon(root: &std::path::Path) -> anyhow::Result<()> {
 
     let dir = root.join(".icode");
     std::fs::create_dir_all(&dir)?;
+    let log_path = dir.join("daemon.log");
+    rotate_log_if_larger(&log_path, DAEMON_LOG_MAX_BYTES);
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(dir.join("daemon.log"))?;
+        .open(&log_path)?;
     let log_err = log.try_clone()?;
 
     let mut cmd = std::process::Command::new(icode_exe_path());
@@ -1592,6 +1720,24 @@ fn build_serve_memory(
     Some(store)
 }
 
+/// The embed config for one-shot commands (`hook stop`, `icode host`), with the
+/// test/ops override `ICODE_EMBED_BACKEND`: `fake` = the deterministic offline
+/// embedder (CI, no Ollama), `none` = no embedder at all (`None`), anything else
+/// replaces the backend name.
+fn embed_config_from_env() -> Option<EmbedConfig> {
+    let mut cfg = EmbedConfig::default();
+    if let Ok(backend) = std::env::var("ICODE_EMBED_BACKEND") {
+        let backend = backend.trim().to_ascii_lowercase();
+        if backend == "none" {
+            return None;
+        }
+        if !backend.is_empty() {
+            cfg.backend = backend;
+        }
+    }
+    Some(cfg)
+}
+
 /// Build the configured embedder for `serve`, probe its health, and report the
 /// resulting mode on stderr. Returns `None` only when the embedder cannot be
 /// BUILT (an unsupported backend — a config error no retry fixes); `serve` never
@@ -1644,6 +1790,9 @@ fn build_serve_embedder() -> Option<Arc<dyn icode_core::traits::Embedder>> {
 const HOOK_SESSION_PROJECT_N: usize = 6;
 /// How many developer-profile notes `session-start` surfaces.
 const HOOK_SESSION_PROFILE_N: usize = 5;
+/// How many recent project rows are scanned to find [`HOOK_SESSION_PROJECT_N`]
+/// that are not auto-summary drafts.
+const HOOK_SESSION_SCAN_N: usize = 60;
 /// Per-line content cap in the injected context (keeps the prompt budget small).
 const HOOK_LINE_MAX: usize = 200;
 
@@ -1653,6 +1802,51 @@ fn basename_str(d: &std::path::Path) -> Option<String> {
         .and_then(|n| n.to_str())
         .map(str::to_string)
         .filter(|s| !s.is_empty())
+}
+
+/// Why a directory maps to the bucket it does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BucketSource {
+    /// `<root>/.icode-project` names the bucket.
+    Marker,
+    /// A linked worktree, named after its MAIN checkout.
+    Worktree,
+    /// The repo root's directory name.
+    Basename,
+}
+
+impl BucketSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            BucketSource::Marker => "marker",
+            BucketSource::Worktree => "worktree",
+            BucketSource::Basename => "basename",
+        }
+    }
+}
+
+/// The memory bucket a git repo maps to: its name, the root it was taken from (the
+/// MAIN checkout for a linked worktree) and the rule that produced it.
+#[derive(Clone, Debug)]
+struct RepoBucket {
+    name: String,
+    root: PathBuf,
+    source: BucketSource,
+}
+
+/// The bucket named by `root` itself: the name declared in its `.icode-project`
+/// marker (so several repos can share one bucket), else its directory name.
+fn bucket_at(root: &std::path::Path, via_worktree: bool) -> Option<RepoBucket> {
+    if let Some(name) = icode_engine::project_marker(root) {
+        return Some(RepoBucket { name, root: root.to_path_buf(), source: BucketSource::Marker });
+    }
+    basename_str(root)
+        .filter(|name| icode_engine::validate_bucket_name(name).is_ok())
+        .map(|name| RepoBucket {
+        name,
+        root: root.to_path_buf(),
+        source: if via_worktree { BucketSource::Worktree } else { BucketSource::Basename },
+    })
 }
 
 /// Given the `.git` FILE of a linked worktree, resolve the MAIN repository's
@@ -1708,15 +1902,21 @@ fn worktree_main_root(dot_git_file: &std::path::Path, worktree_dir: &std::path::
 /// (`…/iCode/crates/foo` → `iCode`, `Onyx`/`onyx` can't split), and it treats a
 /// worktree as the SAME project as its main checkout instead of a fresh bucket.
 fn git_root_basename(dir: &std::path::Path) -> Option<String> {
+    repo_bucket(dir).map(|b| b.name)
+}
+
+/// [`git_root_basename`] with its provenance: the enclosing repo's bucket, the root
+/// it was derived from and why. `None` outside a git repo.
+fn repo_bucket(dir: &std::path::Path) -> Option<RepoBucket> {
     let mut cur = Some(dir);
     while let Some(d) = cur {
         let dot_git = d.join(".git");
         match std::fs::metadata(&dot_git) {
-            Ok(m) if m.is_dir() => return basename_str(d),
+            Ok(m) if m.is_dir() => return bucket_at(d, false),
             Ok(m) if m.is_file() => {
                 return worktree_main_root(&dot_git, d)
-                    .and_then(|root| basename_str(&root))
-                    .or_else(|| basename_str(d));
+                    .and_then(|root| bucket_at(&root, true))
+                    .or_else(|| bucket_at(d, false));
             }
             _ => {}
         }
@@ -1745,7 +1945,7 @@ fn is_throwaway_dir(dir: &std::path::Path) -> bool {
 }
 
 /// Resolve the project name for a hook. Precedence:
-///   1. explicit `--project` (trimmed, if non-empty);
+///   1. explicit `--project` (trimmed, if it is a valid bucket name);
 ///   2. the basename of the enclosing GIT REPO root of the cwd — the canonical,
 ///      subdirectory- and casing-stable "which project" signal;
 ///   3. the cwd basename, UNLESS the cwd is a throwaway/container location
@@ -1758,7 +1958,9 @@ fn is_throwaway_dir(dir: &std::path::Path) -> bool {
 fn hook_project(project: Option<&str>, cwd: Option<&std::path::Path>) -> String {
     if let Some(p) = project {
         let p = p.trim();
-        if !p.is_empty() {
+        // An explicit name that cannot be a bucket (empty, reserved `__*`, control
+        // characters) is ignored rather than trusted: the cwd decides instead.
+        if icode_engine::validate_bucket_name(p).is_ok() {
             return p.to_string();
         }
     }
@@ -1777,7 +1979,7 @@ fn hook_project(project: Option<&str>, cwd: Option<&std::path::Path>) -> String 
     dir.file_name()
         .and_then(|n| n.to_str())
         .map(str::to_string)
-        .filter(|s| !s.is_empty())
+        .filter(|s| icode_engine::validate_bucket_name(s).is_ok())
         .unwrap_or_else(|| "general".to_string())
 }
 
@@ -1926,6 +2128,7 @@ fn hook_session_fallback(project: &str) -> String {
 /// Build the SessionStart `additionalContext` text for `project`. Best-effort:
 /// returns the behavioural fallback string on any error or empty store.
 fn build_session_start_context(project: &str) -> String {
+    use icode_core::traits::WritableMemoryStore;
     use icode_engine::SqliteMemoryStore;
 
     let db_path = central_db_path();
@@ -1934,29 +2137,69 @@ fn build_session_start_context(project: &str) -> String {
         Err(_) => return hook_session_fallback(project),
     };
 
-    let session = match icode_engine::session_start(
-        &store,
-        project,
-        HOOK_SESSION_PROJECT_N,
-        HOOK_SESSION_PROFILE_N,
-    ) {
-        Ok(s) => s,
-        Err(_) => return hook_session_fallback(project),
+    let Ok(prime) = session_prime(&store, project, true) else {
+        return hook_session_fallback(project);
     };
-
-    if session.developer_profile.is_empty() && session.project_context.is_empty() {
+    if prime.count == 0 {
         return hook_session_fallback(project);
     }
+    // Warm-up (best-effort), as the engine's `session_start` does: the records the
+    // session was shown count as used for usage-aware ranking.
+    let _ = store.record_access(&prime.ids);
+
+    let mut lines = prime.lines;
+    // Pin the canonical project name so memory stays in ONE bucket: the agent picks
+    // the `project` argument for every icode call, and deriving it ad-hoc from the
+    // path is exactly what fragments a repo across `crates`, `Onyx`/`onyx`, etc.
+    lines.push(String::new());
+    lines.push(format!(
+        "> Use `project=\"{project}\"` for EVERY icode memory call this session \
+         (session_start / recall / add_memory / …). It is the canonical name for \
+         this repo — do not derive a different one from the working directory."
+    ));
+
+    lines.join("\n")
+}
+
+/// The fact lines of a session-start prime, shared by `hook session-start` and
+/// `icode host prime`. Pure read: no access warm-up (the hook does that itself).
+struct Prime {
+    lines: Vec<String>,
+    /// Records the lines were built from.
+    count: usize,
+    ids: Vec<icode_core::ids::MemoryId>,
+}
+
+/// Session-start facts: the developer profile (L0 first) and the recent project
+/// memory. With `skip_drafts`, auto-summary drafts below importance 2 are NOT
+/// recent project memory — see [`is_draft_auto_summary`].
+fn session_prime(
+    store: &dyn icode_core::traits::ReadableMemoryStore,
+    project: &str,
+    skip_drafts: bool,
+) -> icode_core::Result<Prime> {
+    use icode_core::ids::DEVELOPER_PROJECT;
+
+    let profile = store.list(DEVELOPER_PROJECT, None, HOOK_SESSION_PROFILE_N, false)?;
+    let context: Vec<_> = store
+        .list(project, None, HOOK_SESSION_SCAN_N, false)?
+        .into_iter()
+        .filter(|r| !(skip_drafts && is_draft_auto_summary(r)))
+        .take(HOOK_SESSION_PROJECT_N)
+        .collect();
 
     let mut lines: Vec<String> = Vec::new();
+    if profile.is_empty() && context.is_empty() {
+        return Ok(Prime { lines, count: 0, ids: Vec::new() });
+    }
     lines.push(format!("# iCode memory — session start for `{project}`"));
 
-    if !session.developer_profile.is_empty() {
+    if !profile.is_empty() {
         lines.push(String::new());
         lines.push("## Developer profile (cross-project, always honour these):".to_string());
         // L0/important notes first so the critical always-on rules lead.
         let cfg = icode_core::config::RankingConfig::default();
-        let mut profile = session.developer_profile.clone();
+        let mut profile = profile.clone();
         profile.sort_by(|a, b| {
             let al = icode_engine::is_l0(a, &cfg);
             let bl = icode_engine::is_l0(b, &cfg);
@@ -1971,25 +2214,26 @@ fn build_session_start_context(project: &str) -> String {
         }
     }
 
-    if !session.project_context.is_empty() {
+    if !context.is_empty() {
         lines.push(String::new());
         lines.push("## Recent project memory:".to_string());
-        for rec in &session.project_context {
+        for rec in &context {
             lines.push(format!("- {}", hook_memory_line(rec)));
         }
     }
 
-    // Pin the canonical project name so memory stays in ONE bucket: the agent picks
-    // the `project` argument for every icode call, and deriving it ad-hoc from the
-    // path is exactly what fragments a repo across `crates`, `Onyx`/`onyx`, etc.
-    lines.push(String::new());
-    lines.push(format!(
-        "> Use `project=\"{project}\"` for EVERY icode memory call this session \
-         (session_start / recall / add_memory / …). It is the canonical name for \
-         this repo — do not derive a different one from the working directory."
-    ));
+    let ids = profile.iter().chain(context.iter()).map(|r| r.id.clone()).collect();
+    Ok(Prime { lines, count: profile.len() + context.len(), ids })
+}
 
-    lines.join("\n")
+/// A Stop-hook auto-summary draft (`sid:*` tag) of low importance: a turn-by-turn
+/// safety net, not a curated fact, so it is kept out of the session-start prime.
+/// Todo / bug / decision records are never treated as drafts, whatever their tags.
+fn is_draft_auto_summary(rec: &icode_core::model::MemoryRecord) -> bool {
+    use icode_core::model::Category;
+    rec.importance < 2.0
+        && rec.tags.iter().any(|t| t.starts_with("sid:"))
+        && !matches!(rec.category, Category::Todo | Category::Bug | Category::Decision)
 }
 
 /// `icode hook precompact` — re-inject the L0 "always-on" rules before/after
@@ -2007,8 +2251,6 @@ fn run_hook_precompact(project: Option<&str>, cwd: Option<&std::path::Path>) {
 /// profile + the project, listed for re-injection. Empty string when there are
 /// none (or the store can't open). Uses `list` only — NO embedding backend.
 fn build_precompact_context(project: &str) -> String {
-    use icode_core::ids::DEVELOPER_PROJECT;
-    use icode_core::traits::ReadableMemoryStore;
     use icode_engine::SqliteMemoryStore;
 
     let db_path = central_db_path();
@@ -2017,6 +2259,13 @@ fn build_precompact_context(project: &str) -> String {
         Ok(s) => s,
         Err(_) => return String::new(),
     };
+    precompact_prime(&store, project).lines.join("\n")
+}
+
+/// The L0 rules of the developer profile + `project`, highest importance first,
+/// shared by `hook precompact` and `icode host prime`. Empty when there are none.
+fn precompact_prime(store: &dyn icode_core::traits::ReadableMemoryStore, project: &str) -> Prime {
+    use icode_core::ids::DEVELOPER_PROJECT;
 
     let cfg = icode_core::config::RankingConfig::default();
     // Pull a generous slice of recent rows from each side; the L0 filter is applied
@@ -2031,7 +2280,7 @@ fn build_precompact_context(project: &str) -> String {
     }
 
     if l0.is_empty() {
-        return String::new();
+        return Prime { lines: Vec::new(), count: 0, ids: Vec::new() };
     }
 
     // Highest importance first (the most critical rule leads).
@@ -2048,7 +2297,7 @@ fn build_precompact_context(project: &str) -> String {
     for rec in &l0 {
         lines.push(format!("- {}", hook_memory_line(rec)));
     }
-    lines.join("\n")
+    Prime { lines, count: l0.len(), ids: l0.into_iter().map(|r| r.id).collect() }
 }
 
 /// `icode hook stop` — the `session_end` safety net. Claude Code fires Stop at
@@ -2060,6 +2309,14 @@ fn build_precompact_context(project: &str) -> String {
 /// exits 0 — any failure (no stdin, unreadable transcript, Ollama down, …) is a
 /// silent no-op, never a stall.
 fn run_hook_stop(project: Option<&str>, cwd: Option<&std::path::Path>) {
+    // Under an IDE host that writes its own session summary through `icode host
+    // session-end` (FlowCode sets FLOWCODE_ICODE_HOST=1 on the agent's env), the
+    // per-turn Stop draft would only duplicate it. Drain the payload and leave.
+    if std::env::var("FLOWCODE_ICODE_HOST").is_ok_and(|v| v.trim() == "1") {
+        use std::io::Read;
+        let _ = std::io::copy(&mut std::io::stdin().take(1 << 20), &mut std::io::sink());
+        return;
+    }
     let _ = try_hook_stop(project, cwd);
 }
 
@@ -2097,7 +2354,7 @@ fn try_hook_stop(project: Option<&str>, cwd: Option<&std::path::Path>) -> Option
 
     // add/update embed the content, so this path needs a live embedder — built
     // quietly (no stderr chatter on every turn), degrading to a no-op when down.
-    let embedder = icode_embed::build_embedder(&EmbedConfig::default()).ok()?;
+    let embedder = icode_embed::build_embedder(&embed_config_from_env()?).ok()?;
     embedder.health().ok()?;
     let embedder: Arc<dyn Embedder> = Arc::from(embedder);
     let base = icode_engine::SqliteMemoryStore::open(&central_db_path(), embedder).ok()?;
@@ -2168,6 +2425,35 @@ mod derivation_tests {
         let (_td, root, deep) = repo_with_subdir();
         assert_eq!(git_root_basename(&deep).as_deref(), Some("root"));
         assert_eq!(git_root_basename(&root).as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn project_marker_overrides_directory_name_everywhere_in_the_repo() {
+        let (_td, root, deep) = repo_with_subdir();
+        std::fs::write(root.join(".icode-project"), "# shared\nEcosystem\n").unwrap();
+        assert_eq!(git_root_basename(&deep).as_deref(), Some("Ecosystem"));
+        assert_eq!(hook_project(None, Some(&deep)), "Ecosystem");
+        // A malformed marker falls back to the directory name.
+        std::fs::write(root.join(".icode-project"), "a/b\n").unwrap();
+        assert_eq!(git_root_basename(&deep).as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn reserved_or_invalid_names_never_become_buckets() {
+        let (_td, root, deep) = repo_with_subdir();
+        // A marker in the reserved namespace degrades to the directory name.
+        std::fs::write(root.join(".icode-project"), "__developer__\n").unwrap();
+        assert_eq!(git_root_basename(&deep).as_deref(), Some("root"));
+        // An explicit reserved / control-char name is ignored; the cwd decides.
+        assert_eq!(hook_project(Some("__developer__"), Some(&deep)), "root");
+        assert_eq!(hook_project(Some("a\u{7}b"), Some(&deep)), "root");
+        assert_eq!(hook_project(Some("My Project"), Some(&deep)), "My Project");
+        // A repo whose own directory name is reserved maps to `general`.
+        let td = tempfile::tempdir().expect("tempdir");
+        let odd = td.path().join("__odd");
+        std::fs::create_dir_all(odd.join(".git")).unwrap();
+        assert_eq!(git_root_basename(&odd), None);
+        assert_eq!(hook_project(None, Some(&odd)), "general");
     }
 
     #[test]
@@ -2342,5 +2628,26 @@ mod derivation_tests {
         assert!(!cmdline_is_icode(b"/usr/lib/firefox/firefox\0"));
         // Unreadable/empty cmdline is "cannot tell" → treated as ours.
         assert!(cmdline_is_icode(b""));
+    }
+
+    #[test]
+    fn a_large_daemon_log_is_rotated_and_a_small_one_is_kept() {
+        use super::rotate_log_if_larger;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("daemon.log");
+        let old = dir.path().join("daemon.log.1");
+
+        std::fs::write(&log, b"small").unwrap();
+        rotate_log_if_larger(&log, 10);
+        assert_eq!(std::fs::read(&log).unwrap(), b"small", "under the limit: untouched");
+        assert!(!old.exists());
+
+        std::fs::write(&old, b"older rotation").unwrap();
+        std::fs::write(&log, b"0123456789AB").unwrap();
+        rotate_log_if_larger(&log, 10);
+        assert!(!log.exists(), "over the limit: moved away so the next writer starts fresh");
+        assert_eq!(std::fs::read(&old).unwrap(), b"0123456789AB", "replaces the older .1");
+
+        rotate_log_if_larger(&dir.path().join("absent.log"), 10); // no file: no-op
     }
 }
