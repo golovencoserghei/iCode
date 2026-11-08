@@ -349,6 +349,17 @@ fn main() -> anyhow::Result<()> {
         host::run();
         return Ok(());
     }
+    // `icode hook pre-tool` bypasses clap too: it runs before EVERY Grep/Bash call,
+    // and Claude Code treats exit 2 (clap's usage-error code) as "block the tool".
+    // A stray or future flag must never cost the agent its grep, so its arguments
+    // are read leniently and it always exits 0.
+    {
+        let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+        if args.len() >= 3 && args[1] == "hook" && args[2] == "pre-tool" {
+            run_hook_pre_tool(pre_tool_cwd_arg(&args[3..]).as_deref());
+            std::process::exit(0);
+        }
+    }
     let cli = Cli::parse();
     match cli.command {
         Command::Index { path } => run_index(&existing_root(path)?),
@@ -737,6 +748,21 @@ fn run_hook_pre_tool(cwd: Option<&std::path::Path>) {
 
 /// Wall-clock budget of `icode hook pre-tool`, in milliseconds.
 const PRE_TOOL_BUDGET_MS: u64 = 140;
+
+/// `--cwd DIR` / `--cwd=DIR` from the pre-tool arguments; anything else ignored.
+fn pre_tool_cwd_arg(args: &[std::ffi::OsString]) -> Option<PathBuf> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let s = a.to_string_lossy();
+        if s == "--cwd" {
+            return it.next().map(PathBuf::from).filter(|p| !p.as_os_str().is_empty());
+        }
+        if let Some(v) = s.strip_prefix("--cwd=") {
+            return (!v.is_empty()).then(|| PathBuf::from(v));
+        }
+    }
+    None
+}
 
 /// Where the per-session hint ledgers live: `$ICODE_HOOK_STATE_DIR`, else
 /// `~/.icode/hook-hints` (beside the central db, never inside a project tree).
@@ -2546,7 +2572,10 @@ fn hook_settings_json() -> String {
     let cmd_precompact = format!("{exe} hook precompact --cwd \\\"$CLAUDE_PROJECT_DIR\\\"");
     let cmd_stop = format!("{exe} hook stop --cwd \\\"$CLAUDE_PROJECT_DIR\\\"");
     let cmd_post = format!("{exe} hook post-tool --cwd \\\"$CLAUDE_PROJECT_DIR\\\"");
-    let cmd_pre = format!("{exe} hook pre-tool --cwd \\\"$CLAUDE_PROJECT_DIR\\\"");
+    // Fail-open at the SHELL level too: an older icode without `pre-tool` would
+    // exit 2 from its argument parser, and exit 2 from a PreToolUse hook BLOCKS
+    // the tool call — every grep of the session.
+    let cmd_pre = format!("{exe} hook pre-tool --cwd \\\"$CLAUDE_PROJECT_DIR\\\" 2>/dev/null || true");
     // PostToolUse is matched to Bash only: the ledger cares about commands that
     // ran, and firing on every file read would be pure overhead.
     format!(
