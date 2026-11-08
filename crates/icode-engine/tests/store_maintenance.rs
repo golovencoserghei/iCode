@@ -128,3 +128,39 @@ fn an_index_from_before_the_fingerprint_column_gains_it() {
     assert!(store.record_parse_error_once("/x.rs", "sha256:abc", "new").unwrap());
     assert_eq!(parse_error_rows(&root), 1, "the old duplicate rows for the path are replaced");
 }
+
+#[test]
+fn reconcile_by_stat_repairs_missed_creates_edits_and_deletes() {
+    use icode_core::traits::CodeReadStore;
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    write_tree(&root, 20, "a");
+    let store = SqliteCodeStore::open(&root).unwrap();
+    index_path(&root, &store).unwrap();
+
+    let s = icode_engine::reconcile_by_stat(&root, &store, &root).unwrap();
+    assert_eq!((s.files_indexed, s.files_deleted, s.files_skipped), (0, 0, 20), "unchanged tree");
+
+    fs::write(root.join("new.rs"), "pub fn brand_new() {}\n").unwrap();
+    fs::write(root.join("m0.rs"), "pub fn edited_and_longer_than_before_by_far() {}\n".repeat(30)).unwrap();
+    fs::remove_file(root.join("m1.rs")).unwrap();
+    let s = icode_engine::reconcile_by_stat(&root, &store, &root).unwrap();
+    assert_eq!((s.files_indexed, s.files_deleted), (2, 1));
+    let key = |n: &str| root.join(n).to_string_lossy().to_string();
+    assert!(store.stat_file(&key("new.rs")).unwrap().is_some());
+    assert!(store.stat_file(&key("m1.rs")).unwrap().is_none());
+
+    // A subtree: a directory moved in, then moved out again.
+    let outside = tempfile::tempdir().unwrap();
+    let pkg = outside.path().join("pkg");
+    fs::create_dir_all(pkg.join("inner")).unwrap();
+    fs::write(pkg.join("x.rs"), "pub fn x() {}\n").unwrap();
+    fs::write(pkg.join("inner/y.rs"), "pub fn y() {}\n").unwrap();
+    fs::rename(&pkg, root.join("pkg")).unwrap();
+    let s = icode_engine::reconcile_by_stat(&root, &store, &root.join("pkg")).unwrap();
+    assert_eq!(s.files_indexed, 2);
+    fs::rename(root.join("pkg"), outside.path().join("back")).unwrap();
+    let s = icode_engine::reconcile_by_stat(&root, &store, &root.join("pkg")).unwrap();
+    assert_eq!(s.files_deleted, 2);
+    assert_eq!(store.files_under(&root.to_string_lossy()).unwrap().len(), 20, "the rest is intact");
+}

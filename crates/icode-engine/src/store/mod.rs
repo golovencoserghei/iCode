@@ -1474,6 +1474,26 @@ impl SqliteCodeStore {
         Ok(true)
     }
 
+    /// `(path, mtime, file_size)` of every indexed file strictly below the
+    /// directory `dir` (paths starting with `<dir>/`). A range scan on the UNIQUE
+    /// `files.path` index — `'/'` + 1 is `'0'` — so it costs nothing when the
+    /// answer is empty, which is the common case for a vanished non-source path.
+    pub fn files_under(&self, dir: &str) -> Result<Vec<(String, i64, u64)>> {
+        let base = dir.trim_end_matches('/');
+        let lo = format!("{base}/");
+        let hi = format!("{base}0");
+        let conn = self.conn.lock().map_err(store_err)?;
+        let mut stmt = conn
+            .prepare("SELECT path, mtime, file_size FROM files WHERE path >= ?1 AND path < ?2")
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![lo, hi], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)? as u64))
+            })
+            .map_err(store_err)?;
+        collect(rows)
+    }
+
     /// `VACUUM` the index: rebuild the file without its free pages. Expensive (it
     /// rewrites the whole db and, under WAL, writes it through the WAL), so callers
     /// run it only after a large purge; follow it with [`Self::checkpoint_truncate`].

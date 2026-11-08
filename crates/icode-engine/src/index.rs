@@ -323,6 +323,92 @@ pub fn index_path(root: &Path, store: &SqliteCodeStore) -> Result<IndexStats> {
     Ok(stats)
 }
 
+/// Bring the part of the index under `under` (the whole tree when `under == root`)
+/// back in line with disk using only `stat` — the cheap check for when something
+/// else (the watcher daemon) is supposed to have kept the graph current.
+///
+/// Unlike [`index_path`] it reads no file whose indexed `mtime` and size still match
+/// disk, so an unchanged tree costs one walk plus one stat per file. What it does:
+///   * a path on disk that is not indexed, or whose mtime/size drifted, goes through
+///     [`index_one_file`] (which still hash-skips if only the metadata changed);
+///   * an indexed path under `under` that is no longer on disk is deleted;
+///   * edges and ranks are re-resolved and the WAL truncated only if a row changed.
+///
+/// The trade-off is the mtime granularity: an edit that keeps the size and lands
+/// in the same second as the indexed mtime is invisible to it. That is the gap the
+/// daemon's own events cover; this pass exists for the events the daemon LOST.
+pub fn reconcile_by_stat(root: &Path, store: &SqliteCodeStore, under: &Path) -> Result<IndexStats> {
+    let mut stats = IndexStats::default();
+    let whole_tree = under == root;
+    let prior: HashMap<String, (i64, u64)> = if whole_tree {
+        store
+            .list_files(None, None, usize::MAX)?
+            .into_iter()
+            .map(|f| (f.path, (f.mtime, f.file_size)))
+            .collect()
+    } else {
+        store
+            .files_under(&under.to_string_lossy())?
+            .into_iter()
+            .map(|(p, m, z)| (p, (m, z)))
+            .collect()
+    };
+
+    let on_disk: Vec<std::path::PathBuf> = if under.is_dir() {
+        walk_source_files(under)
+            .into_iter()
+            .filter(|p| whole_tree || !is_in_linked_worktree(root, p))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut any_change = false;
+    let mut seen: HashSet<String> = HashSet::with_capacity(on_disk.len());
+    for path in &on_disk {
+        let key = path.to_string_lossy().to_string();
+        let current = std::fs::metadata(path).ok().map(|m| (mtime_secs(&m), m.len()));
+        let drifted = match (prior.get(&key), current) {
+            (Some(indexed), Some(now)) => *indexed != now,
+            (None, Some(_)) => true,
+            (_, None) => false, // vanished mid-walk: the deletion sweep below has it
+        };
+        if current.is_some() {
+            seen.insert(key.clone());
+        }
+        if !drifted {
+            stats.files_skipped += 1;
+            continue;
+        }
+        match index_one_file(path, store, root) {
+            Ok(s) if s.files_indexed == 0 => stats.files_skipped += 1,
+            Ok(s) => {
+                any_change = true;
+                stats.files_indexed += 1;
+                stats.functions += s.functions;
+                stats.classes += s.classes;
+            }
+            Err(e) => {
+                stats.errors += 1;
+                let _ = store.record_parse_error_once(&key, &error_fingerprint(path), &e.to_string());
+            }
+        }
+    }
+    for path in prior.keys() {
+        if !seen.contains(path) {
+            store.delete_file(path)?;
+            any_change = true;
+            stats.files_deleted += 1;
+        }
+    }
+    if any_change {
+        store.resolve_call_edges(None)?;
+        store.compute_symbol_ranks()?;
+        store.checkpoint_truncate();
+    }
+    Ok(stats)
+}
+
 /// Whether a full pass that removed `deleted` of the `prior_files` it started with
 /// purged enough to be worth a `VACUUM`: at least 500 files, or at least 20% of the
 /// index. Below that the freed pages are simply reused by later writes.

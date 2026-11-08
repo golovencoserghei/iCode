@@ -146,20 +146,13 @@ pub fn run_daemon(root: &Path, store: SqliteCodeStore) -> Result<()> {
     install_sigint(running.clone());
 
     // 4) Debounced watcher → batches over a channel into this thread (so the lock
-    //    guard and store stay owned here; the callback only forwards paths).
-    let (tx, rx) = mpsc::channel::<Vec<PathBuf>>();
+    //    guard and store stay owned here; the callback only classifies).
+    let (tx, rx) = mpsc::channel::<WatchMsg>();
     let mut debouncer = new_debouncer(DEBOUNCE, None, move |res: DebounceEventResult| {
-        if let Ok(events) = res {
-            let paths: Vec<PathBuf> = events
-                .into_iter()
-                .filter(|e| is_content_event(&e.event.kind))
-                .flat_map(|e| e.event.paths.clone())
-                .collect();
-            if !paths.is_empty() {
-                let _ = tx.send(paths);
-            }
+        let msg = classify_watch_result(res);
+        if msg != WatchMsg::Noise {
+            let _ = tx.send(msg);
         }
-        // A watcher backend error is non-fatal: drop the batch, keep watching.
     })
     .map_err(|e| Error::Io(format!("watcher init: {e}")))?;
 
@@ -173,6 +166,10 @@ pub fn run_daemon(root: &Path, store: SqliteCodeStore) -> Result<()> {
     let idle = idle_timeout();
     let mut last_activity = SystemTime::now();
     let mut next_idle_check = Instant::now();
+    let mut rescan_pending = false;
+    let mut last_rescan = Instant::now()
+        .checked_sub(MIN_RESCAN_GAP)
+        .unwrap_or_else(Instant::now);
     while running.load(Ordering::Relaxed) {
         // A daemon whose tree is gone (a deleted worktree, a cleaned-up scratch
         // dir) has nothing left to watch: exit instead of lingering forever.
@@ -180,11 +177,30 @@ pub fn run_daemon(root: &Path, store: SqliteCodeStore) -> Result<()> {
             log(&format!("daemon: root {} disappeared — exiting", root.display()));
             break;
         }
+        // A pending rescan whose rate-limit gap has passed runs now.
+        if rescan_pending && last_rescan.elapsed() >= MIN_RESCAN_GAP {
+            rescan_pending = false;
+            last_rescan = Instant::now();
+            full_rescan(&root, &store);
+            last_activity = SystemTime::now();
+        }
         match rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(paths) => {
+            Ok(WatchMsg::Paths(paths)) => {
                 if process_batch(&root, &store, paths) {
                     last_activity = SystemTime::now();
                 }
+            }
+            Ok(WatchMsg::Noise) => {}
+            Ok(WatchMsg::Rescan(why)) => {
+                // Events were LOST (kernel queue overflow, a watch that could not be
+                // added): the tree may differ from the graph in ways no later event
+                // will reveal. Only a walk can tell — `index_path` hash-skips what
+                // did not change. Rate-limited so a persistent watch error (an
+                // exhausted `max_user_watches`) cannot turn into a walk per event.
+                if !rescan_pending {
+                    log(&format!("daemon: events lost ({why}) — scheduling a full rescan"));
+                }
+                rescan_pending = true;
             }
             Err(RecvTimeoutError::Timeout) => {
                 let Some(idle) = idle else { continue };
@@ -206,6 +222,67 @@ pub fn run_daemon(root: &Path, store: SqliteCodeStore) -> Result<()> {
 
     log("daemon: stopping (lock released)");
     Ok(())
+}
+
+/// Minimum spacing between two full rescans triggered by lost events.
+const MIN_RESCAN_GAP: Duration = Duration::from_secs(10);
+
+/// What the watcher callback hands the main loop.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WatchMsg {
+    /// Paths whose content or existence may have changed.
+    Paths(Vec<PathBuf>),
+    /// Events were lost or the backend failed: the graph can only be trusted again
+    /// after a full walk. Carries a short reason for the log.
+    Rescan(String),
+    /// Nothing that can change the graph (reads, `Other` without a rescan flag).
+    Noise,
+}
+
+/// Turn one debounced watcher delivery into a [`WatchMsg`].
+///
+/// Both failure shapes used to be dropped on the floor, and either one left the
+/// daemon "alive" over a graph it no longer tracked — while `serve` trusted that
+/// daemon and skipped its own startup pass:
+///   * an inotify queue overflow arrives as an `Other` event flagged `need_rescan`
+///     (the kernel discarded events; `max_queued_events` is 16384), which the
+///     content filter rejected;
+///   * a backend `Err` (e.g. `max_user_watches` exhausted while adding a watch for
+///     a new directory) was ignored outright, so nothing under that directory was
+///     ever watched.
+pub fn classify_watch_result(res: DebounceEventResult) -> WatchMsg {
+    match res {
+        Err(errors) => WatchMsg::Rescan(format!(
+            "watcher error: {}",
+            errors.first().map(|e| e.to_string()).unwrap_or_default()
+        )),
+        Ok(events) => {
+            if events.iter().any(|e| e.event.need_rescan()) {
+                return WatchMsg::Rescan("event queue overflowed".into());
+            }
+            let paths: Vec<PathBuf> = events
+                .into_iter()
+                .filter(|e| is_content_event(&e.event.kind))
+                .flat_map(|e| e.event.paths.clone())
+                .collect();
+            if paths.is_empty() {
+                WatchMsg::Noise
+            } else {
+                WatchMsg::Paths(paths)
+            }
+        }
+    }
+}
+
+/// Re-walk the whole tree after lost events. Never fails the daemon.
+fn full_rescan(root: &Path, store: &SqliteCodeStore) {
+    match index_path(root, store) {
+        Ok(s) => log(&format!(
+            "daemon: rescan — {} reindexed, {} unchanged, {} deleted ({} errors)",
+            s.files_indexed, s.files_skipped, s.files_deleted, s.errors
+        )),
+        Err(e) => log(&format!("daemon: rescan failed ({e}) — will retry on the next lost event")),
+    }
 }
 
 /// Handle one debounced batch: dedup paths, drop excluded/unsupported ones, then

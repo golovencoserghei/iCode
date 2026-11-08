@@ -267,3 +267,39 @@ mod idle_exit {
         assert!(!should_exit_idle(now, ago(now, 7 * 3600), Some(future), IDLE));
     }
 }
+
+// ──────────────────────────── lost events / liveness ────────────────────────────
+
+mod lost_events {
+    use icode_engine::{classify_watch_result, WatchMsg};
+    use notify::event::{AccessKind, CreateKind, Event, EventKind, Flag};
+    use notify_debouncer_full::DebouncedEvent;
+    use std::path::PathBuf;
+    use std::time::Instant;
+
+    fn ev(kind: EventKind, path: &str) -> DebouncedEvent {
+        DebouncedEvent::new(Event::new(kind).add_path(PathBuf::from(path)), Instant::now())
+    }
+
+    #[test]
+    fn a_queue_overflow_asks_for_a_rescan() {
+        let overflow = DebouncedEvent::new(Event::new(EventKind::Other).set_flag(Flag::Rescan), Instant::now());
+        let msg = classify_watch_result(Ok(vec![ev(EventKind::Create(CreateKind::File), "/t/a.rs"), overflow]));
+        assert!(matches!(msg, WatchMsg::Rescan(_)), "{msg:?}");
+    }
+
+    #[test]
+    fn a_backend_error_asks_for_a_rescan() {
+        let msg = classify_watch_result(Err(vec![notify::Error::generic("max_user_watches reached")]));
+        assert!(matches!(msg, WatchMsg::Rescan(ref why) if why.contains("max_user_watches")), "{msg:?}");
+    }
+
+    #[test]
+    fn reads_are_noise_and_changes_are_paths() {
+        assert_eq!(classify_watch_result(Ok(vec![ev(EventKind::Access(AccessKind::Any), "/t/a.rs")])), WatchMsg::Noise);
+        assert_eq!(
+            classify_watch_result(Ok(vec![ev(EventKind::Create(CreateKind::File), "/t/a.rs")])),
+            WatchMsg::Paths(vec![PathBuf::from("/t/a.rs")])
+        );
+    }
+}

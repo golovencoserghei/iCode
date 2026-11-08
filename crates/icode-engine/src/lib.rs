@@ -25,14 +25,14 @@ pub mod verify;
 
 pub use chunk::{chunks_for_file, rel_display_path, CHUNK_BUDGET_BYTES};
 pub use daemon::{
-    idle_timeout, is_content_event, run_daemon, should_exit_idle, DaemonLock, HEARTBEAT_EVERY,
+    classify_watch_result, idle_timeout, is_content_event, run_daemon, should_exit_idle, DaemonLock, WatchMsg, HEARTBEAT_EVERY,
     SERVE_HEARTBEAT,
 };
 pub use doctor::{diagnose, DiagnosticReport};
 pub use embed::{embed_pending, embed_pending_capped, EmbedStats};
 pub use index::{
     error_fingerprint, index_one_file, index_path, is_in_excluded_dir, is_in_linked_worktree, is_linked_worktree_below,
-    is_supported_source, should_vacuum, walk_source_files,
+    is_supported_source, reconcile_by_stat, should_vacuum, walk_source_files,
     IndexStats,
 };
 pub use memory::{

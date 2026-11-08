@@ -1243,11 +1243,32 @@ fn run_serve(path: Option<PathBuf>) -> anyhow::Result<()> {
                 let live_watcher =
                     if want_daemon && already_indexed { daemon_pid(&root) } else { None };
                 if let Some(pid) = live_watcher {
-                    eprintln!(
-                        "icode serve: watcher already running (pid {pid}) — the graph is live, \
-                         skipping the startup pass"
-                    );
-                    signal.finish(icode_serve::mcp::GraphSync::Ready);
+                    // Trusting the watcher blindly is not enough: a watcher can be
+                    // alive and still have missed events (a stopped process, a
+                    // kernel queue overflow, a directory it could not watch), and
+                    // nothing would ever repair that. A stat-only reconcile is the
+                    // cheap middle: one walk and one stat per file, no reads unless
+                    // a file's mtime/size disagrees with the index.
+                    let store_bg = store.clone();
+                    let root_bg = root.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let state =
+                            match icode_engine::reconcile_by_stat(&root_bg, store_bg.as_ref(), &root_bg) {
+                                Ok(s) => {
+                                    eprintln!(
+                                        "icode serve: watcher already running (pid {pid}) — skipping the \
+                                         startup pass; stat check: {} reindexed, {} deleted, {} unchanged",
+                                        s.files_indexed, s.files_deleted, s.files_skipped
+                                    );
+                                    icode_serve::mcp::GraphSync::Ready
+                                }
+                                Err(e) => {
+                                    eprintln!("icode serve: stat check failed ({e}); serving existing index");
+                                    icode_serve::mcp::GraphSync::Failed
+                                }
+                            };
+                        signal.finish(state);
+                    });
                 } else {
                     let store_bg = store.clone();
                     let root_bg = root.clone();
