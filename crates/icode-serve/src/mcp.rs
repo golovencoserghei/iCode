@@ -213,6 +213,9 @@ pub struct GraphArgs {
     /// chain: only walk edges at or above this certainty — exact | inferred |
     /// ambiguous (default ambiguous = any edge).
     pub min_certainty: Option<String>,
+    /// chain: return an object with per-hop confidence/certainty and the chain's
+    /// weakest link instead of the plain array of names (default false).
+    pub detail: Option<bool>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -1040,12 +1043,15 @@ impl CodeMcpServer {
 
     /// `graph op=chain`: the path, each hop with its confidence, and the chain's own
     /// trust = its weakest hop.
-    async fn chain_reply(&self, from: String, to: String, max_depth: usize, min: Certainty) -> String {
+    async fn chain_reply(&self, from: String, to: String, max_depth: usize, min: Certainty, detail: bool) -> String {
         let store = self.store.clone();
+        let source = from.clone();
         let result =
             tokio::task::spawn_blocking(move || store.call_chain_hops(&from, &to, max_depth, min)).await;
         match result {
-            Ok(Ok(hops)) => chain_json(hops, min).to_string(),
+            Ok(Ok(hops)) if detail => chain_json(&source, hops, min).to_string(),
+            // The original shape: a bare array of names, `[]` when unreachable.
+            Ok(Ok(hops)) => chain_json(&source, hops, min)["path"].to_string(),
             Ok(Err(e)) => err_json(&e.to_string()),
             Err(e) => err_json(&e.to_string()),
         }
@@ -1703,7 +1709,7 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Call/import graph. op: chain (target->to; each hop labelled exact|inferred|ambiguous, the chain is as strong as its weakest hop; `min_certainty` walks only trusted edges) | impact (reverse deps of a file) | deps (a file's deps).")]
+    #[tool(description = "Call/import graph. op: chain (target->to, an array of names; detail=true adds each hop's certainty exact|inferred|ambiguous and the chain's weakest link; `min_certainty` walks only trusted edges) | impact (reverse deps of a file) | deps (a file's deps).")]
     async fn graph(&self, Parameters(a): Parameters<GraphArgs>) -> String {
         let note = self.await_graph().await;
         tag_sync(note, self.graph_on_graph(Parameters(a)).await)
@@ -1720,7 +1726,7 @@ impl CodeMcpServer {
                     Ok(m) => m,
                     Err(e) => return err_json(&e),
                 };
-                self.chain_reply(a.target, to, a.depth.unwrap_or(12), min).await
+                self.chain_reply(a.target, to, a.depth.unwrap_or(12), min, a.detail.unwrap_or(false)).await
             }
             "impact" => {
                 self.impact_analysis(Parameters(ImpactArgs {
@@ -2453,10 +2459,11 @@ fn annotate_context(json: String, min: Certainty) -> String {
     if touched { v.to_string() } else { json }
 }
 
-/// `graph op=chain` reply. `path` is the old array of names; `hops` carry each
+/// `graph op=chain detail=true` reply (without `detail` only `path` is returned,
+/// the original bare array). `path` is the array of names; `hops` carry each
 /// edge's confidence; `confidence`/`certainty` are the weakest hop; `text` is the
 /// same path in one readable line (`a -> b [exact] -> c [inferred]`).
-fn chain_json(hops: Option<Vec<icode_core::model::ChainHop>>, min: Certainty) -> serde_json::Value {
+fn chain_json(from: &str, hops: Option<Vec<icode_core::model::ChainHop>>, min: Certainty) -> serde_json::Value {
     let Some(hops) = hops else {
         return serde_json::json!({
             "path": [],
@@ -2467,9 +2474,17 @@ fn chain_json(hops: Option<Vec<icode_core::model::ChainHop>>, min: Certainty) ->
     };
     let mut path: Vec<&str> = Vec::with_capacity(hops.len() + 1);
     let mut text = String::new();
-    if let Some(first) = hops.first() {
-        path.push(&first.from);
-        text.push_str(&first.from);
+    // `from` is `to`: the one-name path the old reply gave.
+    let bare = from.rsplit(['.', ':', '\\']).next().unwrap_or(from);
+    match hops.first() {
+        Some(first) => {
+            path.push(&first.from);
+            text.push_str(&first.from);
+        }
+        None => {
+            path.push(bare);
+            text.push_str(bare);
+        }
     }
     for h in &hops {
         path.push(&h.to);
@@ -2686,12 +2701,15 @@ mod tests {
             confidence: c,
             certainty: Certainty::from_confidence(c),
         };
-        let v = chain_json(Some(vec![hop("a", "b", 0.9), hop("b", "c", 0.4)]), Certainty::Ambiguous);
+        let v = chain_json("a", Some(vec![hop("a", "b", 0.9), hop("b", "c", 0.4)]), Certainty::Ambiguous);
         assert_eq!(v["path"], serde_json::json!(["a", "b", "c"]));
         assert_eq!(v["certainty"], "ambiguous");
         assert!((v["confidence"].as_f64().unwrap() - 0.4).abs() < 1e-6);
         assert_eq!(v["text"], "a -> b [exact] -> c [ambiguous]");
-        let none = chain_json(None, Certainty::Exact);
+        // Without `detail` the reply is the original bare array.
+        assert_eq!(v["path"].to_string(), r#"["a","b","c"]"#);
+        assert_eq!(chain_json("Svc::a", Some(vec![]), Certainty::Ambiguous)["path"], serde_json::json!(["a"]));
+        let none = chain_json("a", None, Certainty::Exact);
         assert_eq!(none["found"], false);
         assert_eq!(none["path"], serde_json::json!([]));
     }
