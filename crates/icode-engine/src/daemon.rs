@@ -9,7 +9,7 @@
 //!   3. watch `root` recursively via `notify` + `notify-debouncer-full` (≈1 s
 //!      debounce, so a save-storm / rename pair collapses into one batch);
 //!   4. per batch: delete vanished files, re-index changed/created ones through
-//!      [`index_one_file`].
+//!      [`index_one_file`](crate::index::index_one_file).
 //!
 //! Embedding is DELIBERATELY NOT done here. The graph (parse → symbols → SQLite)
 //! is cheap and always-correct, so keeping it live on every change is free; but
@@ -20,7 +20,7 @@
 //! drains the pending queue, cache-accelerated), or explicitly via `icode embed`.
 //! The daemon just leaves freshly-changed chunks in the pending queue.
 //!
-//! Path form is load-bearing: see [`index_one_file`] — the watcher reconstructs
+//! Path form is load-bearing: see [`index_one_file`](crate::index::index_one_file) — the watcher reconstructs
 //! each changed path under the *canonicalised* `root` so the row keys match what
 //! the indexer wrote (otherwise `delete_file`/`upsert` would miss).
 //!
@@ -29,6 +29,7 @@
 //! After a long idle period with no live client the daemon exits on its own — see
 //! [`should_exit_idle`].
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -36,13 +37,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use icode_core::error::{Error, Result};
-use icode_core::traits::CodeWriteStore;
 use notify::event::{AccessKind, AccessMode};
 use notify::{EventKind, RecursiveMode};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 
 use crate::index::{
-    error_fingerprint, index_one_file, index_path, reconcile_by_stat, is_in_excluded_dir, is_in_linked_worktree, is_supported_source,
+    delete_one_file_noting, error_fingerprint, index_one_file_noting, index_path, is_excluded_below, is_in_linked_worktree,
+    is_supported_source, reconcile_by_stat,
 };
 use crate::store::SqliteCodeStore;
 
@@ -300,6 +301,10 @@ fn process_batch(root: &Path, store: &SqliteCodeStore, mut paths: Vec<PathBuf>) 
     let mut relevant = false;
     let mut reindexed = 0u64;
     let mut deleted = 0u64;
+    // Function names whose definition set this batch changed (before ∪ after of
+    // every re-indexed file, everything a deleted file defined). Edges from OTHER
+    // files to these names are re-graded once the whole batch is in place.
+    let mut touched: HashSet<String> = HashSet::new();
 
     for raw in paths {
         // Normalise to the indexer's key form: an absolute path under the
@@ -310,8 +315,10 @@ fn process_batch(root: &Path, store: &SqliteCodeStore, mut paths: Vec<PathBuf>) 
         // Skip anything the indexer itself would skip — excluded dirs (incl.
         // `.icode`, so our own db writes never feed back) and non-source files.
         // Linked worktrees below the root are other checkouts, not this tree's
-        // source — the same rule the indexer walk applies.
-        if is_in_excluded_dir(&path) || is_in_linked_worktree(root, &path) {
+        // source — the same rule the indexer walk applies. Both rules look only at
+        // the part of the path BELOW the root, as the walk does: a project that
+        // lives inside `~/.cache` or `…/build/` must still get its events.
+        if is_excluded_below(root, &path) || is_in_linked_worktree(root, &path) {
             continue;
         }
 
@@ -344,7 +351,7 @@ fn process_batch(root: &Path, store: &SqliteCodeStore, mut paths: Vec<PathBuf>) 
 
         if path.exists() {
             // Created or modified → re-index (replaces the file's old rows).
-            match index_one_file(&path, store, root) {
+            match index_one_file_noting(&path, store, root, &mut touched) {
                 // A watcher event does NOT mean the bytes changed (atomic saves,
                 // `touch`, a container remounting the tree). `index_one_file` now
                 // hash-skips those and reports them as skipped, so an idle project
@@ -366,7 +373,7 @@ fn process_batch(root: &Path, store: &SqliteCodeStore, mut paths: Vec<PathBuf>) 
             }
         } else {
             // Deleted (or moved away) → drop its rows by the stored key.
-            match store.delete_file(&path.to_string_lossy()) {
+            match delete_one_file_noting(store, &path.to_string_lossy(), &mut touched) {
                 Ok(()) => deleted += 1,
                 Err(e) => log(&format!("daemon: delete failed {} ({e})", path.display())),
             }
@@ -375,6 +382,13 @@ fn process_batch(root: &Path, store: &SqliteCodeStore, mut paths: Vec<PathBuf>) 
 
     if reindexed == 0 && deleted == 0 {
         return relevant; // nothing changed (noise, or unchanged bytes)
+    }
+
+    // `index_one_file_noting` graded each file's OWN outgoing edges; an edge in an
+    // untouched file to a function this batch renamed, removed, added or duplicated
+    // still carries the grade of the old definition set. Re-grade exactly those.
+    if let Err(e) = store.regrade_calls_to(&touched) {
+        log(&format!("daemon: cross-file edge re-grade failed ({e}) — some edge confidences may be stale"));
     }
 
     // Graph centrality is a WHOLE-GRAPH property: editing one file can change the rank

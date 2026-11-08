@@ -152,7 +152,10 @@ pub fn walk_source_files(root: &Path) -> Vec<std::path::PathBuf> {
     WalkDir::new(root)
         .into_iter()
         .filter_entry(|e| {
-            !is_excluded_dir(e.path())
+            // The walk root itself is never excluded, whatever it is named: only
+            // directories BELOW it are matched (a project checked out as `…/build`
+            // is still a project).
+            !(e.depth() > 0 && is_excluded_dir(e.path()))
                 && !(e.depth() > 0 && e.file_type().is_dir() && is_linked_worktree_below(root, e.path()))
         })
         .filter_map(|e| e.ok())
@@ -384,7 +387,9 @@ pub fn reconcile_by_stat(root: &Path, store: &SqliteCodeStore, under: &Path) -> 
             stats.files_skipped += 1;
             continue;
         }
-        match index_one_file(path, store, root) {
+        // The whole-graph `resolve_call_edges(None)` below re-grades every edge, so
+        // the per-file cross-file re-grade would only repeat it.
+        match index_one_file_scoped(path, store, root) {
             Ok(s) if s.files_indexed == 0 => stats.files_skipped += 1,
             Ok(s) => {
                 any_change = true;
@@ -591,6 +596,46 @@ fn mtime_secs(meta: &Metadata) -> i64 {
 /// success). An unsupported extension or a read/parse failure is an `Err` — the
 /// daemon turns that into a `record_parse_error` and keeps running.
 pub fn index_one_file(path: &Path, store: &SqliteCodeStore, root: &Path) -> Result<IndexStats> {
+    let mut touched = HashSet::new();
+    let stats = index_one_file_noting(path, store, root, &mut touched)?;
+    store.regrade_calls_to(&touched)?;
+    Ok(stats)
+}
+
+/// [`index_one_file`] without the cross-file re-grade: the names of the functions
+/// the file defined before and after are added to `touched`, so a caller indexing a
+/// BATCH (the daemon) re-grades the edges to all of them once, after every file of
+/// the batch is in place — see [`SqliteCodeStore::regrade_calls_to`]. Nothing is
+/// added when the file turned out unchanged.
+pub fn index_one_file_noting(
+    path: &Path,
+    store: &SqliteCodeStore,
+    root: &Path,
+    touched: &mut HashSet<String>,
+) -> Result<IndexStats> {
+    let key = path.to_string_lossy();
+    let before = store.function_names_in_file(&key)?;
+    let stats = index_one_file_scoped(path, store, root)?;
+    let after = store.function_names_in_file(&key)?;
+    // An oversize file is dropped yet reported as skipped: compare the name sets
+    // too, so its vanished definitions still re-grade their callers.
+    if stats.files_indexed > 0 || before != after {
+        touched.extend(before);
+        touched.extend(after);
+    }
+    Ok(stats)
+}
+
+/// Delete one file's rows (a file that vanished from disk), adding the names of the
+/// functions it defined to `touched` — their callers elsewhere just lost a
+/// definition. The deletion counterpart of [`index_one_file_noting`].
+pub fn delete_one_file_noting(store: &SqliteCodeStore, key: &str, touched: &mut HashSet<String>) -> Result<()> {
+    touched.extend(store.function_names_in_file(key)?);
+    store.delete_file(key)
+}
+
+/// Re-index one file and re-grade only ITS outgoing edges (no cross-file pass).
+fn index_one_file_scoped(path: &Path, store: &SqliteCodeStore, root: &Path) -> Result<IndexStats> {
     let counts = index_file(path, store, root)?;
     // `index_file` returns zeroed counts when the content hash matched and it skipped
     // the reparse. Report that as SKIPPED, not indexed: the daemon uses this to decide
@@ -624,11 +669,27 @@ pub fn is_supported_source(path: &Path) -> bool {
     language_for(path).is_some()
 }
 
+/// Whether the changed `path` is one the indexer walk of `root` skips because of an
+/// excluded directory — the daemon's per-event form of the walk's rule.
+///
+/// Only the components BELOW `root` count. The walk matches directory names
+/// relative to its root, so a project that itself lives under `~/.cache/…`,
+/// `/srv/build/app` or `…/dist/…` is indexed in full; checking the absolute path
+/// here made the daemon drop EVERY event of such a project, and its graph never
+/// changed again after the first pass. A path outside `root` is never this tree's
+/// source and counts as excluded. `.icode` is in the set, so the daemon never
+/// reacts to its own db writes.
+pub fn is_excluded_below(root: &Path, path: &Path) -> bool {
+    match path.strip_prefix(root) {
+        Ok(rel) => is_in_excluded_dir(rel),
+        Err(_) => true,
+    }
+}
+
 /// Directory component names the indexer (and therefore the daemon) skips wholesale
-/// — build artefacts, VCS metadata, dependency caches. Exposed so the daemon's
-/// watch loop can drop events under any excluded directory using the *same* set the
-/// indexer walks with (a divergence would make the daemon index files `index_path`
-/// never sees). `.icode` is in the set, so the daemon never reacts to its own db writes.
+/// — build artefacts, VCS metadata, dependency caches — matched on EVERY component
+/// of `path`. Pass a path relative to the walk root (see [`is_excluded_below`]): an
+/// absolute path also matches the root's own ancestors.
 pub fn is_in_excluded_dir(path: &Path) -> bool {
     path.components().any(|c| match c {
         std::path::Component::Normal(name) => name
@@ -865,7 +926,7 @@ fn is_excluded_dir(path: &Path) -> bool {
 
 #[cfg(test)]
 mod exclude_tests {
-    use super::{is_excluded_dir, is_in_excluded_dir, is_in_linked_worktree, walk_source_files};
+    use super::{is_excluded_below, is_excluded_dir, is_in_excluded_dir, is_in_linked_worktree, walk_source_files};
     use std::path::Path;
 
     /// `dir/.git` as a FILE pointing at `gitdir`.
@@ -964,5 +1025,29 @@ mod exclude_tests {
         assert!(is_excluded_dir(Path::new("/home/u/.cache")));
         assert!(is_excluded_dir(Path::new("/home/u/proj/target")));
         assert!(!is_excluded_dir(Path::new("/home/u/proj/src")));
+    }
+
+    #[test]
+    fn exclusion_looks_only_below_the_root() {
+        // The root's own ancestors may be named anything — a checkout under
+        // `~/.cache`, `/srv/build/app` or `…/dist/…` is still a project.
+        for root in ["/home/u/.cache/x", "/srv/build/app", "/w/dist/p", "/home/u/.local/src/p"] {
+            let root = Path::new(root);
+            assert!(!is_excluded_below(root, &root.join("src/a.ts")), "kept: {}", root.display());
+            assert!(is_excluded_below(root, &root.join("build/x.ts")), "<root>/build excluded");
+            assert!(is_excluded_below(root, &root.join(".icode/index.db")));
+            assert!(is_excluded_below(root, &root.join("pkg/node_modules/m/i.js")));
+        }
+        // Outside the root is never this tree's source.
+        assert!(is_excluded_below(Path::new("/srv/app"), Path::new("/srv/other/a.ts")));
+    }
+
+    #[test]
+    fn a_root_named_like_an_excluded_dir_is_walked() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path().join(".cache/build");
+        src(&root.join("src"), "lib.rs");
+        src(&root.join("build"), "gen.rs");
+        assert_eq!(walked(&root), vec!["src/lib.rs"]);
     }
 }

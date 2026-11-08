@@ -3325,6 +3325,47 @@ fn import_segments(module: &str) -> Vec<String> {
         .collect()
 }
 
+/// Grade `confidence` by resolution method, then drop qualified guesses that match
+/// no definition — for the calls selected by `filter` (an ` AND …` clause on
+/// `calls`, bound by `args`; empty = every call). Shared by the path-scoped and
+/// whole-graph [`SqliteCodeStore::resolve_call_edges`] and the callee-scoped
+/// [`SqliteCodeStore::regrade_calls_to`], so all three grade identically.
+/// Returns the number of edges graded.
+fn grade_calls(conn: &Connection, filter: &str, args: &[&dyn rusqlite::types::ToSql]) -> Result<usize> {
+    // 1) Grade confidence by resolution method (uses the pre-null guess). A
+    //    receiver call whose receiver did NOT pin a definition is a guess about
+    //    an unknown value's type: never better than ambiguous.
+    let conf_sql = format!(
+        "UPDATE calls SET confidence = CASE \
+           WHEN resolved_callee IS NOT NULL \
+                AND (SELECT COUNT(*) FROM functions f WHERE f.qualified_name = calls.resolved_callee) = 1 THEN {q1} \
+           WHEN resolved_callee IS NOT NULL \
+                AND (SELECT COUNT(*) FROM functions f WHERE f.qualified_name = calls.resolved_callee) > 1 THEN {q2} \
+           WHEN is_method = 1 \
+                AND EXISTS (SELECT 1 FROM functions f WHERE f.name = calls.callee) THEN {b2} \
+           WHEN is_method = 1 THEN {u} \
+           WHEN (SELECT COUNT(*) FROM functions f WHERE f.name = calls.callee) = 1 THEN {b1} \
+           WHEN (SELECT COUNT(*) FROM functions f WHERE f.name = calls.callee) > 1 THEN {b2} \
+           ELSE {u} END \
+         WHERE 1=1{filter}",
+        q1 = CONF_QUALIFIED_UNIQUE,
+        q2 = CONF_QUALIFIED_MULTI,
+        b1 = CONF_BARE_UNIQUE,
+        b2 = CONF_BARE_COLLISION,
+        u = CONF_UNRESOLVED,
+    );
+    let graded = conn.execute(&conf_sql, args).map_err(store_err)?;
+    // 2) Drop qualified guesses that matched no real definition → the edge
+    //    reverts to bare-name (resolved_callee IS NULL) for the read queries.
+    let null_sql = format!(
+        "UPDATE calls SET resolved_callee = NULL \
+         WHERE resolved_callee IS NOT NULL \
+           AND NOT EXISTS (SELECT 1 FROM functions f WHERE f.qualified_name = calls.resolved_callee){filter}"
+    );
+    conn.execute(&null_sql, args).map_err(store_err)?;
+    Ok(graded)
+}
+
 /// Mark receiver calls that cannot target a FREE function with `is_method = 1`.
 ///
 /// Rust and PHP parsers set `is_method` from the grammar (`a.b()` vs `a::b()`). The
@@ -3482,37 +3523,7 @@ impl SqliteCodeStore {
         //    `mark_receiver_calls`: afterwards `is_method = 1` means exactly that, in
         //    every language, and every read query's soundness rule applies to it.
         mark_receiver_calls(&conn, path)?;
-        // 1) Grade confidence by resolution method (uses the pre-null guess). A
-        //    receiver call whose receiver did NOT pin a definition is a guess about
-        //    an unknown value's type: never better than ambiguous.
-        let conf_sql = format!(
-            "UPDATE calls SET confidence = CASE \
-               WHEN resolved_callee IS NOT NULL \
-                    AND (SELECT COUNT(*) FROM functions f WHERE f.qualified_name = calls.resolved_callee) = 1 THEN {q1} \
-               WHEN resolved_callee IS NOT NULL \
-                    AND (SELECT COUNT(*) FROM functions f WHERE f.qualified_name = calls.resolved_callee) > 1 THEN {q2} \
-               WHEN is_method = 1 \
-                    AND EXISTS (SELECT 1 FROM functions f WHERE f.name = calls.callee) THEN {b2} \
-               WHEN is_method = 1 THEN {u} \
-               WHEN (SELECT COUNT(*) FROM functions f WHERE f.name = calls.callee) = 1 THEN {b1} \
-               WHEN (SELECT COUNT(*) FROM functions f WHERE f.name = calls.callee) > 1 THEN {b2} \
-               ELSE {u} END \
-             WHERE 1=1{filter}",
-            q1 = CONF_QUALIFIED_UNIQUE,
-            q2 = CONF_QUALIFIED_MULTI,
-            b1 = CONF_BARE_UNIQUE,
-            b2 = CONF_BARE_COLLISION,
-            u = CONF_UNRESOLVED,
-        );
-        conn.execute(&conf_sql, args.as_slice()).map_err(store_err)?;
-        // 2) Drop qualified guesses that matched no real definition → the edge
-        //    reverts to bare-name (resolved_callee IS NULL) for the read queries.
-        let null_sql = format!(
-            "UPDATE calls SET resolved_callee = NULL \
-             WHERE resolved_callee IS NOT NULL \
-               AND NOT EXISTS (SELECT 1 FROM functions f WHERE f.qualified_name = calls.resolved_callee){filter}"
-        );
-        conn.execute(&null_sql, args.as_slice()).map_err(store_err)?;
+        grade_calls(&conn, filter, args.as_slice())?;
         if path.is_none() {
             conn.execute(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
@@ -3526,6 +3537,70 @@ impl SqliteCodeStore {
         // extra rebuild is cheaper than risking a stale graph).
         self.bump_graph_epoch();
         Ok(())
+    }
+
+    /// Bare names of every function currently defined in `path` (the stored key).
+    /// The daemon snapshots these before and after re-indexing or deleting a file:
+    /// edges in OTHER files that call one of these names are graded against a
+    /// definition set that just changed — see [`Self::regrade_calls_to`].
+    pub fn function_names_in_file(&self, path: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(store_err)?;
+        let mut stmt = conn
+            .prepare_cached("SELECT DISTINCT name FROM functions WHERE path = ?1")
+            .map_err(store_err)?;
+        let rows = stmt.query_map([path], |r| r.get::<_, String>(0)).map_err(store_err)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(store_err)
+    }
+
+    /// Re-grade every call edge whose callee is one of `names`, wherever its caller
+    /// lives — the same grading as [`Self::resolve_call_edges`], filtered by callee
+    /// instead of by path.
+    ///
+    /// `index_one_file` only re-grades the edited file's OUTGOING edges, but an
+    /// edge's grade depends on how many definitions its callee name has right now:
+    /// rename a function and the callers in untouched files kept `0.6 inferred`
+    /// against a definition that no longer exists; add a second definition and they
+    /// kept "unique" instead of `0.4 collision`. Every edge whose grade can move is
+    /// one whose callee name gained or lost a definition, and a qualified guess
+    /// (`Type::method`) always ends in that same bare callee — so the callee filter
+    /// covers both bands. Uses `idx_calls_callee`; cost scales with the edges to
+    /// those names, not with the graph. Returns the number of edges re-graded.
+    pub fn regrade_calls_to(&self, names: &HashSet<String>) -> Result<usize> {
+        if names.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.lock().map_err(store_err)?;
+        conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS regrade_names (name TEXT PRIMARY KEY); \
+             SAVEPOINT regrade; DELETE FROM temp.regrade_names;",
+        )
+        .map_err(store_err)?;
+        let run = || -> Result<usize> {
+            {
+                let mut ins = conn
+                    .prepare_cached("INSERT OR IGNORE INTO temp.regrade_names (name) VALUES (?1)")
+                    .map_err(store_err)?;
+                for n in names {
+                    ins.execute([n]).map_err(store_err)?;
+                }
+            }
+            grade_calls(&conn, " AND calls.callee IN (SELECT name FROM temp.regrade_names)", &[])
+        };
+        match run() {
+            Ok(n) => {
+                conn.execute_batch("DELETE FROM temp.regrade_names; RELEASE regrade")
+                    .map_err(store_err)?;
+                drop(conn);
+                if n > 0 {
+                    self.bump_graph_epoch();
+                }
+                Ok(n)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK TO regrade; RELEASE regrade");
+                Err(e)
+            }
+        }
     }
 
     fn resolve_symbol(
