@@ -1894,6 +1894,9 @@ impl CodeMcpServer {
     /// directory name. `serve` already anchors the root at the working-tree top,
     /// so this matches the name the memory tools use for the same checkout.
     fn project_name(&self) -> String {
+        if let Some(shared) = icode_engine::project_marker(&self.root) {
+            return shared;
+        }
         self.root
             .file_name()
             .and_then(|n| n.to_str())

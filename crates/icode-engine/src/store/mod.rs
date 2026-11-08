@@ -37,6 +37,9 @@ pub use vector::Vec0Index;
 /// rebuild handles the added columns; no in-place migration.
 const SCHEMA_VERSION: i64 = 9;
 
+/// Bytes a checkpoint may leave in the `-wal` file (`PRAGMA journal_size_limit`).
+const JOURNAL_SIZE_LIMIT: i64 = 64 * 1024 * 1024;
+
 /// A graph node's identity: `module\u{1}qualified_name`. Keying by name ALONE collapses
 /// every homonym in the tree into one node, which in a monorepo silently rewrites the
 /// graph (see `compute_symbol_ranks`). The separator is a control char so it cannot
@@ -163,6 +166,40 @@ impl SqliteCodeStore {
 
         let conn = Connection::open(&db_path).map_err(store_err)?;
         Self::from_conn(conn)
+    }
+
+    /// Open an EXISTING index read-only: no `.icode` dir creation, no deletion of
+    /// an incompatible file, no DDL and no PRAGMA writes. `Ok(None)` when there is
+    /// no index at `<root>/.icode/index.db` or its schema generation is not the
+    /// current one (the caller reports "not indexed"). Used by the one-shot
+    /// `icode host` reads, which must never mutate a project's tree.
+    pub fn open_existing_readonly(root: &Path, busy_ms: u64) -> Result<Option<Self>> {
+        use rusqlite::OpenFlags;
+        register_sqlite_vec();
+        let db_path = root.join(".icode").join("index.db");
+        if !db_path.is_file() {
+            return Ok(None);
+        }
+        let conn = Connection::open_with_flags(
+            &db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(store_err)?;
+        conn.busy_timeout(std::time::Duration::from_millis(busy_ms)).map_err(store_err)?;
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .map_err(store_err)?;
+        if version != SCHEMA_VERSION {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            cache_conn: None,
+            graph_epoch: AtomicU64::new(0),
+            adjacency_cache: Mutex::new(None),
+            #[cfg(test)]
+            rebuild_count: AtomicU64::new(0),
+        }))
     }
 
     /// Open an in-memory store (tests / ephemeral use). Always fresh.
@@ -1383,6 +1420,108 @@ impl SqliteCodeStore {
         collect(rows)
     }
 
+    /// Best-effort `PRAGMA wal_checkpoint(TRUNCATE)`: copy the WAL back into the
+    /// db and truncate the `-wal` file to zero bytes. Called after a write burst
+    /// (a daemon batch that changed rows, the end of a full pass) so the WAL does
+    /// not sit at its high-water mark between bursts.
+    ///
+    /// Never an error: a reader in another process (a `serve` mid-query) makes the
+    /// checkpoint report busy, and that just means the next burst tries again. The
+    /// busy timeout is shortened for the call so a checkpoint never holds this
+    /// store's connection for the full 5 s write timeout. Returns whether the WAL
+    /// was fully checkpointed.
+    pub fn checkpoint_truncate(&self) -> bool {
+        let Ok(conn) = self.conn.lock() else { return false };
+        let _ = conn.busy_timeout(std::time::Duration::from_millis(250));
+        let done = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get::<_, i64>(0))
+            .map(|busy| busy == 0)
+            .unwrap_or(false);
+        let _ = conn.busy_timeout(std::time::Duration::from_millis(5_000));
+        done
+    }
+
+    /// Record that `path` failed to index — once per version of the file.
+    ///
+    /// `fingerprint` identifies the bytes that failed (see
+    /// [`crate::index::error_fingerprint`]). If the stored error for `path` already
+    /// carries it, nothing is written and `false` comes back: the caller should not
+    /// log it again either. Otherwise the path's previous error rows are replaced by
+    /// this one and `true` comes back.
+    ///
+    /// The plain [`CodeWriteStore::record_parse_error`] appended a row per call, and
+    /// the daemon calls it on every watcher event: one non-UTF-8 file that something
+    /// kept touching produced a row and a log line per event, which is how a
+    /// `daemon.log` reached 202 MB.
+    pub fn record_parse_error_once(&self, path: &str, fingerprint: &str, error: &str) -> Result<bool> {
+        let mut conn = self.conn.lock().map_err(store_err)?;
+        let seen = conn
+            .prepare("SELECT 1 FROM parse_errors WHERE path = ?1 AND fingerprint = ?2")
+            .and_then(|mut st| st.exists(rusqlite::params![path, fingerprint]))
+            .map_err(store_err)?;
+        if seen {
+            return Ok(false);
+        }
+        let tx = conn.transaction().map_err(store_err)?;
+        tx.execute("DELETE FROM parse_errors WHERE path = ?1", rusqlite::params![path])
+            .map_err(store_err)?;
+        tx.execute(
+            "INSERT INTO parse_errors (path, error, fingerprint) VALUES (?1, ?2, ?3)",
+            rusqlite::params![path, error, fingerprint],
+        )
+        .map_err(store_err)?;
+        tx.commit().map_err(store_err)?;
+        Ok(true)
+    }
+
+    /// `(path, mtime, file_size)` of every indexed file strictly below the
+    /// directory `dir` (paths starting with `<dir>/`). A range scan on the UNIQUE
+    /// `files.path` index — `'/'` + 1 is `'0'` — so it costs nothing when the
+    /// answer is empty, which is the common case for a vanished non-source path.
+    pub fn files_under(&self, dir: &str) -> Result<Vec<(String, i64, u64)>> {
+        let base = dir.trim_end_matches('/');
+        let lo = format!("{base}/");
+        let hi = format!("{base}0");
+        let conn = self.conn.lock().map_err(store_err)?;
+        let mut stmt = conn
+            .prepare("SELECT path, mtime, file_size FROM files WHERE path >= ?1 AND path < ?2")
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![lo, hi], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)? as u64))
+            })
+            .map_err(store_err)?;
+        collect(rows)
+    }
+
+    /// Drop recorded parse errors for every path not in `on_disk`. A file that
+    /// failed to read was never in `files`, so deleting it from disk does not reach
+    /// `delete_file`; without this its error would be reported forever. Returns the
+    /// number of rows removed.
+    pub fn prune_parse_errors_except(&self, on_disk: &HashSet<String>) -> Result<u64> {
+        let conn = self.conn.lock().map_err(store_err)?;
+        let paths: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT DISTINCT path FROM parse_errors").map_err(store_err)?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).map_err(store_err)?;
+            collect(rows)?
+        };
+        let mut removed = 0u64;
+        for p in paths.iter().filter(|p| !on_disk.contains(p.as_str())) {
+            removed += conn
+                .execute("DELETE FROM parse_errors WHERE path = ?1", rusqlite::params![p])
+                .map_err(store_err)? as u64;
+        }
+        Ok(removed)
+    }
+
+    /// `VACUUM` the index: rebuild the file without its free pages. Expensive (it
+    /// rewrites the whole db and, under WAL, writes it through the WAL), so callers
+    /// run it only after a large purge; follow it with [`Self::checkpoint_truncate`].
+    pub fn vacuum(&self) -> Result<()> {
+        let conn = self.conn.lock().map_err(store_err)?;
+        conn.execute_batch("VACUUM").map_err(store_err)
+    }
+
     /// Read `PRAGMA user_version` from an existing db file via a throwaway
     /// connection (dropped before the caller may delete the file).
     fn db_is_current(db_path: &Path) -> Result<bool> {
@@ -1423,8 +1562,32 @@ impl SqliteCodeStore {
         // unbounded under the bulk-write indexer, while keeping commit-time fsync
         // off (synchronous=NORMAL only fsyncs at these checkpoints).
         conn.pragma_update(None, "wal_autocheckpoint", 1000).map_err(store_err)?;
+        // ...but an auto-checkpoint only REWINDS the WAL, it never shrinks the file:
+        // after one large pass the `-wal` stays at its high-water mark for as long as
+        // any connection is open (observed: 387 MB next to a long-lived daemon). Cap
+        // what a checkpoint leaves on disk; [`Self::checkpoint_truncate`] does the
+        // rest after a write burst.
+        conn.pragma_update(None, "journal_size_limit", JOURNAL_SIZE_LIMIT).map_err(store_err)?;
 
         conn.execute_batch(schema::SCHEMA).map_err(store_err)?;
+        // Additive column on a table that predates it: `CREATE TABLE IF NOT EXISTS`
+        // leaves an existing table alone, and a schema-version bump would throw the
+        // whole regenerable index away for one nullable column.
+        let has_fingerprint = conn
+            .prepare("SELECT 1 FROM pragma_table_info('parse_errors') WHERE name = 'fingerprint'")
+            .and_then(|mut st| st.exists([]))
+            .map_err(store_err)?;
+        // Several processes may open an old index at the same moment (parallel
+        // hooks, a serve per editor window): all see the column missing, one ALTER
+        // wins, the rest get "duplicate column name". That loser's goal — the
+        // column exists — is met, so it is success, not an error.
+        if !has_fingerprint {
+            if let Err(e) = conn.execute_batch("ALTER TABLE parse_errors ADD COLUMN fingerprint TEXT") {
+                if !e.to_string().contains("duplicate column name") {
+                    return Err(store_err(e));
+                }
+            }
+        }
         // Stamp the schema generation so a future incompatible version is detected.
         conn.pragma_update(None, "user_version", SCHEMA_VERSION).map_err(store_err)?;
         Ok(Self {
@@ -2524,6 +2687,9 @@ impl CodeWriteStore for SqliteCodeStore {
         // Replace the file row (ON DELETE CASCADE drops all its old graph rows).
         tx.execute("DELETE FROM files WHERE path = ?1", rusqlite::params![file.path])
             .map_err(store_err)?;
+        // It indexes now, so whatever failure was recorded for it is history.
+        tx.execute("DELETE FROM parse_errors WHERE path = ?1", rusqlite::params![file.path])
+            .map_err(store_err)?;
         tx.execute(
             "INSERT INTO files (path, language, content_hash, ast_hash, lines_total, mtime, file_size, module) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -2716,6 +2882,9 @@ impl CodeWriteStore for SqliteCodeStore {
         // returning symbols from a file nobody can open. The `code_chunks_ad`
         // trigger mirrors the delete into `vec_code`.
         tx.execute("DELETE FROM code_chunks WHERE path = ?1", rusqlite::params![path])
+            .map_err(store_err)?;
+        // A file that left the index has no parse error worth reporting either.
+        tx.execute("DELETE FROM parse_errors WHERE path = ?1", rusqlite::params![path])
             .map_err(store_err)?;
         tx.commit().map_err(store_err)?;
         // ON DELETE CASCADE dropped the file's `calls` rows → invalidate the cache.

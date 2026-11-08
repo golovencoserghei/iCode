@@ -24,17 +24,21 @@ pub mod vault;
 pub mod verify;
 
 pub use chunk::{chunks_for_file, rel_display_path, CHUNK_BUDGET_BYTES};
-pub use daemon::{run_daemon, DaemonLock};
+pub use daemon::{
+    classify_watch_result, idle_timeout, is_content_event, run_daemon, should_exit_idle, DaemonLock, WatchMsg, HEARTBEAT_EVERY,
+    SERVE_HEARTBEAT,
+};
 pub use doctor::{diagnose, DiagnosticReport};
 pub use embed::{embed_pending, embed_pending_capped, EmbedStats};
 pub use index::{
-    index_one_file, index_path, is_in_excluded_dir, is_supported_source, walk_source_files,
+    error_fingerprint, index_one_file, index_path, is_in_excluded_dir, is_in_linked_worktree, is_linked_worktree_below,
+    is_supported_source, reconcile_by_stat, should_vacuum, walk_source_files,
     IndexStats,
 };
 pub use memory::{
     auto_summary_content, curate, Archived, CurateConfig, CurateReport, DuplicatePair, digest_transcript, effective_score, is_l0, parse_stop_input, rank,
     redact_secrets, remove_auto_summary, Redaction, sanitize_fts5, sanitize_nl, session_end, session_start,
-    upsert_auto_summary, SessionEnd, SessionStart, RenameReport, SqliteMemoryStore, StopHookInput,
+    upsert_auto_summary, project_marker, validate_bucket_name, validate_project_name, PROJECT_MARKER, SessionEnd, SessionStart, RenameReport, SqliteMemoryStore, StopHookInput,
     TranscriptDigest, WalStore, DEFAULT_PROFILE_NOTES, DEFAULT_PROJECT_MEMORIES,
 };
 pub use recall::{code_to_memory, recall, why_this_exists};

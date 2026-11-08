@@ -154,3 +154,208 @@ fn pid_lock_file_survives_drop_and_reacquires() {
     drop(again);
     assert!(lock_path.exists(), "lock file still present after the second drop");
 }
+
+/// (3) A daemon whose root disappears exits on its own instead of watching a
+/// deleted tree forever (deleted worktrees and scratch dirs used to leave one
+/// orphaned `icode daemon run` each).
+#[test]
+fn daemon_exits_when_its_root_disappears() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = std::fs::canonicalize(dir.path()).expect("canon root").join("proj");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("lib.rs"), V1).unwrap();
+    // The store lives OUTSIDE the root so removing the tree does not pull the db
+    // out from under the test's own assertions.
+    let store_dir = tempfile::tempdir().expect("store dir");
+    let store = SqliteCodeStore::open(store_dir.path()).expect("open store");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let watched = root.clone();
+    std::thread::spawn(move || {
+        let r = icode_engine::run_daemon(&watched, store);
+        let _ = tx.send(r.is_ok());
+    });
+    // Wait until the daemon holds its lock (it is watching), then delete the tree.
+    let lock = root.join(".icode/daemon.lock");
+    for _ in 0..100 {
+        if fs::read_to_string(&lock).map(|s| !s.trim().is_empty()).unwrap_or(false) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    fs::remove_dir_all(&root).unwrap();
+    let exited = rx.recv_timeout(std::time::Duration::from_secs(10));
+    assert_eq!(exited, Ok(true), "daemon must exit cleanly once its root is gone");
+}
+
+/// (5) Reads are not changes. The inotify backend reports every open as
+/// `Access(Open)`; if the daemon re-indexed on those, its own read of a file would
+/// schedule the next read forever. Only events that can change bytes or existence
+/// may reach the re-index path.
+#[test]
+fn reads_do_not_trigger_reindex_but_changes_do() {
+    use icode_engine::is_content_event;
+    use notify::event::{
+        AccessKind, AccessMode, CreateKind, DataChange, EventKind, MetadataKind, ModifyKind,
+        RemoveKind, RenameMode,
+    };
+
+    for read in [
+        EventKind::Access(AccessKind::Open(AccessMode::Any)),
+        EventKind::Access(AccessKind::Read),
+        EventKind::Access(AccessKind::Close(AccessMode::Read)),
+        EventKind::Access(AccessKind::Any),
+        EventKind::Other,
+    ] {
+        assert!(!is_content_event(&read), "{read:?} must not re-index");
+    }
+    for change in [
+        EventKind::Create(CreateKind::File),
+        EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+        EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+        EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+        EventKind::Remove(RemoveKind::File),
+        EventKind::Access(AccessKind::Close(AccessMode::Write)),
+        EventKind::Any,
+    ] {
+        assert!(is_content_event(&change), "{change:?} must re-index");
+    }
+}
+
+// ──────────────────────────── idle exit ────────────────────────────
+
+mod idle_exit {
+    use icode_engine::should_exit_idle;
+    use std::time::{Duration, SystemTime};
+
+    const IDLE: Duration = Duration::from_secs(6 * 3600);
+    fn ago(now: SystemTime, secs: u64) -> SystemTime {
+        now - Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn recent_events_keep_the_daemon_alive_even_without_a_client() {
+        let now = SystemTime::now();
+        assert!(!should_exit_idle(now, ago(now, 60), None, IDLE));
+    }
+
+    #[test]
+    fn a_fresh_heartbeat_keeps_an_idle_daemon_alive() {
+        let now = SystemTime::now();
+        assert!(!should_exit_idle(now, ago(now, 7 * 3600), Some(ago(now, 30)), IDLE));
+    }
+
+    #[test]
+    fn no_events_and_a_stale_heartbeat_mean_exit() {
+        let now = SystemTime::now();
+        assert!(should_exit_idle(now, ago(now, 7 * 3600), Some(ago(now, 7 * 3600)), IDLE));
+        assert!(should_exit_idle(now, ago(now, 6 * 3600), Some(ago(now, 6 * 3600)), IDLE), "boundary is inclusive");
+    }
+
+    #[test]
+    fn no_events_and_no_heartbeat_file_mean_exit() {
+        let now = SystemTime::now();
+        assert!(should_exit_idle(now, ago(now, 7 * 3600), None, IDLE));
+    }
+
+    #[test]
+    fn timestamps_from_the_future_count_as_now() {
+        let now = SystemTime::now();
+        let future = now + Duration::from_secs(3600);
+        assert!(!should_exit_idle(now, future, None, IDLE));
+        assert!(!should_exit_idle(now, ago(now, 7 * 3600), Some(future), IDLE));
+    }
+}
+
+// ──────────────────────────── lost events / liveness ────────────────────────────
+
+mod lost_events {
+    use icode_engine::{classify_watch_result, WatchMsg};
+    use notify::event::{AccessKind, CreateKind, Event, EventKind, Flag};
+    use notify_debouncer_full::DebouncedEvent;
+    use std::path::PathBuf;
+    use std::time::Instant;
+
+    fn ev(kind: EventKind, path: &str) -> DebouncedEvent {
+        DebouncedEvent::new(Event::new(kind).add_path(PathBuf::from(path)), Instant::now())
+    }
+
+    #[test]
+    fn a_queue_overflow_asks_for_a_rescan() {
+        let overflow = DebouncedEvent::new(Event::new(EventKind::Other).set_flag(Flag::Rescan), Instant::now());
+        let msg = classify_watch_result(Ok(vec![ev(EventKind::Create(CreateKind::File), "/t/a.rs"), overflow]));
+        assert!(matches!(msg, WatchMsg::Rescan(_)), "{msg:?}");
+    }
+
+    #[test]
+    fn a_backend_error_asks_for_a_rescan() {
+        let msg = classify_watch_result(Err(vec![notify::Error::generic("max_user_watches reached")]));
+        assert!(matches!(msg, WatchMsg::Rescan(ref why) if why.contains("max_user_watches")), "{msg:?}");
+    }
+
+    #[test]
+    fn reads_are_noise_and_changes_are_paths() {
+        assert_eq!(classify_watch_result(Ok(vec![ev(EventKind::Access(AccessKind::Any), "/t/a.rs")])), WatchMsg::Noise);
+        assert_eq!(
+            classify_watch_result(Ok(vec![ev(EventKind::Create(CreateKind::File), "/t/a.rs")])),
+            WatchMsg::Paths(vec![PathBuf::from("/t/a.rs")])
+        );
+    }
+}
+
+#[test]
+fn lock_liveness_follows_the_flock_not_the_pid() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(!DaemonLock::is_held(dir.path()), "no lock file: no daemon");
+    let lock = DaemonLock::acquire(dir.path()).unwrap();
+    assert!(DaemonLock::is_held(dir.path()));
+    drop(lock);
+    // The file still names our (very much alive) pid — that must not count.
+    assert!(!DaemonLock::is_held(dir.path()), "a released lock means no daemon, whatever pid the file holds");
+}
+
+/// A directory moved INTO the tree arrives as one event for the directory; its
+/// files must still land in the graph, and leave it when the directory moves out.
+#[test]
+fn a_directory_moved_in_and_out_is_reflected_in_the_graph() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = std::fs::canonicalize(dir.path()).unwrap().join("proj");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("lib.rs"), V1).unwrap();
+    let store = SqliteCodeStore::open(&root).expect("open store");
+    let reader = SqliteCodeStore::open(&root).expect("open reader");
+
+    let watched = root.clone();
+    std::thread::spawn(move || {
+        let _ = icode_engine::run_daemon(&watched, store);
+    });
+    let lock = root.join(".icode/daemon.lock");
+    for _ in 0..100 {
+        if fs::read_to_string(&lock).map(|s| !s.trim().is_empty()).unwrap_or(false) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let outside = tempfile::tempdir().unwrap();
+    let pkg = outside.path().join("pkg");
+    fs::create_dir_all(pkg.join("deep")).unwrap();
+    fs::write(pkg.join("deep/moved.rs"), "pub fn moved_in() {}\n").unwrap();
+    fs::rename(&pkg, root.join("pkg")).unwrap();
+    let moved = root.join("pkg/deep/moved.rs").to_string_lossy().to_string();
+    let wait_for = |want: bool| {
+        for _ in 0..60 {
+            if reader.stat_file(&moved).unwrap().is_some() == want {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
+    };
+    assert!(wait_for(true), "a moved-in directory's files must be indexed");
+    fs::rename(root.join("pkg"), outside.path().join("back")).unwrap();
+    assert!(wait_for(false), "a moved-out directory's files must leave the index");
+    fs::remove_dir_all(&root).unwrap(); // stops the daemon
+}

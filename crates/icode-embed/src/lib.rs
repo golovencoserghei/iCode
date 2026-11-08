@@ -4,8 +4,10 @@
 //! 1024). `FastEmbedder` (ONNX, offline fallback) lands in a later task.
 //! Both implement `icode_core::traits::Embedder`.
 
+pub mod fake;
 pub mod ollama;
 
+pub use fake::FakeEmbedder;
 pub use ollama::OllamaEmbedder;
 
 use icode_core::config::EmbedConfig;
@@ -20,6 +22,8 @@ use icode_core::traits::Embedder;
 pub fn build_embedder(cfg: &EmbedConfig) -> Result<Box<dyn Embedder>> {
     match cfg.backend.as_str() {
         "ollama" => Ok(Box::new(OllamaEmbedder::new(cfg)?)),
+        // Deterministic offline embedder for tests/CI (see `fake`).
+        "fake" => Ok(Box::new(FakeEmbedder::new(cfg.dim))),
         other => Err(Error::Config(format!(
             "embed backend not supported yet: {other} (fastembed fallback lands later)"
         ))),

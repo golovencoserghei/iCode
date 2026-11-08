@@ -205,12 +205,18 @@ fn hook_config_prints_valid_json_snippet() {
 // ──────────────────────────── hook stop (session_end safety net) ────────────────────────────
 
 /// Run `icode hook stop <args…>` feeding `stdin`; returns (stdout, exit_code).
+/// Offline: no embedder unless a test asks for the fake one.
 fn run_hook_stop(home: &Path, args: &[&str], stdin: &str) -> (String, i32) {
+    run_hook_stop_with(home, "none", args, stdin)
+}
+
+fn run_hook_stop_with(home: &Path, backend: &str, args: &[&str], stdin: &str) -> (String, i32) {
     use std::io::Write;
     let mut child = Command::new(icode_bin())
         .args(["hook", "stop"])
         .args(args)
         .env("HOME", home)
+        .env("ICODE_EMBED_BACKEND", backend)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -302,33 +308,117 @@ fn stop_hook_upserts_one_auto_summary_per_session() {
         transcript.display()
     );
 
-    // Exit 0 in EVERY environment. With a live embedder (Ollama up) the summary
-    // must exist and stay a SINGLE row across repeated Stop firings; with Ollama
-    // down the hook degrades to a silent no-op (0 rows) — both are correct.
+    // No embedder: the hook degrades to a silent no-op — nothing is written.
     let (stdout, code) = run_hook_stop(home.path(), &["--project", "demo"], &stdin);
     assert_eq!(code, 0);
     assert!(stdout.is_empty(), "stop must print nothing, got: {stdout}");
-    let after_first = count_auto_rows(&db, "sid:feed1234");
-    assert!(after_first <= 1, "at most one auto-summary, got {after_first}");
+    assert_eq!(count_auto_rows(&db, "sid:feed1234"), 0);
 
+    // With an embedder (the offline fake): exactly one summary, and repeated Stop
+    // firings refresh it instead of adding rows.
+    let (stdout, code) = run_hook_stop_with(home.path(), "fake", &["--project", "demo"], &stdin);
+    assert_eq!(code, 0);
+    assert!(stdout.is_empty(), "stop must print nothing, got: {stdout}");
+    assert_eq!(count_auto_rows(&db, "sid:feed1234"), 1);
+    let (_, code) = run_hook_stop_with(home.path(), "fake", &["--project", "demo"], &stdin);
+    assert_eq!(code, 0);
+    assert_eq!(count_auto_rows(&db, "sid:feed1234"), 1, "repeated Stop firings must upsert, not multiply rows");
+
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let (content, importance): (String, f64) = conn
+        .query_row(
+            "SELECT content, importance FROM memories WHERE project='demo' AND tags LIKE '%sid:feed1234%'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(content.contains("Задача: «почини баг"), "summary must cite the task: {content}");
+    assert!(content.contains("Итог:"), "summary must carry the outcome: {content}");
+    assert_eq!(importance, 1.0);
+}
+
+// ──────────────────────────── host-managed sessions ────────────────────────────
+
+/// Seed a row with an explicit id and category (the shared helper fixes both).
+fn seed_row(db: &Path, id: &str, category: &str, content: &str, importance: f64, tags: &[&str]) {
+    let conn = rusqlite::Connection::open(db).expect("open central db for seeding");
+    let tags_json = serde_json::to_string(tags).unwrap();
+    conn.execute(
+        "INSERT INTO memories (id, project, content, category, tags, importance, status, \
+         access_count, created_at, last_accessed_at, content_hash) \
+         VALUES (?1,'demo',?2,?3,?4,?5,'active',0,'2026-06-25T00:00:00+00:00','2026-06-25T00:00:00+00:00','h')",
+        params![id, content, category, tags_json, importance],
+    )
+    .expect("seed row");
+}
+
+#[test]
+fn stop_hook_treats_grouped_session_end_as_closing_the_session() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let db = ensure_db(home.path());
+    seed_memory(&db, "demo", "Авто-сводка: черновик", 1.0, &["auto-session", "sid:cafe1234"]);
+    let transcript = home.path().join("t.jsonl");
+    std::fs::write(
+        &transcript,
+        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__icode__session","input":{"op":"end","project":"demo","summary":"done"}}]}}"#,
+    )
+    .unwrap();
+    let stdin = format!(
+        r#"{{"session_id":"cafe1234-0000","transcript_path":"{}","cwd":"/tmp/demo"}}"#,
+        transcript.display()
+    );
     let (_, code) = run_hook_stop(home.path(), &["--project", "demo"], &stdin);
     assert_eq!(code, 0);
-    let after_second = count_auto_rows(&db, "sid:feed1234");
-    assert_eq!(
-        after_first, after_second,
-        "repeated Stop firings must upsert, not multiply rows"
-    );
+    assert_eq!(count_auto_rows(&db, "sid:cafe1234"), 0, "the grouped op=end call must delete the draft");
+}
 
-    if after_first == 1 {
-        let conn = rusqlite::Connection::open(&db).unwrap();
-        let content: String = conn
-            .query_row(
-                "SELECT content FROM memories WHERE project='demo' AND tags LIKE '%sid:feed1234%'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!(content.contains("Задача: «почини баг"), "summary must cite the task: {content}");
-        assert!(content.contains("Итог:"), "summary must carry the outcome: {content}");
-    }
+#[test]
+fn stop_hook_is_silent_under_a_host_that_writes_its_own_summary() {
+    use std::io::Write;
+    let home = tempfile::tempdir().expect("tempdir");
+    let db = ensure_db(home.path());
+    seed_memory(&db, "demo", "Авто-сводка: черновик", 1.0, &["auto-session", "sid:beef5678"]);
+    let transcript = home.path().join("t.jsonl");
+    std::fs::write(
+        &transcript,
+        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__icode__session_end","input":{}}]}}"#,
+    )
+    .unwrap();
+    let stdin = format!(
+        r#"{{"session_id":"beef5678-0000","transcript_path":"{}","cwd":"/tmp/demo"}}"#,
+        transcript.display()
+    );
+    let mut child = Command::new(icode_bin())
+        .args(["hook", "stop", "--project", "demo"])
+        .env("HOME", home.path())
+        .env("FLOWCODE_ICODE_HOST", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stdout.is_empty() && out.stderr.is_empty());
+    // Untouched: the hook did nothing at all, not even the delete.
+    assert_eq!(count_auto_rows(&db, "sid:beef5678"), 1);
+}
+
+#[test]
+fn session_start_hides_low_importance_drafts_but_not_tasks() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let db = ensure_db(home.path());
+    seed_row(&db, "mem_draft__demo", "general", "Авто-сводка сессии: черновик хода", 1.0, &["auto-session", "sid:0a0b0c0d"]);
+    seed_row(&db, "mem_kept__demo", "general", "Авто-сводка, поднятая до важной", 2.0, &["auto-session", "sid:0e0f0a0b"]);
+    seed_row(&db, "mem_todo__demo", "todo", "todo с тегом sid остаётся", 1.0, &["sid:01020304"]);
+    seed_row(&db, "mem_plain__demo", "decision", "обычное решение проекта", 3.0, &[]);
+
+    let (stdout, code) = run_hook(home.path(), &["session-start", "--project", "demo"]);
+    assert_eq!(code, 0);
+    assert_valid_hook_json(&stdout, "SessionStart");
+    assert!(!stdout.contains("черновик хода"), "draft must be hidden: {stdout}");
+    assert!(stdout.contains("поднятая до важной"), "importance>=2 stays: {stdout}");
+    assert!(stdout.contains("todo с тегом sid остаётся"), "todo is never filtered: {stdout}");
+    assert!(stdout.contains("обычное решение проекта"), "{stdout}");
 }

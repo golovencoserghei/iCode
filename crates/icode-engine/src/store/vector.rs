@@ -38,8 +38,10 @@ pub(crate) fn f32_blob(v: &[f32]) -> Vec<u8> {
 /// [`f32_blob`]). Trailing bytes that don't form a full f32 are ignored — a
 /// well-formed blob is always a multiple of 4 bytes.
 pub(crate) fn blob_to_f32(blob: &[u8]) -> Vec<f32> {
-    blob.chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    blob.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
         .collect()
 }
 
