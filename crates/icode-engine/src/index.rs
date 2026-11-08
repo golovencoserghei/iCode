@@ -387,7 +387,9 @@ pub fn reconcile_by_stat(root: &Path, store: &SqliteCodeStore, under: &Path) -> 
             stats.files_skipped += 1;
             continue;
         }
-        match index_one_file(path, store, root) {
+        // The whole-graph `resolve_call_edges(None)` below re-grades every edge, so
+        // the per-file cross-file re-grade would only repeat it.
+        match index_one_file_scoped(path, store, root) {
             Ok(s) if s.files_indexed == 0 => stats.files_skipped += 1,
             Ok(s) => {
                 any_change = true;
@@ -594,6 +596,46 @@ fn mtime_secs(meta: &Metadata) -> i64 {
 /// success). An unsupported extension or a read/parse failure is an `Err` — the
 /// daemon turns that into a `record_parse_error` and keeps running.
 pub fn index_one_file(path: &Path, store: &SqliteCodeStore, root: &Path) -> Result<IndexStats> {
+    let mut touched = HashSet::new();
+    let stats = index_one_file_noting(path, store, root, &mut touched)?;
+    store.regrade_calls_to(&touched)?;
+    Ok(stats)
+}
+
+/// [`index_one_file`] without the cross-file re-grade: the names of the functions
+/// the file defined before and after are added to `touched`, so a caller indexing a
+/// BATCH (the daemon) re-grades the edges to all of them once, after every file of
+/// the batch is in place — see [`SqliteCodeStore::regrade_calls_to`]. Nothing is
+/// added when the file turned out unchanged.
+pub fn index_one_file_noting(
+    path: &Path,
+    store: &SqliteCodeStore,
+    root: &Path,
+    touched: &mut HashSet<String>,
+) -> Result<IndexStats> {
+    let key = path.to_string_lossy();
+    let before = store.function_names_in_file(&key)?;
+    let stats = index_one_file_scoped(path, store, root)?;
+    let after = store.function_names_in_file(&key)?;
+    // An oversize file is dropped yet reported as skipped: compare the name sets
+    // too, so its vanished definitions still re-grade their callers.
+    if stats.files_indexed > 0 || before != after {
+        touched.extend(before);
+        touched.extend(after);
+    }
+    Ok(stats)
+}
+
+/// Delete one file's rows (a file that vanished from disk), adding the names of the
+/// functions it defined to `touched` — their callers elsewhere just lost a
+/// definition. The deletion counterpart of [`index_one_file_noting`].
+pub fn delete_one_file_noting(store: &SqliteCodeStore, key: &str, touched: &mut HashSet<String>) -> Result<()> {
+    touched.extend(store.function_names_in_file(key)?);
+    store.delete_file(key)
+}
+
+/// Re-index one file and re-grade only ITS outgoing edges (no cross-file pass).
+fn index_one_file_scoped(path: &Path, store: &SqliteCodeStore, root: &Path) -> Result<IndexStats> {
     let counts = index_file(path, store, root)?;
     // `index_file` returns zeroed counts when the content hash matched and it skipped
     // the reparse. Report that as SKIPPED, not indexed: the daemon uses this to decide

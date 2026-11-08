@@ -33,7 +33,7 @@ pub use daemon::{
 pub use doctor::{diagnose, DiagnosticReport};
 pub use embed::{embed_pending, embed_pending_capped, EmbedStats};
 pub use index::{
-    error_fingerprint, index_one_file, index_path, is_excluded_below,
+    delete_one_file_noting, error_fingerprint, index_one_file, index_one_file_noting, index_path, is_excluded_below,
     is_in_excluded_dir, is_in_linked_worktree, is_linked_worktree_below,
     is_supported_source, reconcile_by_stat, should_vacuum, walk_source_files,
     IndexStats,

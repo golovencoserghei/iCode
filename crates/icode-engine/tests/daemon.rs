@@ -360,13 +360,62 @@ fn a_directory_moved_in_and_out_is_reflected_in_the_graph() {
     fs::remove_dir_all(&root).unwrap(); // stops the daemon
 }
 
+/// Confidence of `caller_file`'s call edges to `callee` (one per call site).
+fn edge_confidence(root: &std::path::Path, caller_file: &str, callee: &str) -> Vec<f64> {
+    let db = rusqlite::Connection::open(root.join(".icode/index.db")).unwrap();
+    let mut stmt = db
+        .prepare("SELECT confidence FROM calls WHERE path LIKE '%/' || ?1 AND callee = ?2")
+        .unwrap();
+    let rows = stmt.query_map([caller_file, callee], |r| r.get::<_, f64>(0)).unwrap();
+    rows.map(Result::unwrap).collect()
+}
+
 const CALLER_TS: &str = "import { computeTotal } from './a';\nexport function run(): number {\n  return computeTotal(21);\n}\n";
 const DEF_TS: &str = "export function computeTotal(x: number): number {\n  return x * 2;\n}\n";
+
+/// An edit to the DEFINING file re-grades the edges of callers it never touched:
+/// the grade of `b.ts → computeTotal` depends on how many `computeTotal`s exist.
+#[test]
+fn editing_a_definition_regrades_callers_in_untouched_files() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.ts"), DEF_TS).unwrap();
+    fs::write(root.join("src/b.ts"), CALLER_TS).unwrap();
+    let store = SqliteCodeStore::open(&root).expect("open store");
+    icode_engine::index_path(&root, &store).unwrap();
+    assert_eq!(edge_confidence(&root, "b.ts", "computeTotal"), vec![0.6], "bare unique");
+
+    // Rename the definition; b.ts is not touched.
+    fs::write(root.join("src/a.ts"), DEF_TS.replace("computeTotal", "computeSum")).unwrap();
+    index_one_file(&keyed(&root, "src/a.ts"), &store, &root).unwrap();
+    assert_eq!(edge_confidence(&root, "b.ts", "computeTotal"), vec![0.3], "definition gone → unresolved");
+
+    // It comes back, then gains a twin in another file.
+    fs::write(root.join("src/a.ts"), DEF_TS).unwrap();
+    index_one_file(&keyed(&root, "src/a.ts"), &store, &root).unwrap();
+    assert_eq!(edge_confidence(&root, "b.ts", "computeTotal"), vec![0.6], "definition back → unique");
+    fs::write(root.join("src/d.ts"), DEF_TS).unwrap();
+    index_one_file(&keyed(&root, "src/d.ts"), &store, &root).unwrap();
+    assert_eq!(edge_confidence(&root, "b.ts", "computeTotal"), vec![0.4], "two definitions → collision");
+
+    // Deleting the twin (the daemon's deletion path) makes it unique again.
+    let mut touched = std::collections::HashSet::new();
+    icode_engine::delete_one_file_noting(&store, &keyed(&root, "src/d.ts").to_string_lossy(), &mut touched).unwrap();
+    assert!(touched.contains("computeTotal"));
+    store.regrade_calls_to(&touched).unwrap();
+    assert_eq!(edge_confidence(&root, "b.ts", "computeTotal"), vec![0.6]);
+
+    // The incremental result equals a whole-graph re-grade.
+    store.resolve_call_edges(None).unwrap();
+    assert_eq!(edge_confidence(&root, "b.ts", "computeTotal"), vec![0.6]);
+}
 
 /// A project that itself lives under directories named like excluded ones
 /// (`.cache`, `build`) is indexed by the walk — and the daemon must keep it live.
 /// Before the fix the daemon matched the ABSOLUTE path against the exclusion list
-/// and dropped every event of such a project. `<root>/build/` stays excluded.
+/// and dropped every event of such a project. `<root>/build/` stays excluded, and
+/// a cross-file re-grade happens through the live loop as well.
 #[test]
 fn a_project_inside_an_excluded_named_dir_stays_live() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -403,6 +452,7 @@ fn a_project_inside_an_excluded_named_dir_stays_live() {
     }
     assert!(live, "an edit inside a project under `.cache/build/` must reach the graph");
     std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(edge_confidence(&root, "b.ts", "computeTotal"), vec![0.3], "caller re-graded by the live batch");
     assert!(reader.get_function("inBuild", None, true).unwrap().is_none(), "<root>/build/ stays excluded");
     fs::remove_dir_all(&root).unwrap(); // stops the daemon
 }
