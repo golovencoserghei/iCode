@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use icode_core::ids::{MemoryId, DEVELOPER_PROJECT};
-use icode_core::model::{Category, CodeQuery, Language, NewMemory, SearchMode, SymbolKind};
+use icode_core::model::{Call, Category, Certainty, CodeQuery, Language, NewMemory, SearchMode, SymbolKind};
 use icode_core::traits::{CodeReadStore, Embedder, MemoryStore};
 use icode_engine::SqliteCodeStore;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -195,6 +195,9 @@ pub struct SymbolArgs {
     pub with_body: Option<bool>,
     /// Max rows (default 50).
     pub limit: Option<usize>,
+    /// callers/callees/context: drop call edges below this certainty —
+    /// exact | inferred | ambiguous (default ambiguous = keep all).
+    pub min_certainty: Option<String>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -207,6 +210,12 @@ pub struct GraphArgs {
     pub to: Option<String>,
     /// Hops to traverse.
     pub depth: Option<usize>,
+    /// chain: only walk edges at or above this certainty — exact | inferred |
+    /// ambiguous (default ambiguous = any edge).
+    pub min_certainty: Option<String>,
+    /// chain: return an object with per-hop confidence/certainty and the chain's
+    /// weakest link instead of the plain array of names (default false).
+    pub detail: Option<bool>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -215,6 +224,8 @@ pub struct MapArgs {
     pub top: Option<usize>,
     /// Sub-project to map (a monorepo member). Omit to list the members.
     pub scope: Option<String>,
+    /// Subsystems and hubs to show (default 8 each).
+    pub limit: Option<usize>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -422,24 +433,6 @@ pub struct CallersArgs {
     pub name: String,
     /// Max rows to return (default 50).
     pub limit: Option<usize>,
-}
-
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-pub struct CalleesArgs {
-    /// Symbol name whose direct callees to list.
-    pub name: String,
-    /// Max rows to return (default 50).
-    pub limit: Option<usize>,
-}
-
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-pub struct CallChainArgs {
-    /// Source symbol name.
-    pub from: String,
-    /// Target symbol name.
-    pub to: String,
-    /// Max edges to traverse in the call graph (default 12).
-    pub max_depth: Option<usize>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -1048,35 +1041,17 @@ impl CodeMcpServer {
         }
     }
 
-    async fn get_callers(&self, Parameters(args): Parameters<CallersArgs>) -> String {
+    /// `graph op=chain`: the path, each hop with its confidence, and the chain's own
+    /// trust = its weakest hop.
+    async fn chain_reply(&self, from: String, to: String, max_depth: usize, min: Certainty, detail: bool) -> String {
         let store = self.store.clone();
-        let limit = args.limit.unwrap_or(50);
-        let result = tokio::task::spawn_blocking(move || store.get_callers(&args.name, limit)).await;
-        match result {
-            Ok(Ok(calls)) => to_json(&calls),
-            Ok(Err(e)) => err_json(&e.to_string()),
-            Err(e) => err_json(&e.to_string()),
-        }
-    }
-
-    async fn get_callees(&self, Parameters(args): Parameters<CalleesArgs>) -> String {
-        let store = self.store.clone();
-        let limit = args.limit.unwrap_or(50);
-        let result = tokio::task::spawn_blocking(move || store.get_callees(&args.name, limit)).await;
-        match result {
-            Ok(Ok(calls)) => to_json(&calls),
-            Ok(Err(e)) => err_json(&e.to_string()),
-            Err(e) => err_json(&e.to_string()),
-        }
-    }
-
-    async fn get_call_chain(&self, Parameters(args): Parameters<CallChainArgs>) -> String {
-        let store = self.store.clone();
-        let max_depth = args.max_depth.unwrap_or(12);
+        let source = from.clone();
         let result =
-            tokio::task::spawn_blocking(move || store.call_chain(&args.from, &args.to, max_depth)).await;
+            tokio::task::spawn_blocking(move || store.call_chain_hops(&from, &to, max_depth, min)).await;
         match result {
-            Ok(Ok(chain)) => to_json(&chain),
+            Ok(Ok(hops)) if detail => chain_json(&source, hops, min).to_string(),
+            // The original shape: a bare array of names, `[]` when unreachable.
+            Ok(Ok(hops)) => chain_json(&source, hops, min)["path"].to_string(),
             Ok(Err(e)) => err_json(&e.to_string()),
             Err(e) => err_json(&e.to_string()),
         }
@@ -1643,13 +1618,17 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Everything about a symbol. op: context (default: def+callers+callees) | def | callers | callees | references (every use, classified: definition/call/import/mention - precise, not grep) | tests (which tests reach it, transitively - empty means UNTESTED) | implementations | similar.")]
+    #[tool(description = "Everything about a symbol. op: context (default: def+callers+callees) | def | callers | callees | references (every use, classified: definition/call/import/mention - precise, not grep) | tests (which tests reach it, transitively - empty means UNTESTED) | implementations | similar. Every call edge carries `certainty`: exact (receiver pinned one definition) | inferred (likely) | ambiguous (name collision/unresolved); `min_certainty` filters callers/callees/context.")]
     async fn symbol(&self, Parameters(a): Parameters<SymbolArgs>) -> String {
         let note = self.await_graph().await;
         tag_sync(note, self.symbol_on_graph(Parameters(a)).await)
     }
 
     async fn symbol_on_graph(&self, Parameters(a): Parameters<SymbolArgs>) -> String {
+        let min = match parse_min_certainty(a.min_certainty.as_deref()) {
+            Ok(m) => m,
+            Err(e) => return err_json(&e),
+        };
         match a.op.as_deref().unwrap_or("context") {
             "def" => {
                 let f = self
@@ -1669,20 +1648,8 @@ impl CodeMcpServer {
                 }))
                 .await
             }
-            "callers" => {
-                self.get_callers(Parameters(CallersArgs {
-                    name: a.name,
-                    limit: a.limit,
-                }))
-                .await
-            }
-            "callees" => {
-                self.get_callees(Parameters(CalleesArgs {
-                    name: a.name,
-                    limit: a.limit,
-                }))
-                .await
-            }
+            "callers" => self.call_edges_reply(a.name, a.limit, min, true).await,
+            "callees" => self.call_edges_reply(a.name, a.limit, min, false).await,
             "implementations" => {
                 self.find_implementations(Parameters(ImplementationsArgs { name: a.name }))
                     .await
@@ -1709,16 +1676,40 @@ impl CodeMcpServer {
                 .await
             }
             _ => {
-                self.get_symbol_context(Parameters(SymbolContextArgs {
-                    name: a.name,
-                    file_hint: a.file_hint,
-                }))
-                .await
+                let json = self
+                    .get_symbol_context(Parameters(SymbolContextArgs {
+                        name: a.name,
+                        file_hint: a.file_hint,
+                    }))
+                    .await;
+                annotate_context(json, min)
             }
         }
     }
 
-    #[tool(description = "Call/import graph. op: chain (target->to) | impact (reverse deps of a file) | deps (a file's deps).")]
+    /// callers/callees with a `certainty` per edge, filtered to `min`. When a filter
+    /// is active the store is asked for more rows so the filter does not starve the
+    /// page (the cap is still `limit`).
+    async fn call_edges_reply(&self, name: String, limit: Option<usize>, min: Certainty, callers: bool) -> String {
+        let store = self.store.clone();
+        let limit = limit.unwrap_or(50);
+        let fetch = if min > Certainty::Ambiguous { limit.saturating_mul(4).max(200) } else { limit };
+        let result = tokio::task::spawn_blocking(move || {
+            if callers {
+                store.get_callers(&name, fetch)
+            } else {
+                store.get_callees(&name, fetch)
+            }
+        })
+        .await;
+        match result {
+            Ok(Ok(calls)) => to_json(&annotate_calls(&calls, min, limit)),
+            Ok(Err(e)) => err_json(&e.to_string()),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }
+
+    #[tool(description = "Call/import graph. op: chain (target->to, an array of names; detail=true adds each hop's certainty exact|inferred|ambiguous and the chain's weakest link; `min_certainty` walks only trusted edges) | impact (reverse deps of a file) | deps (a file's deps).")]
     async fn graph(&self, Parameters(a): Parameters<GraphArgs>) -> String {
         let note = self.await_graph().await;
         tag_sync(note, self.graph_on_graph(Parameters(a)).await)
@@ -1731,12 +1722,11 @@ impl CodeMcpServer {
                     Some(t) => t,
                     None => return err_json("graph op=chain needs `to`"),
                 };
-                self.get_call_chain(Parameters(CallChainArgs {
-                    from: a.target,
-                    to,
-                    max_depth: a.depth,
-                }))
-                .await
+                let min = match parse_min_certainty(a.min_certainty.as_deref()) {
+                    Ok(m) => m,
+                    Err(e) => return err_json(&e),
+                };
+                self.chain_reply(a.target, to, a.depth.unwrap_or(12), min, a.detail.unwrap_or(false)).await
             }
             "impact" => {
                 self.impact_analysis(Parameters(ImpactArgs {
@@ -1756,7 +1746,7 @@ impl CodeMcpServer {
         }
     }
 
-    #[tool(description = "Architecture overview: stats, languages, hotspots, entry points, complex symbols. In a monorepo, call it WITHOUT scope first to list the sub-projects, then with scope=<member> to map one.")]
+    #[tool(description = "Architecture overview: stats, languages, subsystems (clusters of files that call each other, with key files and links), hubs (most central symbols + caller counts), hotspots, entry points, complex symbols. In a monorepo, call it WITHOUT scope first to list the sub-projects, then with scope=<member> to map one.")]
     async fn map(&self, Parameters(a): Parameters<MapArgs>) -> String {
         let note = self.await_graph().await;
         tag_sync(note, self.map_on_graph(Parameters(a)).await)
@@ -1765,10 +1755,13 @@ impl CodeMcpServer {
     async fn map_on_graph(&self, Parameters(a): Parameters<MapArgs>) -> String {
         let store = self.store.clone();
         let top = a.top.unwrap_or(30);
+        let limit = a.limit.unwrap_or(8);
         let scope = a.scope.clone();
         let result = tokio::task::spawn_blocking(move || {
             if let Some(scope) = scope.filter(|s| !s.trim().is_empty()) {
-                return store.repo_map_scoped(top, &scope).map(MapReply::Scoped);
+                let map = store.repo_map_scoped(top, &scope)?;
+                let subs = store.subsystems(Some(&scope))?;
+                return Ok::<_, icode_core::error::Error>(MapReply::Scoped(Box::new((map, subs))));
             }
             // No scope. In a MONOREPO, dumping the whole tree is not a map — measured on
             // a real one it returned 4485 files, ~800 entry points and a hotspot list
@@ -1782,11 +1775,13 @@ impl CodeMcpServer {
             if members.len() > 1 {
                 return Ok(MapReply::Members(members));
             }
-            store.repo_map(top).map(MapReply::Scoped)
+            let map = store.repo_map(top)?;
+            let subs = store.subsystems(None)?;
+            Ok(MapReply::Scoped(Box::new((map, subs))))
         })
         .await;
         match result {
-            Ok(Ok(MapReply::Scoped(map))) => to_json(&map),
+            Ok(Ok(MapReply::Scoped(reply))) => map_json(&reply.0, &reply.1, limit),
             Ok(Ok(MapReply::Members(members))) => serde_json::json!({
                 "monorepo": true,
                 "hint": "this tree holds several sub-projects; call map again with scope=<name> \
@@ -2418,6 +2413,116 @@ fn jit_embed(store: &SqliteCodeStore, embedder: &dyn Embedder) {
     }
 }
 
+/// `min_certainty` argument → level (absent/empty = ambiguous = keep everything).
+fn parse_min_certainty(raw: Option<&str>) -> std::result::Result<Certainty, String> {
+    match raw {
+        None => Ok(Certainty::Ambiguous),
+        Some(s) => Certainty::parse(s)
+            .ok_or_else(|| format!("unknown min_certainty `{s}` (exact|inferred|ambiguous)")),
+    }
+}
+
+/// Call edges as JSON objects with a `certainty` word next to the numeric
+/// `confidence`, dropping edges below `min`, capped at `limit`. Additive: every
+/// field a `Call` already serialized is still there.
+fn annotate_calls(calls: &[Call], min: Certainty, limit: usize) -> Vec<serde_json::Value> {
+    calls
+        .iter()
+        .filter(|c| c.certainty() >= min)
+        .take(limit)
+        .map(|c| {
+            let mut v = serde_json::to_value(c).unwrap_or(serde_json::Value::Null);
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("certainty".into(), c.certainty().as_str().into());
+            }
+            v
+        })
+        .collect()
+}
+
+/// `symbol op=context`: annotate (and filter) its `callers`/`callees` in place.
+/// Anything that is not a context object (an error, a sync-wrapped payload) passes
+/// through untouched.
+fn annotate_context(json: String, min: Certainty) -> String {
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&json) else { return json };
+    let Some(obj) = v.as_object_mut() else { return json };
+    let mut touched = false;
+    for key in ["callers", "callees"] {
+        if let Some(arr) = obj.get(key).and_then(|a| a.as_array()) {
+            let calls: Vec<Call> = arr.iter().filter_map(|c| serde_json::from_value(c.clone()).ok()).collect();
+            if calls.len() == arr.len() {
+                obj.insert(key.into(), annotate_calls(&calls, min, usize::MAX).into());
+                touched = true;
+            }
+        }
+    }
+    if touched { v.to_string() } else { json }
+}
+
+/// `graph op=chain detail=true` reply (without `detail` only `path` is returned,
+/// the original bare array). `path` is the array of names; `hops` carry each
+/// edge's confidence; `confidence`/`certainty` are the weakest hop; `text` is the
+/// same path in one readable line (`a -> b [exact] -> c [inferred]`).
+fn chain_json(from: &str, hops: Option<Vec<icode_core::model::ChainHop>>, min: Certainty) -> serde_json::Value {
+    let Some(hops) = hops else {
+        return serde_json::json!({
+            "path": [],
+            "hops": [],
+            "found": false,
+            "min_certainty": min.as_str(),
+        });
+    };
+    let mut path: Vec<&str> = Vec::with_capacity(hops.len() + 1);
+    let mut text = String::new();
+    // `from` is `to`: the one-name path the old reply gave.
+    let bare = from.rsplit(['.', ':', '\\']).next().unwrap_or(from);
+    match hops.first() {
+        Some(first) => {
+            path.push(&first.from);
+            text.push_str(&first.from);
+        }
+        None => {
+            path.push(bare);
+            text.push_str(bare);
+        }
+    }
+    for h in &hops {
+        path.push(&h.to);
+        text.push_str(&format!(" -> {} [{}]", h.to, h.certainty));
+    }
+    let confidence = icode_core::model::weakest_link(&hops.iter().map(|h| h.confidence).collect::<Vec<_>>());
+    serde_json::json!({
+        "path": path,
+        "hops": hops,
+        "found": true,
+        "confidence": icode_core::model::round_confidence(confidence),
+        "certainty": Certainty::from_confidence(confidence).as_str(),
+        "text": text,
+    })
+}
+
+/// The map reply: the existing `RepoMap` fields untouched, plus `subsystems`
+/// (trimmed to `limit`) and `hubs` (top `limit` by centrality).
+fn map_json(map: &icode_core::model::RepoMap, subs: &icode_core::model::SubsystemMap, limit: usize) -> String {
+    let mut v = serde_json::to_value(map).unwrap_or(serde_json::Value::Null);
+    if let Some(obj) = v.as_object_mut() {
+        let shown: Vec<_> = subs.subsystems.iter().take(limit).collect();
+        obj.insert("subsystems".into(), serde_json::to_value(&shown).unwrap_or_default());
+        if subs.subsystems.len() > shown.len() {
+            obj.insert(
+                "subsystems_more".into(),
+                format!("{} more (map limit=N)", subs.subsystems.len() - shown.len()).into(),
+            );
+        }
+        if subs.unclustered_files > 0 {
+            obj.insert("unclustered_files".into(), subs.unclustered_files.into());
+        }
+        let hubs: Vec<_> = subs.hubs.iter().take(limit).collect();
+        obj.insert("hubs".into(), serde_json::to_value(&hubs).unwrap_or_default());
+    }
+    v.to_string()
+}
+
 fn to_json<T: serde::Serialize>(value: &T) -> String {
     serde_json::to_string(value).unwrap_or_else(|e| err_json(&e.to_string()))
 }
@@ -2425,7 +2530,7 @@ fn to_json<T: serde::Serialize>(value: &T) -> String {
 /// `map` answers with either a real map or, in an unscoped monorepo, the list of members
 /// to scope into.
 enum MapReply {
-    Scoped(icode_core::model::RepoMap),
+    Scoped(Box<(icode_core::model::RepoMap, icode_core::model::SubsystemMap)>),
     Members(Vec<(String, u64)>),
 }
 
@@ -2534,6 +2639,80 @@ fn looks_project_specific(content: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn call(callee: &str, confidence: f32) -> Call {
+        Call {
+            path: "/p/a.rs".into(),
+            caller: "a".into(),
+            callee: callee.into(),
+            line: 3,
+            confidence,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn call_edges_gain_certainty_without_losing_old_fields() {
+        let calls = vec![call("x", 0.9), call("y", 0.6), call("z", 0.0)];
+        let all = annotate_calls(&calls, Certainty::Ambiguous, 50);
+        assert_eq!(all.len(), 3);
+        for (v, c) in all.iter().zip(&calls) {
+            // Every field the old reply had is still there, unchanged.
+            let old = serde_json::to_value(c).unwrap();
+            for (k, val) in old.as_object().unwrap() {
+                assert_eq!(&v[k], val, "field {k} changed");
+            }
+        }
+        assert_eq!(all[0]["certainty"], "exact");
+        assert_eq!(all[1]["certainty"], "inferred");
+        assert_eq!(all[2]["certainty"], "ambiguous", "an unresolved 0.0 edge is ambiguous");
+        let exact = annotate_calls(&calls, Certainty::Exact, 50);
+        assert_eq!(exact.len(), 1);
+        assert_eq!(annotate_calls(&calls, Certainty::Inferred, 1).len(), 1, "limit still caps");
+        assert_eq!(parse_min_certainty(None), Ok(Certainty::Ambiguous));
+        assert!(parse_min_certainty(Some("sure")).is_err());
+    }
+
+    #[test]
+    fn context_is_annotated_and_errors_pass_through() {
+        let ctx = serde_json::json!({
+            "definition": null,
+            "callers": [serde_json::to_value(call("x", 0.4)).unwrap()],
+            "callees": [serde_json::to_value(call("y", 0.9)).unwrap()],
+            "imports": [], "routes": [], "implementations": [], "similar_symbols": [],
+        })
+        .to_string();
+        let v: serde_json::Value = serde_json::from_str(&annotate_context(ctx.clone(), Certainty::Ambiguous)).unwrap();
+        assert_eq!(v["callers"][0]["certainty"], "ambiguous");
+        assert_eq!(v["callees"][0]["certainty"], "exact");
+        let v: serde_json::Value = serde_json::from_str(&annotate_context(ctx, Certainty::Exact)).unwrap();
+        assert_eq!(v["callers"].as_array().unwrap().len(), 0);
+        assert_eq!(v["callees"].as_array().unwrap().len(), 1);
+        let err = err_json("boom");
+        assert_eq!(annotate_context(err.clone(), Certainty::Exact), err);
+    }
+
+    #[test]
+    fn chain_reply_reports_the_weakest_hop() {
+        use icode_core::model::ChainHop;
+        let hop = |f: &str, t: &str, c: f32| ChainHop {
+            from: f.into(),
+            to: t.into(),
+            confidence: c,
+            certainty: Certainty::from_confidence(c),
+        };
+        let v = chain_json("a", Some(vec![hop("a", "b", 0.9), hop("b", "c", 0.4)]), Certainty::Ambiguous);
+        assert_eq!(v["path"], serde_json::json!(["a", "b", "c"]));
+        assert_eq!(v["certainty"], "ambiguous");
+        assert!((v["confidence"].as_f64().unwrap() - 0.4).abs() < 1e-6);
+        assert_eq!(v["text"], "a -> b [exact] -> c [ambiguous]");
+        // Without `detail` the reply is the original bare array.
+        assert_eq!(v["path"].to_string(), r#"["a","b","c"]"#);
+        assert_eq!(chain_json("Svc::a", Some(vec![]), Certainty::Ambiguous)["path"], serde_json::json!(["a"]));
+        let none = chain_json("a", None, Certainty::Exact);
+        assert_eq!(none["found"], false);
+        assert_eq!(none["path"], serde_json::json!([]));
+    }
 
     #[test]
     fn dev_note_gate_flags_paths_not_universal_rules() {

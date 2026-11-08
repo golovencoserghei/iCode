@@ -23,7 +23,7 @@ use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use icode_core::ids::MemoryId;
-use icode_core::model::{Category, MemoryRecord, MemoryStatus};
+use icode_core::model::{Category, Certainty, MemoryRecord, MemoryStatus};
 use icode_core::traits::{CodeReadStore, Embedder, ReadableMemoryStore, WritableMemoryStore};
 use icode_engine::{SqliteCodeStore, SqliteMemoryStore, WalStore};
 use serde_json::{json, Map, Value};
@@ -1018,12 +1018,21 @@ fn op_impact(args: &Map<String, Value>) -> HostResult {
         let mut symbols = Vec::new();
         if let Some(code) = &code {
             for hit in code.file_outline(&path).unwrap_or_default().into_iter().take(25) {
-                let callers = code.get_callers(&hit.name, 200).map(|c| c.len()).unwrap_or(0);
+                let calls = code.get_callers(&hit.name, 200).unwrap_or_default();
+                let callers = calls.len();
+                // How many of those callers are certain: an `ambiguous` edge is a name
+                // collision, so a big caller count made of them overstates the blast radius.
+                let by_certainty = |level: Certainty| calls.iter().filter(|c| c.certainty() == level).count();
                 let tests = code.find_tests_covering(&hit.name, 3).unwrap_or_default();
                 symbols.push(json!({
                     "name": hit.name,
                     "kind": serde_json::to_value(hit.kind).unwrap_or(Value::Null),
                     "callers": callers,
+                    "callersByCertainty": {
+                        "exact": by_certainty(Certainty::Exact),
+                        "inferred": by_certainty(Certainty::Inferred),
+                        "ambiguous": by_certainty(Certainty::Ambiguous),
+                    },
                     "tests": tests.len(),
                     "testNames": tests.iter().take(5).map(|t| t.test.clone()).collect::<Vec<_>>(),
                 }));

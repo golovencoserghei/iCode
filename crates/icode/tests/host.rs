@@ -399,6 +399,10 @@ fn impact_reports_symbols_callers_and_memories() {
     let file = &data["files"][0];
     let helper = file["symbols"].as_array().unwrap().iter().find(|s| s["name"] == "helper").expect("helper symbol");
     assert_eq!(helper["callers"], 1);
+    // Additive: the certainty breakdown sums to the old caller count.
+    let by = &helper["callersByCertainty"];
+    let sum: u64 = ["exact", "inferred", "ambiguous"].iter().map(|k| by[*k].as_u64().unwrap()).sum();
+    assert_eq!(sum, 1, "{by}");
     assert!(helper["tests"].as_u64().unwrap() >= 1, "{helper}");
     assert_eq!(file["memories"][0]["id"], "mem_I__widget");
 }
