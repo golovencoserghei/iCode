@@ -6,6 +6,7 @@
 //! recall (M5) fill in later.
 
 pub mod chunk;
+pub mod cluster;
 pub mod daemon;
 pub mod doctor;
 pub mod embed;

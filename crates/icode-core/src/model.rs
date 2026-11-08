@@ -153,6 +153,138 @@ pub struct Call {
     pub confidence: f32,
 }
 
+/// How far an agent can lean on one call edge, as a word instead of a float.
+///
+/// `calls.confidence` grades HOW an edge resolved (see [`Call::confidence`]), but a
+/// bare `0.6` means nothing to a reader. Three buckets carry the decision that
+/// matters: `exact` — the receiver pinned a single definition; `inferred` — a
+/// homonym-class match or a unique bare name, usually right; `ambiguous` — a bare
+/// name with several candidates, or nothing resolved at all. An edge read before
+/// the resolve pass (confidence 0.0) is ambiguous by definition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Certainty {
+    Ambiguous,
+    Inferred,
+    Exact,
+}
+
+impl Certainty {
+    /// Bucket a stored confidence. Thresholds sit BETWEEN the grades of the scale
+    /// (0.9 / 0.7 / 0.6 / 0.4 / 0.3) so an f32 round-trip through SQLite REAL can
+    /// never move an edge across a bucket boundary. NaN reads as ambiguous.
+    pub fn from_confidence(confidence: f32) -> Self {
+        if confidence >= 0.85 {
+            Certainty::Exact
+        } else if confidence >= 0.5 {
+            Certainty::Inferred
+        } else {
+            Certainty::Ambiguous
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Certainty::Exact => "exact",
+            Certainty::Inferred => "inferred",
+            Certainty::Ambiguous => "ambiguous",
+        }
+    }
+
+    /// Parse a user-facing level (`exact|inferred|ambiguous`, case-insensitive).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "exact" => Some(Certainty::Exact),
+            "inferred" => Some(Certainty::Inferred),
+            "ambiguous" | "all" | "" => Some(Certainty::Ambiguous),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Certainty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A path is only as trustworthy as its weakest hop: the minimum confidence over
+/// `hops`. An empty path (source == target) is trivially exact (1.0). NaN hops are
+/// treated as 0.0 so one corrupt row cannot make a path look certain.
+pub fn weakest_link(hops: &[f32]) -> f32 {
+    hops.iter()
+        .map(|c| if c.is_nan() { 0.0 } else { *c })
+        .fold(1.0f32, f32::min)
+}
+
+impl Call {
+    /// The edge's [`Certainty`] bucket.
+    pub fn certainty(&self) -> Certainty {
+        Certainty::from_confidence(self.confidence)
+    }
+}
+
+/// One hop of a call chain with the confidence of the edge that carries it (the
+/// best edge between the two names when several exist).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChainHop {
+    pub from: String,
+    pub to: String,
+    pub confidence: f32,
+    pub certainty: Certainty,
+}
+
+/// A detected subsystem: a community of files that call each other more than they
+/// call the rest of the project (see `icode_engine::cluster`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Subsystem {
+    pub id: usize,
+    /// Common directory prefix of its files (relative to the project root); when
+    /// the files share none, the directory holding most of them, suffixed `+`.
+    pub name: String,
+    /// Highest-ranked symbol inside it — what the subsystem is "about".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_symbol: Option<String>,
+    pub files: usize,
+    pub functions: usize,
+    /// Test files attached to it (the subsystem they call most). Tests do not
+    /// shape the partition — they call into everything.
+    pub tests: usize,
+    /// Up to three most central files (relative paths).
+    pub key_files: Vec<String>,
+    /// The heaviest links to other subsystems: (subsystem id, edge weight).
+    pub links: Vec<SubsystemLink>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SubsystemLink {
+    pub to: usize,
+    /// Sum of the confidence-weighted call/import edges between the two.
+    pub weight: f64,
+}
+
+/// A hub: a symbol the rest of the code leans on (high centrality), with how many
+/// distinct resolved call sites reach it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Hub {
+    pub symbol: String,
+    pub path: String,
+    /// Resolved call sites from production code (tests excluded).
+    pub callers: usize,
+    pub rank: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subsystem: Option<usize>,
+}
+
+/// Subsystems + hubs for one scope, as cached in the index.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SubsystemMap {
+    pub subsystems: Vec<Subsystem>,
+    /// Files that ended up alone (no edges strong enough to join anything).
+    pub unclustered_files: usize,
+    pub hubs: Vec<Hub>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Route {
     pub path: String,
@@ -510,4 +642,45 @@ pub struct RecallResult {
     pub relevant_code: Vec<CodeHit>,
     pub relevant_memory: Vec<MemoryHit>,
     pub facts: Vec<Triple>,
+}
+
+#[cfg(test)]
+mod certainty_tests {
+    use super::*;
+
+    #[test]
+    fn confidence_scale_maps_to_three_buckets() {
+        assert_eq!(Certainty::from_confidence(0.9), Certainty::Exact);
+        assert_eq!(Certainty::from_confidence(1.0), Certainty::Exact);
+        assert_eq!(Certainty::from_confidence(0.7), Certainty::Inferred);
+        assert_eq!(Certainty::from_confidence(0.6), Certainty::Inferred);
+        assert_eq!(Certainty::from_confidence(0.4), Certainty::Ambiguous);
+        assert_eq!(Certainty::from_confidence(0.3), Certainty::Ambiguous);
+        // Before the resolve pass every edge is 0.0: ambiguous, never a panic.
+        assert_eq!(Certainty::from_confidence(0.0), Certainty::Ambiguous);
+        assert_eq!(Certainty::from_confidence(f32::NAN), Certainty::Ambiguous);
+        // A REAL round-trip (f64 -> f32) must not move a grade across a boundary.
+        assert_eq!(Certainty::from_confidence(0.9f64 as f32), Certainty::Exact);
+        assert_eq!(Certainty::from_confidence(0.6f64 as f32), Certainty::Inferred);
+    }
+
+    #[test]
+    fn certainty_orders_and_parses() {
+        assert!(Certainty::Exact > Certainty::Inferred && Certainty::Inferred > Certainty::Ambiguous);
+        assert_eq!(Certainty::parse("EXACT"), Some(Certainty::Exact));
+        assert_eq!(Certainty::parse("inferred"), Some(Certainty::Inferred));
+        assert_eq!(Certainty::parse("ambiguous"), Some(Certainty::Ambiguous));
+        assert_eq!(Certainty::parse("maybe"), None);
+        assert_eq!(serde_json::to_string(&Certainty::Exact).unwrap(), "\"exact\"");
+    }
+
+    #[test]
+    fn a_path_is_as_strong_as_its_weakest_hop() {
+        assert_eq!(weakest_link(&[0.9, 0.6, 0.9]), 0.6);
+        assert_eq!(weakest_link(&[0.9, 0.3]), 0.3);
+        assert_eq!(weakest_link(&[0.9]), 0.9);
+        assert_eq!(weakest_link(&[]), 1.0);
+        assert_eq!(weakest_link(&[0.9, f32::NAN]), 0.0);
+        assert_eq!(Certainty::from_confidence(weakest_link(&[0.9, 0.0])), Certainty::Ambiguous);
+    }
 }

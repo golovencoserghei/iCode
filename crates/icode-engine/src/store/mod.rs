@@ -10,6 +10,7 @@
 //! makes this the correct serialization point anyway.
 
 mod schema;
+mod subsystems;
 mod vector;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -112,7 +113,32 @@ fn env_i64(key: &str, default: i64) -> i64 {
 /// name → deduped list of bare `callee` names. Cached behind an [`Arc`] so graph
 /// queries share ONE materialization instead of rebuilding it from the entire
 /// `calls` table (full in-RAM adjacency + dedup `HashSet`) on every request.
-type CachedAdjacency = HashMap<String, Vec<String>>;
+///
+/// Derefs to the plain adjacency map; `confidence` additionally holds, per bare
+/// `(caller, callee)` pair, the BEST confidence among the edges collapsed into it
+/// (a chain hop is as good as the strongest call that makes it).
+#[derive(Debug, Default, PartialEq)]
+struct CachedAdjacency {
+    adjacency: HashMap<String, Vec<String>>,
+    confidence: HashMap<(String, String), f32>,
+}
+
+impl std::ops::Deref for CachedAdjacency {
+    type Target = HashMap<String, Vec<String>>;
+    fn deref(&self) -> &Self::Target {
+        &self.adjacency
+    }
+}
+
+impl CachedAdjacency {
+    /// Confidence of the bare edge `from -> to` (0.0 when absent).
+    fn edge_confidence(&self, from: &str, to: &str) -> f32 {
+        self.confidence
+            .get(&(from.to_string(), to.to_string()))
+            .copied()
+            .unwrap_or(0.0)
+    }
+}
 
 pub struct SqliteCodeStore {
     conn: Arc<Mutex<Connection>>,
@@ -545,6 +571,82 @@ impl SqliteCodeStore {
         self.tests_reaching(&[symbol.to_string()], max_depth, &[])
     }
 
+    /// [`CodeReadStore::call_chain`] with the confidence of every hop.
+    ///
+    /// Shortest path (BFS, same bare-name graph as `call_chain`) using only edges at
+    /// or above `min` certainty, so `min = Exact` answers "is there a path I can
+    /// trust end to end?" rather than "is there any path at all". Each hop carries
+    /// the BEST confidence among the call sites joining those two names; the
+    /// chain's own trust is the weakest hop ([`weakest_link`]).
+    ///
+    /// `None` = unreachable within `max_depth`; `Some(vec![])` = `from` is `to`.
+    pub fn call_chain_hops(
+        &self,
+        from: &str,
+        to: &str,
+        max_depth: usize,
+        min: Certainty,
+    ) -> Result<Option<Vec<ChainHop>>> {
+        if max_depth == 0 {
+            return Ok(None);
+        }
+        let from_bare = last_name_segment(from);
+        let to_bare = last_name_segment(to);
+        if from_bare == to_bare {
+            return Ok(Some(Vec::new()));
+        }
+        let edges = self.call_edges()?;
+        let mut prev: HashMap<String, String> = HashMap::new();
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+        visited.insert(from_bare.clone());
+        queue.push_back((from_bare.clone(), 0));
+        let mut found = false;
+        'bfs: while let Some((node, depth)) = queue.pop_front() {
+            if depth >= max_depth {
+                continue;
+            }
+            let Some(neighbours) = edges.get(&node) else { continue };
+            for next in neighbours {
+                if Certainty::from_confidence(edges.edge_confidence(&node, next)) < min {
+                    continue;
+                }
+                if visited.insert(next.clone()) {
+                    prev.insert(next.clone(), node.clone());
+                    if next == &to_bare {
+                        found = true;
+                        break 'bfs;
+                    }
+                    queue.push_back((next.clone(), depth + 1));
+                }
+            }
+        }
+        if !found {
+            return Ok(None);
+        }
+        let mut names = vec![to_bare.clone()];
+        let mut cur = to_bare;
+        while let Some(p) = prev.get(&cur) {
+            names.push(p.clone());
+            cur = p.clone();
+        }
+        names.reverse();
+        Ok(Some(
+            names
+                .windows(2)
+                .map(|w| {
+                    let confidence = edges.edge_confidence(&w[0], &w[1]);
+                    ChainHop {
+                        from: w[0].clone(),
+                        to: w[1].clone(),
+                        confidence,
+                        certainty: Certainty::from_confidence(confidence),
+                    }
+                })
+                .collect(),
+        ))
+    }
+
     /// Which tests exercise ANY symbol defined in `path`, transitively.
     ///
     /// The file-level counterpart of [`find_tests_covering`], and the half the
@@ -968,7 +1070,17 @@ impl SqliteCodeStore {
     ///
     /// Call AFTER `resolve_call_edges`, once the graph is complete. Cheap: a handful
     /// of passes over ~1.5k edges.
+    ///
+    /// Also advances the persisted graph generation, which keys the cached
+    /// subsystem partition (see `subsystems`): this runs after every re-index
+    /// batch, exactly when the cached partition may have gone stale.
     pub fn compute_symbol_ranks(&self) -> Result<()> {
+        let ranked = self.compute_symbol_ranks_inner();
+        self.bump_graph_generation()?;
+        ranked
+    }
+
+    fn compute_symbol_ranks_inner(&self) -> Result<()> {
         let conn = self.conn.lock().map_err(store_err)?;
 
         // NODE IDENTITY IS (module, qualified_name) — not the name alone.
@@ -3590,25 +3702,35 @@ fn module_matches_file(module: &str, file_path: &str) -> bool {
 /// Load the by-name call graph as bare-name adjacency (`caller_bare` → set of
 /// `callee_bare`). Callers are stored qualified, callees bare; we reduce both to
 /// their last segment so the BFS/reachability runs in one name space.
-fn load_call_edges(conn: &Connection) -> Result<HashMap<String, Vec<String>>> {
-    let mut stmt = conn.prepare("SELECT caller, callee FROM calls").map_err(store_err)?;
+fn load_call_edges(conn: &Connection) -> Result<CachedAdjacency> {
+    let mut stmt = conn.prepare("SELECT caller, callee, confidence FROM calls").map_err(store_err)?;
     let rows = stmt
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, f64>(2)?))
+        })
         .map_err(store_err)?;
-    let mut edges: HashMap<String, Vec<String>> = HashMap::new();
-    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut out = CachedAdjacency::default();
     for r in rows {
-        let (caller, callee) = r.map_err(store_err)?;
+        let (caller, callee, conf) = r.map_err(store_err)?;
         let from = last_name_segment(&caller);
         let to = last_name_segment(&callee);
         if from == to {
             continue; // drop self-edges
         }
-        if seen.insert((from.clone(), to.clone())) {
-            edges.entry(from).or_default().push(to);
+        let conf = if conf.is_finite() { conf as f32 } else { 0.0 };
+        match out.confidence.entry((from.clone(), to.clone())) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                if conf > *e.get() {
+                    e.insert(conf);
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(conf);
+                out.adjacency.entry(from).or_default().push(to);
+            }
         }
     }
-    Ok(edges)
+    Ok(out)
 }
 
 /// Entry-point function names: `main` plus every distinct route `handler_method`.
