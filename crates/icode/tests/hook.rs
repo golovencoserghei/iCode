@@ -28,6 +28,8 @@ fn run_hook(home: &Path, args: &[&str]) -> (String, i32) {
         .args(["hook"])
         .args(args)
         .env("HOME", home)
+        // A FlowCode-hosted shell exports this; the Stop hook then stays silent by design.
+        .env_remove("FLOWCODE_ICODE_HOST")
         .output()
         .expect("spawn icode hook");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -216,6 +218,8 @@ fn run_hook_stop_with(home: &Path, backend: &str, args: &[&str], stdin: &str) ->
         .args(["hook", "stop"])
         .args(args)
         .env("HOME", home)
+        // A FlowCode-hosted shell exports this; the Stop hook then stays silent by design.
+        .env_remove("FLOWCODE_ICODE_HOST")
         .env("ICODE_EMBED_BACKEND", backend)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
