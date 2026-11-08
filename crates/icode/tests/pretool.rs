@@ -89,7 +89,7 @@ fn grep_for_a_symbol_gets_the_graph_answer() {
     assert!(h.get("permissionDecision").is_none());
     let ctx = h["additionalContext"].as_str().unwrap();
     assert!(ctx.contains("defined: src/billing.py:1"), "{ctx}");
-    assert!(ctx.contains("call sites: 2"), "{ctx}");
+    assert!(ctx.contains("indexed call edges: 2"), "{ctx}");
     assert!(ctx.contains("src/api.py:4 in checkout"), "{ctx}");
     assert!(ctx.contains("op=callers name=compute_invoice_total"), "{ctx}");
 

@@ -776,16 +776,19 @@ fn hook_state_dir() -> PathBuf {
     db.parent().map(|p| p.join("hook-hints")).unwrap_or_else(|| PathBuf::from(".icode/hook-hints"))
 }
 
-/// The indexed tree a search path belongs to: its repo top when that holds an
-/// index (the canonical place), else the nearest ancestor that does.
+/// The indexed tree a (canonical) search target belongs to.
+///
+/// The target's repo top — a linked worktree's OWN root, never its main checkout
+/// — is the only candidate: if it holds no index the hook stays silent. Climbing
+/// past it would answer a worktree's grep from another checkout's index, with
+/// another branch's line numbers. Outside any repo, the nearest ancestor holding
+/// an index is used.
 fn index_root_for(target: &std::path::Path) -> Option<PathBuf> {
     let has_index = |d: &std::path::Path| d.join(".icode").join("index.db").is_file();
-    if let Some(top) = find_repo_top(target) {
-        if has_index(&top) {
-            return Some(top);
-        }
+    match find_repo_top(target) {
+        Some(top) => has_index(&top).then_some(top),
+        None => target.ancestors().find(|d| has_index(d)).map(std::path::Path::to_path_buf),
     }
-    target.ancestors().find(|d| has_index(d)).map(std::path::Path::to_path_buf)
 }
 
 /// The whole decision, stdin JSON in → hook JSON out (or `None` = silence).
@@ -799,7 +802,7 @@ fn pre_tool_hint(raw: &str, cwd: Option<&std::path::Path>, state_dir: &std::path
     if calls.is_empty() {
         return None;
     }
-    let ledger = icode_engine::HintLedger::open(state_dir, &input.session_id)?;
+    let mut ledger = icode_engine::HintLedger::open(state_dir, &input.session_id)?;
     if ledger.count() >= cap {
         return None;
     }
@@ -816,23 +819,24 @@ fn pre_tool_hint(raw: &str, cwd: Option<&std::path::Path>, state_dir: &std::path
     // One hint per tool call, for ONE indexed tree: the tree of the first search
     // that names a symbol. Up to three symbols, each never hinted before.
     let mut root: Option<PathBuf> = None;
-    let mut wanted: Vec<String> = Vec::new();
+    let mut wanted: Vec<(String, icode_engine::SearchScope)> = Vec::new();
     for call in &calls {
-        let symbols = icode_engine::symbols_from_pattern(&call.pattern, call.fixed);
+        let symbols = icode_engine::symbols_from_pattern(&call.pattern, call.fixed, call.extended);
         if symbols.is_empty() {
             continue;
         }
-        // The searched tree: `cd` dir, then the first search path, lifted to the
-        // indexed root (repo top, else nearest ancestor holding an index).
-        let mut target = base.clone();
-        if let Some(d) = &call.dir {
-            target = target.join(d);
-        }
-        if let Some(p) = call.paths.first() {
-            target = target.join(p);
-        }
-        let Some(r) = index_root_for(&target) else { continue };
-        if unindexable_root(&r).is_some() {
+        // Where the search really runs: `cd` dir, then each search path, resolved
+        // on disk (`..` and symlinks included) — never textually.
+        let dir = match &call.dir {
+            Some(d) => base.join(d),
+            None => base.clone(),
+        };
+        let raw_targets: Vec<PathBuf> =
+            if call.paths.is_empty() { vec![dir.clone()] } else { call.paths.iter().map(|p| dir.join(p)).collect() };
+        let targets: Vec<PathBuf> = raw_targets.iter().filter_map(|t| std::fs::canonicalize(t).ok()).collect();
+        let Some(first) = targets.first() else { continue };
+        let Some(r) = index_root_for(first) else { continue };
+        if unindexable_root(&r).is_some() || targets.iter().any(|t| !t.starts_with(&r)) {
             continue;
         }
         match &root {
@@ -840,31 +844,38 @@ fn pre_tool_hint(raw: &str, cwd: Option<&std::path::Path>, state_dir: &std::path
             Some(have) if *have != r => continue,
             Some(_) => {}
         }
+        let scope = icode_engine::SearchScope { targets, globs: call.globs.clone(), types: call.types.clone() };
         for sym in symbols {
-            if !wanted.contains(&sym) && !ledger.contains(&sym) {
-                wanted.push(sym);
+            if !wanted.iter().any(|(w, _)| *w == sym) && !ledger.contains(&sym) {
+                wanted.push((sym, scope.clone()));
             }
         }
     }
     let root = root?;
-    // Read-only, never creates `.icode/`; a missing or foreign-schema index = silence.
+    // A read-only connection: never creates `.icode/` or an index, never writes
+    // the db. (SQLite may still create the `-wal`/`-shm` sidecars of a WAL-mode
+    // db it reads — that is SQLite's reader protocol, not a write.) A missing
+    // or foreign-schema index = silence.
     let store = SqliteCodeStore::open_existing_readonly(&root, 50).ok()??;
     let briefs: Vec<icode_engine::SymbolBrief> = wanted
         .iter()
         .take(6)
-        .filter_map(|s| icode_engine::symbol_brief(&store, s))
+        .filter_map(|(s, scope)| icode_engine::symbol_brief(&store, s, &root, scope))
         .take(3)
         .collect();
     if briefs.is_empty() {
         return None;
     }
-    let text = icode_engine::render_hint(&briefs, &root);
 
-    // Record before printing: a ledger we cannot write is a cap we cannot keep.
-    let mut ledger = ledger;
+    // Claim under the session lock before printing: a cap we cannot record is a
+    // cap we cannot keep, and a parallel hook may have taken these symbols.
     let names: Vec<&str> = briefs.iter().map(|b| b.name.as_str()).collect();
-    ledger.record(&names).ok()?;
-    Some(hook_output_json("PreToolUse", &text))
+    let claimed = ledger.commit(&names, cap).ok()?;
+    let briefs: Vec<icode_engine::SymbolBrief> = briefs.into_iter().filter(|b| claimed.contains(&b.name)).collect();
+    if briefs.is_empty() {
+        return None;
+    }
+    Some(hook_output_json("PreToolUse", &icode_engine::render_hint(&briefs)))
 }
 
 fn run_stats(path: &std::path::Path) -> anyhow::Result<()> {

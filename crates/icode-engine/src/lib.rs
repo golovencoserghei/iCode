@@ -44,11 +44,11 @@ pub use memory::{
 };
 pub use pretool::{
     hint_cap, parse_grep_command, parse_pre_tool_input, render_hint, search_calls_in_command, shell_segments, symbol_brief,
-    symbol_from_pattern, symbols_from_pattern, HintLedger, PreToolInput, SearchCall, Segment, SymbolBrief,
+    symbol_from_pattern, symbols_from_pattern, HintLedger, PreToolInput, SearchCall, SearchScope, Segment, SymbolBrief,
 };
 pub use recall::{code_to_memory, recall, why_this_exists};
 pub use search::{find_similar, hybrid_search, rrf_fuse, semantic_search, RRF_K};
-pub use store::{SqliteCodeStore, Vec0Index};
+pub use store::{DefinitionSite, SqliteCodeStore, Vec0Index};
 pub use verdict::{check_exists, ExistScope};
 pub use vault::{Vault, VaultEntry};
 pub use verify::hook::{

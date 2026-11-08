@@ -114,6 +114,16 @@ fn env_i64(key: &str, default: i64) -> i64 {
 /// `calls` table (full in-RAM adjacency + dedup `HashSet`) on every request.
 type CachedAdjacency = HashMap<String, Vec<String>>;
 
+/// One definition from [`SqliteCodeStore::find_definitions`] with the stamp its
+/// file had when it was indexed (`mtime` in seconds, size in bytes).
+#[derive(Debug, Clone)]
+pub struct DefinitionSite {
+    pub hit: CodeHit,
+    pub file_mtime: i64,
+    pub file_size: u64,
+    pub lines_total: u64,
+}
+
 pub struct SqliteCodeStore {
     conn: Arc<Mutex<Connection>>,
     /// Optional handle to the SHARED code-embedding cache in the central db
@@ -777,45 +787,59 @@ impl SqliteCodeStore {
     }
 
     /// Every DEFINITION of `symbol` (bare name or qualified name) across functions
-    /// and classes, ordered by path/line: the first `limit` of them plus the total.
+    /// and classes, with the indexed stamp of its file, ordered by path/line and
+    /// deduplicated. At most `limit` rows.
+    ///
+    /// Joined with `files`: a symbol row whose file row is gone (an index that once
+    /// held `./crates/…` keys kept 1017 such orphans here) is not a definition of
+    /// anything, and the stamp lets a caller reject a file that changed on disk.
     ///
     /// `get_function`/`get_class` return ONE row; a name defined in several places
     /// (a trait method, a homonym in two crates) needs all of them to be answered
     /// honestly, and the mention scan in [`Self::find_references`] is far too slow
     /// for a hook that runs before every grep.
-    pub fn find_definitions(&self, symbol: &str, limit: usize) -> Result<(Vec<CodeHit>, usize)> {
+    pub fn find_definitions(&self, symbol: &str, limit: usize) -> Result<Vec<DefinitionSite>> {
         if limit == 0 || symbol.trim().is_empty() {
-            return Ok((vec![], 0));
+            return Ok(vec![]);
         }
         let conn = self.conn.lock().map_err(store_err)?;
-        let mut out: Vec<CodeHit> = Vec::new();
+        let mut out: Vec<DefinitionSite> = Vec::new();
         for (table, kind) in [("functions", SymbolKind::Function), ("classes", SymbolKind::Class)] {
             let sql = format!(
-                "SELECT name, qualified_name, path, line_start, line_end FROM {table} \
-                 WHERE name = ?1 OR qualified_name = ?1"
+                "SELECT t.name, t.qualified_name, t.path, t.line_start, t.line_end, \
+                        f.mtime, f.file_size, f.lines_total \
+                 FROM {table} t JOIN files f ON f.id = t.file_id \
+                 WHERE t.name = ?1 OR t.qualified_name = ?1 LIMIT ?2"
             );
             let mut stmt = conn.prepare(&sql).map_err(store_err)?;
             let rows = stmt
-                .query_map(rusqlite::params![symbol], |r| {
-                    Ok(CodeHit {
-                        kind,
-                        name: r.get(0)?,
-                        qualified_name: r.get(1)?,
-                        path: r.get(2)?,
-                        line_start: r.get::<_, i64>(3)? as u32,
-                        line_end: r.get::<_, i64>(4)? as u32,
-                        score: 1.0,
-                        snippet: None,
-                        stale: false,
+                .query_map(rusqlite::params![symbol, limit as i64], |r| {
+                    Ok(DefinitionSite {
+                        hit: CodeHit {
+                            kind,
+                            name: r.get(0)?,
+                            qualified_name: r.get(1)?,
+                            path: r.get(2)?,
+                            line_start: r.get::<_, i64>(3)? as u32,
+                            line_end: r.get::<_, i64>(4)? as u32,
+                            score: 1.0,
+                            snippet: None,
+                            stale: false,
+                        },
+                        file_mtime: r.get(5)?,
+                        file_size: r.get::<_, i64>(6)? as u64,
+                        lines_total: r.get::<_, i64>(7)? as u64,
                     })
                 })
                 .map_err(store_err)?;
             out.extend(collect(rows)?);
         }
-        out.sort_by(|a, b| a.path.cmp(&b.path).then(a.line_start.cmp(&b.line_start)));
-        let total = out.len();
+        out.sort_by(|a, b| a.hit.path.cmp(&b.hit.path).then(a.hit.line_start.cmp(&b.hit.line_start)));
+        out.dedup_by(|a, b| {
+            a.hit.path == b.hit.path && a.hit.line_start == b.hit.line_start && a.hit.qualified_name == b.hit.qualified_name
+        });
         out.truncate(limit);
-        Ok((out, total))
+        Ok(out)
     }
 
     /// Every place `symbol` is referenced, CLASSIFIED — the precise answer to "where
