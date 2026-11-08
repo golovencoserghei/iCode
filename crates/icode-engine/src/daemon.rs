@@ -42,7 +42,7 @@ use notify::{EventKind, RecursiveMode};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 
 use crate::index::{
-    error_fingerprint, index_one_file, index_path, is_in_excluded_dir, is_in_linked_worktree, is_supported_source,
+    error_fingerprint, index_one_file, index_path, reconcile_by_stat, is_in_excluded_dir, is_in_linked_worktree, is_supported_source,
 };
 use crate::store::SqliteCodeStore;
 
@@ -311,7 +311,33 @@ fn process_batch(root: &Path, store: &SqliteCodeStore, mut paths: Vec<PathBuf>) 
         // `.icode`, so our own db writes never feed back) and non-source files.
         // Linked worktrees below the root are other checkouts, not this tree's
         // source — the same rule the indexer walk applies.
-        if is_in_excluded_dir(&path) || !is_supported_source(&path) || is_in_linked_worktree(root, &path) {
+        if is_in_excluded_dir(&path) || is_in_linked_worktree(root, &path) {
+            continue;
+        }
+
+        // A DIRECTORY event carries one path for a whole subtree: `mv dir` into
+        // the tree reports only the directory's creation, `mv dir` out of it only
+        // its removal. Handled per file, the moved-in files were never indexed and
+        // the moved-out ones stayed in the graph. Reconcile the subtree by stat
+        // instead — new files indexed, vanished ones deleted, the rest untouched.
+        // A vanished path that is not a source file may have been a directory: the
+        // same reconcile then just drops whatever was indexed below it (a range
+        // query, free when nothing was).
+        let gone = !path.exists();
+        if path != root && (path.is_dir() || (gone && !is_supported_source(&path))) {
+            match reconcile_by_stat(root, store, &path) {
+                Ok(s) => {
+                    if s.files_indexed + s.files_deleted > 0 {
+                        relevant = true;
+                        reindexed += s.files_indexed;
+                        deleted += s.files_deleted;
+                    }
+                }
+                Err(e) => log(&format!("daemon: subtree sync failed {} ({e})", path.display())),
+            }
+            continue;
+        }
+        if !is_supported_source(&path) {
             continue;
         }
         relevant = true;

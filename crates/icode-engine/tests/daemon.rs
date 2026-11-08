@@ -314,3 +314,48 @@ fn lock_liveness_follows_the_flock_not_the_pid() {
     // The file still names our (very much alive) pid — that must not count.
     assert!(!DaemonLock::is_held(dir.path()), "a released lock means no daemon, whatever pid the file holds");
 }
+
+/// A directory moved INTO the tree arrives as one event for the directory; its
+/// files must still land in the graph, and leave it when the directory moves out.
+#[test]
+fn a_directory_moved_in_and_out_is_reflected_in_the_graph() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = std::fs::canonicalize(dir.path()).unwrap().join("proj");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("lib.rs"), V1).unwrap();
+    let store = SqliteCodeStore::open(&root).expect("open store");
+    let reader = SqliteCodeStore::open(&root).expect("open reader");
+
+    let watched = root.clone();
+    std::thread::spawn(move || {
+        let _ = icode_engine::run_daemon(&watched, store);
+    });
+    let lock = root.join(".icode/daemon.lock");
+    for _ in 0..100 {
+        if fs::read_to_string(&lock).map(|s| !s.trim().is_empty()).unwrap_or(false) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let outside = tempfile::tempdir().unwrap();
+    let pkg = outside.path().join("pkg");
+    fs::create_dir_all(pkg.join("deep")).unwrap();
+    fs::write(pkg.join("deep/moved.rs"), "pub fn moved_in() {}\n").unwrap();
+    fs::rename(&pkg, root.join("pkg")).unwrap();
+    let moved = root.join("pkg/deep/moved.rs").to_string_lossy().to_string();
+    let wait_for = |want: bool| {
+        for _ in 0..60 {
+            if reader.stat_file(&moved).unwrap().is_some() == want {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
+    };
+    assert!(wait_for(true), "a moved-in directory's files must be indexed");
+    fs::rename(root.join("pkg"), outside.path().join("back")).unwrap();
+    assert!(wait_for(false), "a moved-out directory's files must leave the index");
+    fs::remove_dir_all(&root).unwrap(); // stops the daemon
+}
