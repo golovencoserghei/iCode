@@ -1557,9 +1557,16 @@ impl SqliteCodeStore {
             .prepare("SELECT 1 FROM pragma_table_info('parse_errors') WHERE name = 'fingerprint'")
             .and_then(|mut st| st.exists([]))
             .map_err(store_err)?;
+        // Several processes may open an old index at the same moment (parallel
+        // hooks, a serve per editor window): all see the column missing, one ALTER
+        // wins, the rest get "duplicate column name". That loser's goal — the
+        // column exists — is met, so it is success, not an error.
         if !has_fingerprint {
-            conn.execute_batch("ALTER TABLE parse_errors ADD COLUMN fingerprint TEXT")
-                .map_err(store_err)?;
+            if let Err(e) = conn.execute_batch("ALTER TABLE parse_errors ADD COLUMN fingerprint TEXT") {
+                if !e.to_string().contains("duplicate column name") {
+                    return Err(store_err(e));
+                }
+            }
         }
         // Stamp the schema generation so a future incompatible version is detected.
         conn.pragma_update(None, "user_version", SCHEMA_VERSION).map_err(store_err)?;

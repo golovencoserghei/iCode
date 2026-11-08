@@ -164,3 +164,33 @@ fn reconcile_by_stat_repairs_missed_creates_edits_and_deletes() {
     assert_eq!(s.files_deleted, 2);
     assert_eq!(store.files_under(&root.to_string_lossy()).unwrap().len(), 20, "the rest is intact");
 }
+
+#[test]
+fn concurrent_first_opens_of_an_old_index_all_succeed() {
+    for round in 0..5 {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        drop(SqliteCodeStore::open(&root).unwrap());
+        {
+            let conn = rusqlite::Connection::open(root.join(".icode/index.db")).unwrap();
+            conn.execute_batch(
+                "DROP TABLE parse_errors; \
+                 CREATE TABLE parse_errors (id INTEGER PRIMARY KEY, path TEXT NOT NULL, error TEXT NOT NULL);",
+            )
+            .unwrap();
+        }
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let (root, barrier) = (root.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    SqliteCodeStore::open(&root).map(|_| ()).map_err(|e| e.to_string())
+                })
+            })
+            .collect();
+        let errors: Vec<String> =
+            handles.into_iter().filter_map(|h| h.join().unwrap().err()).collect();
+        assert!(errors.is_empty(), "round {round}: {errors:?}");
+    }
+}
